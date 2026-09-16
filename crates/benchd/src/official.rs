@@ -1,0 +1,5283 @@
+//! B-2 — `benchd` OFFICIAL benchmark path, at parity with the Swift official run
+//! (`QwenRuntimeBenchmark.benchmarkWithWorker`, main.swift official gating, benchmark.sh).
+//!
+//! The official path diverges from the local checked-timing path (`crate::iterate`) in
+//! several load-bearing ways, all corrected from the original steer against the read-first
+//! Swift map:
+//!
+//! 1. **Timed-runs FIRST, then gates** (cold-path / anti-memoization defense,
+//!    Constants.swift:82-88): prefill → decode → floor/band/finite evaluation →
+//!    correctness. The timed phases run before any correctness so the measured path is
+//!    never warmed by the gates (QwenRuntimeBenchmark.swift:466-558 precede :560-581).
+//! 2. **THREE fresh sandboxed workers** — a dedicated `RuntimeWorkerClient` per phase
+//!    (prefill :469-484, decode :486-503, correctness :565-581), each closed/reaped before
+//!    the next. No shared session, no warm caches across phases.
+//! 3. **Full correctness set** — base cases + anchors + free_run (+ behavior/GPQA on the
+//!    GPU path): `checkGates == true` ⇒ `caseCount = totalCorrectnessCaseCount`,
+//!    `gates = correctnessGates` (QwenRuntimeCorrectness.swift:351/435). Contrast local's
+//!    base-cases-only default.
+//! 4. **128-step decode window + benchmark-ORACLE checks** (Constants.swift:70, seed 512):
+//!    every timed token is verified against `golden.benchmark.expected_*`; a corrupted
+//!    oracle FAILS official (`BenchmarkTokenMismatchError`) — the failure class the local
+//!    path structurally cannot test.
+//! 5. **Official gating** — 0.95 speedup floors, prefill band ±5% / decode +2%−5%, and a
+//!    non-finite score fails, evaluated BEFORE correctness (Score.swift:50-126).
+//! 6. **Sealing/integrity** — the sealed stdout payload is the coarsened score (2-sig-fig
+//!    diagnostics, ranking fields untouched); the `metrics.commit` carries the resolved
+//!    commit identifier (official-only).
+//!
+//! The SANDBOX fail-closed spawn + Seatbelt profile live in `bench_runner::sandbox`; this
+//! module owns the phase orchestration + scoring. The REAL timed measurement and the
+//! end-to-end both-sides run are B-3 on the GPU box — this module is macOS-buildable and
+//! unit-tested against a stub `MockEngine` (no real engine, no GPU).
+
+use bench_core::conformance::{run_conformance, ConformanceReport, CorrectnessScope};
+use bench_core::constants::{AcceptanceBands, WindowShape};
+use bench_core::golden::GoldenFixture;
+use bench_core::score::{evaluate_timed_run, ScoringWeights, SpeedupFloors};
+use bench_protocol::SpecConfig;
+use bench_runner::{
+    run_timed_benchmark_persistent_on_session, LineTransport, RunnerError, Session, TimingParams,
+    TimingResult, VerifyMode,
+};
+
+use crate::iterate::{
+    apply_timing_metrics, base_metrics, failed_metrics, failed_score, finite_nonneg,
+    first_conformance_failure, FailedAudit, FailureReport, Mode, RunDigests, ScoringInputs,
+    SessionEngine,
+};
+use crate::score::{ScoreMetrics, ScorePayload};
+
+/// Seal the BOARD-facing `metrics.per_prompt` record for the ONE timed prompt this official run
+/// measured (the challenge board's MTP column and per-prompt decode readout).
+///
+/// WHY THIS EXISTS. The free-run decode measurement computes
+/// [`bench_core::free_run::FreeRunAudit::effective_mean_draft_len`] on every timed leg, but the two
+/// free-run producers in `bench-runner/src/timing.rs` used to drop the whole audit when they
+/// narrowed into [`TimingResult`], so the single-leg official path had nothing to seal and the board
+/// showed a dash. The value now rides on `TimingResult::effective_mean_draft_len`.
+///
+/// ONE ENTRY, NEVER MORE. Official times the golden's benchmark oracle — ONE prompt — so exactly one
+/// record is sealed; entries are never invented for pool prompts this run did not measure. The
+/// identity is the golden's own sha256 (BIND BY BYTES), the same identity `metrics.golden_hash`
+/// carries and the same rule the paired flow uses for its records.
+///
+/// NOTHING ENFORCED CHANGES. `mtp_seconds_per_token_mean` is READ BACK from
+/// `metrics.decode_seconds_per_token` — the enforced whole-window figure `apply_timing_metrics` just
+/// wrote — so the two cannot drift and no second, decode-only quantity is introduced (the RED-TEAM
+/// REVERT notes in `bench-runner/src/timing.rs`). The array is additive: it feeds no score, floor or
+/// band.
+///
+/// NO `head_provenance_sha256`. The engine's loaded-head digest arrives on the `hello`
+/// (`bench_runner::Hello::head_provenance`), which the timed-worker spawn closures discard — a
+/// [`Session`] does not retain it, and neither does [`TimingResult`]. The official path therefore has
+/// no head digest in hand at this point, so the key is OMITTED rather than invented. The board reads
+/// it optionally and simply flags no custom head.
+///
+/// WHERE IT IS SEALED, AND WHY THAT IS NOT THE #132(b) BLANK. The call sites are the three official
+/// payloads that RETAIN the real measured timing surface: the passing score and the two
+/// failed-with-timing builders. `per_prompt` belongs to that timing surface — both its numbers
+/// describe the timed decode window that really ran — so it rides with the retained half. It is NOT
+/// part of the correctness-derived surface `official_failed_timed_band` blanks to match Swift: that
+/// blank exists because a non-empty `golden_hash` asserts "correctness completed", and
+/// `prompt_sha256` asserts something else entirely, namely which prompt the clock measured. A
+/// gates-only payload measured no prompt, so it seals nothing here.
+///
+/// A `None` audit (the teacher-forced v1 path, which official never takes) seals NOTHING.
+fn seal_official_per_prompt(
+    metrics: &mut ScoreMetrics,
+    golden: &GoldenFixture,
+    timing: &TimingResult,
+) {
+    crate::iterate::seal_timing_surface_facts(metrics, golden, timing);
+}
+
+/// Seal the ENGINE IDENTITY the TIMED worker announced on its `hello` — the worker whose leg is
+/// scored.
+///
+/// WHY THIS EXISTS. Every benchd spawn site wrote `let (session, _hello) = Session::connect(...)`:
+/// the handshake was validated (nonce, protocol version, capabilities) and then the engine's own
+/// self-description was THROWN AWAY, so a sealed score said nothing about which engine build
+/// produced it. The board's custom-head reader looks for `head_provenance_sha256`, and a CUDA run's
+/// `backend` string carries the engine pin, overlay, nvcc and driver — all of it identity a scored
+/// artifact should carry.
+///
+/// AUDIT-ONLY, ADDITIVE, FAIL-SOFT. Nothing here is scored, gated or compared: an engine that omits
+/// a field simply seals no key for it (`skip_serializing_if`), so a pre-#106 engine's score is
+/// byte-unchanged. The score is NOT refused on a divergence between the timed and correctness
+/// workers — that would be a new refusal on the scored path — so the TIMED worker's hello is the one
+/// sealed, by the rule that the sealed identity must be the identity that produced the sealed
+/// number.
+///
+/// `head_provenance_sha256` is MIRRORED onto each `per_prompt` entry, which is where the board reads
+/// it; the entries are already sealed by then, so this fills them in place.
+///
+/// THE RUNNER AND RESIDENT IDENTITIES ARE SEALED THE SAME WAY. The wire contract says `runner` and
+/// `resident` are modeled "exactly like `head_provenance`" — so they are recorded here too, as
+/// `runner_id` / `runner_model_type` / `runner_manifest_sha256` / `runner_build` and
+/// `resident_pid` / `resident_load_epoch`. Each is absent from the sealed JSON when the hello
+/// lacked it, never `0` and never `""`: an absent key is the honest statement "the worker said
+/// nothing", which is a different claim from "the worker said zero". They are IDENTITY, recorded in
+/// the score.json metrics and NEVER scored — nothing reads them back as an input to a number.
+pub fn seal_engine_identity(metrics: &mut ScoreMetrics, hello: &bench_runner::Hello) {
+    metrics.engine_backend = hello.backend.clone();
+    metrics.engine_device = hello.device.clone();
+    metrics.engine_protocol_version = hello.protocol_version;
+    metrics.head_provenance_sha256 = hello.head_provenance.as_ref().map(|p| p.sha256.clone());
+    metrics.runner_id = hello.runner.as_ref().map(|r| r.id.clone());
+    metrics.runner_model_type = hello.runner.as_ref().map(|r| r.model_type.clone());
+    metrics.runner_manifest_sha256 = hello.runner.as_ref().map(|r| r.manifest_sha256.clone());
+    metrics.runner_build = hello.runner.as_ref().map(|r| r.build.clone());
+    metrics.resident_pid = hello.resident.as_ref().map(|r| r.pid);
+    metrics.resident_load_epoch = hello.resident.as_ref().map(|r| r.load_epoch);
+    for entry in &mut metrics.per_prompt {
+        entry
+            .head_provenance_sha256
+            .clone_from(&metrics.head_provenance_sha256);
+    }
+}
+
+/// The named refusal raised when two phases of ONE timed window report DIFFERENT resident
+/// identities ([`retain_timed_hello`]).
+///
+/// The resident's `load_epoch` is constant for the life of the process, so a changed `pid` or
+/// `load_epoch` between the prefill worker's hello and the decode worker's hello means the window
+/// did not run against one resident process: something reloaded the weights mid-window. That
+/// violates weights-load-once, and it makes the sealed identity a lie — the score would name one
+/// process while part of the window ran on another. It is refused rather than sealed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResidentIdentityChanged {
+    /// The resident identity the FIRST phase of this window reported.
+    pub first: Option<bench_protocol::ResidentIdentity>,
+    /// The resident identity a LATER phase reported, which differs from `first`.
+    pub then: Option<bench_protocol::ResidentIdentity>,
+}
+
+impl ResidentIdentityChanged {
+    /// The refusal's stable NAME, in the style of the manifest gate's named failures.
+    pub const NAME: &'static str = "resident_identity_changed_within_window";
+
+    /// The refusal's stable name.
+    pub fn name(&self) -> &'static str {
+        Self::NAME
+    }
+}
+
+impl std::fmt::Display for ResidentIdentityChanged {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let show = |r: &Option<bench_protocol::ResidentIdentity>| match r {
+            Some(r) => format!("pid {} load_epoch {}", r.pid, r.load_epoch),
+            None => "no resident (the worker loaded its own weights)".to_string(),
+        };
+        write!(
+            f,
+            "{}: one timed window ran against two different resident identities — the first phase \
+             reported {}, a later phase reported {}. The resident load_epoch is constant for the \
+             life of the process, so this is a reload inside the window (weights-load-once).",
+            self.name(),
+            show(&self.first),
+            show(&self.then)
+        )
+    }
+}
+
+/// Retain the TIMED worker's hello for sealing, and REFUSE a window whose phases disagree about the
+/// resident process.
+///
+/// A timed leg can be assembled from several worker sessions — the official path spawns a fresh
+/// worker per timed phase (prefill, then decode), each with its own hello. Every one of them must
+/// report the SAME resident identity, because they are all supposed to be attached to the same
+/// resident process for the whole window. This is the one place that sees both hellos, so it is
+/// where the check belongs.
+///
+/// Only the RESIDENT identity is checked. The other identity fields are not: a worker legitimately
+/// reports its own `pid` rather than the resident's, and the runner
+/// identity is already gated by the conformance kit against a declared manifest.
+///
+/// `slot` holds the hello retained so far. On the first call it is filled. On a later call the new
+/// hello's resident identity is compared with the retained one; equal (including both absent) keeps
+/// the retained hello, and different is refused by name.
+pub fn retain_timed_hello(
+    slot: &mut Option<bench_runner::Hello>,
+    hello: bench_runner::Hello,
+) -> Result<(), ResidentIdentityChanged> {
+    match slot {
+        Some(first) if first.resident != hello.resident => Err(ResidentIdentityChanged {
+            first: first.resident.clone(),
+            then: hello.resident.clone(),
+        }),
+        Some(_) => Ok(()),
+        None => {
+            *slot = Some(hello);
+            Ok(())
+        }
+    }
+}
+
+/// Whether an official run REQUIRES the runtime worker (Swift
+/// `benchmarkRequiresRuntimeWorker`, QwenRuntimeBenchmark.swift:295-300): true iff the
+/// golden declares any correctness BEHAVIOR case (hidden GPQA TTFT). Behavior TTFT is
+/// measured in the trusted parent around sandboxed worker calls; the in-process path cannot
+/// produce an equivalent trusted measurement, so its presence forces the worker path (and
+/// benchd's official path fails closed without a sandboxed worker regardless).
+///
+/// Parity port + unit-tested; benchd's official run ALWAYS spawns sandboxed workers
+/// (fail-closed), so this predicate is subsumed by that guarantee here and reserved for a
+/// future worker-optional decision — hence `allow(dead_code)`.
+#[allow(dead_code)]
+pub fn benchmark_requires_runtime_worker(golden: &GoldenFixture) -> bool {
+    golden
+        .correctness_gates
+        .as_ref()
+        .is_some_and(|g| !g.behavior_cases().is_empty())
+}
+
+/// #61 — the OFFICIAL paired-baseline trusted override (Swift `PairedBaselineOverride`,
+/// BenchmarkSupport.swift:35-80). The official timing machine measures the pinned reference
+/// implementation immediately before the candidate and passes its seconds-per-token through
+/// `MLXFAST_PAIRED_BASELINE_PREFILL_SECONDS_PER_TOKEN` /
+/// `MLXFAST_PAIRED_BASELINE_DECODE_SECONDS_PER_TOKEN`, so candidate speedups and floors are
+/// priced against the same runner VM / hour / thermal state
+/// (`docs/measure-job-contract.md@fe2da64`; evicted at cd5782e, resolve via git).
+///
+/// FAIL-CLOSED, byte-for-byte with Swift `fromEnvironment` (:50-79):
+/// - both unset (after trim) ⇒ `Ok(None)` (no override; fall through to flags/golden);
+/// - exactly one set ⇒ error "…must be provided together" (a half-set pair is an operator
+///   wiring error and must stop the run, never silently degrade);
+/// - a value that is not a FINITE POSITIVE double ⇒ error (mispricing the whole session).
+///
+/// Official-only: local modes never consult this (Swift strips both keys from the sandboxed
+/// worker env, and only the benchmark/official paths read them). `prefill_raw`/`decode_raw`
+/// are the raw env values (`None` if unset), passed in so the resolution is a pure,
+/// testable function.
+pub fn paired_baseline_from_env(
+    prefill_raw: Option<&str>,
+    decode_raw: Option<&str>,
+) -> Result<Option<(f64, f64)>, String> {
+    const PREFILL_KEY: &str = "MLXFAST_PAIRED_BASELINE_PREFILL_SECONDS_PER_TOKEN";
+    const DECODE_KEY: &str = "MLXFAST_PAIRED_BASELINE_DECODE_SECONDS_PER_TOKEN";
+    let prefill = prefill_raw.unwrap_or("").trim();
+    let decode = decode_raw.unwrap_or("").trim();
+    if prefill.is_empty() && decode.is_empty() {
+        return Ok(None);
+    }
+    if prefill.is_empty() || decode.is_empty() {
+        return Err(format!(
+            "{PREFILL_KEY} and {DECODE_KEY} must be provided together"
+        ));
+    }
+    let prefill_v = parse_finite_positive(prefill).ok_or_else(|| {
+        format!("{PREFILL_KEY} must be a finite positive seconds-per-token value")
+    })?;
+    let decode_v = parse_finite_positive(decode)
+        .ok_or_else(|| format!("{DECODE_KEY} must be a finite positive seconds-per-token value"))?;
+    Ok(Some((prefill_v, decode_v)))
+}
+
+/// THE reader of the `MLXFAST_PAIRED_BASELINE_*` pair from the process environment — one call site
+/// shape for every path that consults it, so every path carries the SAME fail-closed posture.
+///
+/// Before #359 the two entry points disagreed: `main.rs` propagated the refusal with `?` while
+/// [`official_resolved_baseline_pair`] did `.ok().flatten()`, which turned a half-set or
+/// non-finite pair into "no override" and silently fell through to the golden's / contract's pair.
+/// A mispriced denominator is exactly what [`paired_baseline_from_env`] exists to refuse, so the
+/// silent posture is gone and this is the only way the pair is read.
+pub fn paired_baseline_override() -> Result<Option<(f64, f64)>, String> {
+    paired_baseline_from_env(
+        std::env::var("MLXFAST_PAIRED_BASELINE_PREFILL_SECONDS_PER_TOKEN")
+            .ok()
+            .as_deref(),
+        std::env::var("MLXFAST_PAIRED_BASELINE_DECODE_SECONDS_PER_TOKEN")
+            .ok()
+            .as_deref(),
+    )
+}
+
+/// A finite, strictly-positive `f64` from a string, else `None` (Swift `Double(raw)` +
+/// `isFinite` + `> 0`).
+fn parse_finite_positive(s: &str) -> Option<f64> {
+    match s.parse::<f64>() {
+        Ok(v) if v.is_finite() && v > 0.0 => Some(v),
+        _ => None,
+    }
+}
+
+/// Port of Swift `QwenRuntimePreflight.isCommitSHAHex` (:40-45): a lowercase-hex string of
+/// 7..=40 chars (short-to-full commit SHA). NOTE the correction to the original "40-hex"
+/// steer — Swift's `metrics.commit` predicate accepts 7-40 (only benchmark.sh's
+/// `candidate.sha` recovery is strict-40); this mirrors the field's real source.
+pub fn is_commit_sha_hex(s: &str) -> bool {
+    let n = s.len();
+    (7..=40).contains(&n)
+        && s.bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// Port of Swift `QwenRuntimePreflight.commitIdentifier` (:26-45): a trimmed, valid-hex
+/// `MLXFAST_COMMIT_SHA` wins; otherwise fall back to `git rev-parse --short HEAD`, or `""`.
+/// `commit_sha_env` is the raw `MLXFAST_COMMIT_SHA` value (or `None` if unset), passed in so
+/// the resolution is a pure, testable function; the git fallback is only consulted when the
+/// env value is absent or malformed.
+pub fn commit_identifier(commit_sha_env: Option<&str>) -> String {
+    if let Some(v) = commit_sha_env {
+        let trimmed = v.trim();
+        if is_commit_sha_hex(trimmed) {
+            return trimmed.to_string();
+        }
+    }
+    crate::git_rev_parse_head(None, true).unwrap_or_default()
+}
+
+/// EVERYTHING ONE OFFICIAL RUN IS MEASURED AND SEALED UNDER, resolved once and threaded as ONE
+/// value.
+///
+/// The golden it replays, what it is scored against, what it seals (`digests`, `commit`), and how
+/// the worker is driven (`spec`, `window`) — every function on the official path took
+/// the same list, positionally, which is what the too-many-arguments lint on three of them was
+/// silenced for (#191). `bands` is deliberately NOT in here: the PAIRED path measures a
+/// candidate window against its own live control leg and has no acceptance bands to state, so the
+/// bands ride only on the entry that actually gates with them.
+#[derive(Debug, Clone)]
+pub struct OfficialParams<'a> {
+    pub golden: &'a GoldenFixture,
+    /// What the run is scored against: the baseline pair its speedups divide by and the floors
+    /// they must clear.
+    pub scoring: ScoringInputs,
+    pub digests: RunDigests<'a>,
+    pub commit: &'a str,
+    /// The resolved `--mtp-depth` / `--candidate-spec` request that rides the timed leg. `None` is
+    /// the historical bare request; a divergent engine echo discards the leg.
+    pub spec: Option<SpecConfig>,
+    pub window: &'a WindowShape,
+}
+
+/// The correctness-gate coordinates a FAILED official payload seals: which case diverged, at which
+/// step, and how many teacher-forced steps the gate had checked when it did. They describe one
+/// verdict, so they travel as one value.
+struct CorrectnessFailure {
+    first_failing_case: Option<String>,
+    first_failing_step: Option<i64>,
+    /// The REAL partial per-case checked-step sum through the failing gate (Swift
+    /// `correctness?.checkedSteps`), or — for a pre-correctness timed fault that has no
+    /// `ConformanceReport` to sum — the golden-derived placeholder.
+    checked_steps: i64,
+}
+
+/// THE official flow: ONE model-holding worker for the WHOLE window (David 2026-08-30 load-once).
+///
+/// `spawn_timed` is called EXACTLY ONCE to open that worker; the timed prefill+decode phases run
+/// over it via [`run_timed_benchmark_persistent_on_session`]; and the correctness phase runs over
+/// the SAME session, so the model loads ONCE. The per-phase isolation is the worker's own
+/// `beginMeasuredPhase` reset, which fires on `prefill`, `free_decode_begin`, and
+/// `correctness_begin` alike. The gating/scoring order (timed-first → floors/bands → full
+/// correctness) lives in [`finish_official`].
+/// The TIMED leg's parameters: the golden's benchmark oracle, the resolved spec, and
+/// the fixture's `official_prefill_warmup_runs` unmeasured prefill passes in the
+/// timed session ahead of the one timed prefill (on MLX the timed session is a fresh attach, and
+/// its first prefill is not a steady reading; on CUDA the resident engine is already warm and the
+/// adapter refuses a second opener — see the constants).
+pub fn official_timed_params(
+    benchmark: &bench_core::golden::BenchmarkGolden,
+    spec: Option<SpecConfig>,
+    window: &WindowShape,
+) -> TimingParams {
+    // CONTRACT-FIRST (STEP 1, David 2026-09-15): the decode depth AND the warm-up count come from
+    // the run's ONE resolved window. `platform` is gone from this signature on purpose — the
+    // platform keys the TABLE's warm-up count, and that lookup now happens once, at the
+    // resolution, rather than here.
+    crate::iterate::benchmark_window_params(benchmark, Mode::Official.decode_steps(window))
+        .with_spec(spec)
+        .with_prefill_warmup_runs(window.official_prefill_warmup_runs)
+}
+
+/// The MEASUREMENT-INTEGRITY WARMUP leg's parameters (coordinator ruling 2026-08-31): ONE
+/// unmeasured, DISCARDED pass over the SAME benchmark prompt, decode seed and oracle the timed
+/// legs use, at the SAME decode depth and with the SAME spec.
+///
+/// WHY IT EXISTS. On a FRESH resident serve the FIRST forward pays cold first-prefill JIT /
+/// CUDA-graph-capture / flashinfer-JIT cost: a sealed CUDA null-control (serial-vs-serial, expected
+/// score ~1.000) FLOOR-REFUSED at prefill_speedup 0.261 (532 vs 2041 tok/s) purely from that cold
+/// first prefill. Both legs of a paired run are warmed identically, so the comparison is
+/// warm-against-warm on both sides.
+///
+/// WHY IT CANNOT LEAK INTO THE MEASURED NUMBERS. It runs `VerifyMode::TimeOnly`, so a token
+/// divergence does not abort it (catching an oracle mismatch stays the REAL timed legs' job), and
+/// its `TimingResult` is DISCARDED on the spot — it never reaches any baseline, speedup, floor,
+/// band or score. The depth matches the timed window (`Mode::Official.decode_steps(&test_window())`) because a
+/// shorter warmup left the timed decode measurably colder. The SPEC matches the timed leg's,
+/// because a speculating window JITs different shapes than a serial one.
+///
+/// `None` for a golden too short to warm, so the real timed leg surfaces the canonical
+/// precondition error rather than a warmup-labelled one. That guard is no stricter than the timed
+/// path's own.
+fn official_warmup_params(
+    benchmark: &bench_core::golden::BenchmarkGolden,
+    spec: Option<SpecConfig>,
+    window: &WindowShape,
+) -> Option<TimingParams> {
+    let warmup_decode_steps = Mode::Official.decode_steps(window);
+    let runnable = benchmark.expected_decode_tokens.len() >= warmup_decode_steps
+        && !benchmark.prefill_prompt_tokens.is_empty()
+        && !benchmark.decode_seed_tokens.is_empty();
+    runnable.then(|| {
+        crate::iterate::benchmark_window_params(benchmark, warmup_decode_steps).with_spec(spec)
+    })
+}
+
+/// WHICH stage of a timed window failed. The three classes carry different sealed error strings
+/// and different failure payloads, so they stay distinct all the way out of [`run_timed_window`]
+/// rather than being flattened into one message the caller has to re-parse.
+enum TimedWindowFailure {
+    /// The unmeasured warmup leg itself faulted.
+    Warmup(RunnerError),
+    /// The measured prefill/decode legs faulted — including the oracle-mismatch class.
+    Timed(RunnerError),
+}
+
+/// ONE window's WARMUP leg and TIMED prefill+decode legs. This is the shared measurement body: the
+/// ranked candidate leg ([`official_core_windowed`]), the SERIAL-CONTROL leg of a paired run and
+/// every `calibrate-baseline` pass all run through it, so the three cannot drift apart.
+///
+/// ONE model-holding worker is opened, warmed and driven through both timed phases, and is RETURNED
+/// still open so a caller that needs another phase over the same residency (official's correctness
+/// gate) never loads the model twice. The caches are not isolated by a fresh process; they are
+/// isolated by the worker's phase-start reset, which benchd asserts fail-closed at every phase close
+/// (`cache_memory == 0`).
+///
+/// The unmeasured warmup leg is deliberately UNGATED — it is what heats the GPU — and the cool gate
+/// then holds each TIMED phase to the per-phase contract.
+fn run_timed_window<T, FT, G>(
+    params: &TimingParams,
+    warmup_params: Option<&TimingParams>,
+    spawn_timed: &mut FT,
+    cool_gate: &mut G,
+) -> Result<(TimingResult, Session<T>), TimedWindowFailure>
+where
+    T: LineTransport,
+    FT: FnMut() -> bench_runner::Result<Session<T>>,
+    G: FnMut(&str) -> bench_runner::Result<()>,
+{
+    let mut no_cool_gate = |_phase: &str| -> bench_runner::Result<()> { Ok(()) };
+    let mut session = spawn_timed().map_err(TimedWindowFailure::Timed)?;
+    if let Some(wp) = warmup_params {
+        // A warmup fault discards the session, so fail closed here rather than let the measured leg
+        // report a bare SessionDiscarded.
+        run_timed_benchmark_persistent_on_session(
+            &mut session,
+            &mut no_cool_gate,
+            wp,
+            VerifyMode::TimeOnly,
+        )
+        .map_err(TimedWindowFailure::Warmup)?;
+    }
+    let measured = run_timed_benchmark_persistent_on_session(
+        &mut session,
+        cool_gate,
+        params,
+        VerifyMode::Verify,
+    )
+    .map_err(TimedWindowFailure::Timed)?;
+    Ok((measured, session))
+}
+
+/// The CANDIDATE leg's timed window (warmup + prefill + decode, every token oracle-checked), or the
+/// failed payload that ends the run. Shared by the single-leg window and the paired path, so an
+/// oracle mismatch, a warmup fault and a protocol fault are classified ONCE. On the load-once
+/// residency the measured session comes back still open for the correctness gate.
+fn measure_candidate_window<T, FT, G>(
+    run: OfficialParams<'_>,
+    benchmark: &bench_core::golden::BenchmarkGolden,
+    spawn_timed: &mut FT,
+    cool_gate: &mut G,
+) -> Result<(TimingResult, Session<T>), Box<ScorePayload>>
+where
+    T: LineTransport,
+    FT: FnMut() -> bench_runner::Result<Session<T>>,
+    G: FnMut(&str) -> bench_runner::Result<()>,
+{
+    let OfficialParams {
+        golden,
+        scoring,
+        digests,
+        commit,
+        // The run's RESOLVED spec and window (STEP 1, David 2026-09-15). The window carries the
+        // decode depth AND the unmeasured prefill-pass count; it REPLACES the `platform` this
+        // function used to take — the platform was only ever here to key the warm-up count, and
+        // that lookup now happens once, at the resolution.
+        spec,
+        window,
+    } = run;
+    let params = official_timed_params(benchmark, spec.clone(), window);
+
+    // MEASUREMENT-INTEGRITY WARMUP + the TIMED legs, in the window shape this run measures
+    // ([`run_timed_window`], which carries the whole rationale). The warmup leg is unmeasured and
+    // discarded; the timed legs pass the caller's cool gate; the held session comes back so the
+    // correctness phase below can reuse the ONE model residency.
+    let warmup_params = official_warmup_params(benchmark, spec.clone(), window);
+    let measured_result = run_timed_window(&params, warmup_params.as_ref(), spawn_timed, cool_gate);
+    let (measured, held_session) = match measured_result {
+        Ok(t) => t,
+        Err(TimedWindowFailure::Warmup(e)) => {
+            return Err(Box::new(official_failed(
+                golden,
+                digests,
+                commit,
+                format!("official warmup leg failed: {e}"),
+                scoring,
+            )));
+        }
+        Err(TimedWindowFailure::Timed(RunnerError::TokenMismatch { label, step, .. })) => {
+            // The benchmark-ORACLE failure class the local path cannot test: a corrupted
+            // oracle (or a fast-garbage engine) diverges and FAILS official. Byte-match Swift
+            // `makeFailedScore` for a `BenchmarkTokenMismatchError`
+            // (QwenRuntimeBenchmark.swift:668-676): `error = mismatch.description`,
+            // `firstFailingCase = "benchmark"`, `firstFailingStep = mismatch.step`, and
+            // `expectedToken`/`actualToken` are ALWAYS nil.
+            //
+            // Swift's PREFILL and decode-SEED comparisons go through `compareOne`
+            // (Golden.swift:560-581) with `step: nil`, so `description` has NO " at step N"
+            // suffix and `firstFailingStep = nil`. Only the decode-TOKEN class
+            // (`compareDecodeTokens`, Golden.swift:533-551) carries a step. benchd's
+            // `RunnerError::TokenMismatch.step` is non-optional, so distinguish by label.
+            //
+            // A8/DAVID RULING (timed decode = INCREMENTAL FREE-RUN): the timed decode leg now
+            // drives `free_decode_begin` + `free_decode_run`, so its oracle-mismatch labels are
+            // "benchmark free-run decode seed token" (step-less) and "benchmark free-run decode
+            // token" (the stepped class). The PREFILL label is unchanged ("benchmark prefill
+            // token", still teacher-forced). The sealed error strings therefore name the
+            // free-run mechanism ("benchmark free-run decode token mismatch at step N", …) — an
+            // intentional divergence from Swift's teacher-forced description, sanctioned by the
+            // ruling: teacher-forced-per-step is retained ONLY for the untimed correctness gate.
+            let is_decode_token_class = label == "benchmark free-run decode token";
+            let (error, first_failing_step) = if is_decode_token_class {
+                (
+                    format!("{label} mismatch at step {step}"),
+                    Some(step as i64),
+                )
+            } else {
+                (format!("{label} mismatch"), None)
+            };
+            // The benchmark-ORACLE mismatch is a TIMED-phase failure BEFORE correctness runs
+            // (official is timed-first). Like RULING-2's band/floor/finite path, Swift returns
+            // via makeFailedScore(correctness: nil) — BLANKING the correctness audit fields
+            // (golden_hash="", case_count=0, checked_steps=0) — but RETAINS the resolved
+            // baselines (baselinePrefill/DecodeSecondsPerToken, set at :434-435 before the timed
+            // phase). See official_failed_timed_oracle.
+            return Err(Box::new(official_failed_timed_oracle(
+                golden,
+                digests,
+                commit,
+                error,
+                first_failing_step,
+                scoring,
+            )));
+        }
+        Err(TimedWindowFailure::Timed(e)) => {
+            // A non-oracle timed failure (protocol / completed-work barrier / spawn): fail
+            // closed with the runner's message. No trustworthy timing to retain.
+            return Err(Box::new(official_failed(
+                golden,
+                digests,
+                commit,
+                format!("{e}"),
+                scoring,
+            )));
+        }
+    };
+
+    // Steps 2-4 (gating → correctness → assembly) operate on the measured `timing`; they are
+    // factored into `finish_official` so they can be unit-tested with a SYNTHETIC in-band
+    // TimingResult (a mock's ~0 wall-clock can never sit inside the acceptance band). The
+    // correctness worker is the ONE resident session the timed phases ran on (load-once), so the
+    // window never loads the model twice and never holds two residencies.
+    Ok((measured, held_session))
+}
+
+pub fn official_core_windowed<T, FT, G>(
+    run: OfficialParams<'_>,
+    bands: AcceptanceBands,
+    mut spawn_timed: FT,
+    mut cool_gate: G,
+) -> ScorePayload
+where
+    T: LineTransport,
+    FT: FnMut() -> bench_runner::Result<Session<T>>,
+    G: FnMut(&str) -> bench_runner::Result<()>,
+{
+    let OfficialParams {
+        golden,
+        scoring,
+        digests,
+        commit,
+        spec,
+        window,
+    } = run;
+    // Official times the golden's benchmark ORACLE workload (Swift's official benchmark),
+    // NOT cases[0]. A benchmark-less golden fails preflight (Swift throws before spawning).
+    let benchmark = match &golden.benchmark {
+        Some(b) => b,
+        None => {
+            return official_failed(
+                golden,
+                digests,
+                commit,
+                "benchmark golden file must contain a benchmark oracle".to_string(),
+                scoring,
+            )
+        }
+    };
+    // SPEC ON THE TIMED LEG (`--mtp-depth` / `--candidate-spec`). The official path used to build
+    // its `TimingParams` with NO spec at all, so `free_decode_begin` went out bare and the engine
+    // resolved its default — serial. On an engine where speculation is a SERVE-BOOT property that
+    // was invisible; on a per-REQUEST engine it means a declared MTP leg was measured SERIAL while
+    // being scored against the MTP oracle. The resolved spec now rides the timed window, and the
+    // engine's `effective_spec` echo must equal it or the leg is discarded (spec-never-ignored,
+    // enforced in `bench_runner`). `None` is byte-for-byte the historical bare request.
+    let (measured, held_session) = match measure_candidate_window(
+        OfficialParams {
+            golden,
+            scoring,
+            digests,
+            commit,
+            spec,
+            window,
+        },
+        benchmark,
+        &mut spawn_timed,
+        &mut cool_gate,
+    ) {
+        Ok(measured) => measured,
+        Err(payload) => return *payload,
+    };
+
+    // Correctness on the SAME resident worker: the timed decode phase closed its barrier (allocator
+    // drained), leaving the session healthy, and `correctness_begin` fires the worker's
+    // `beginMeasuredPhase` reset again — the accepted per-phase isolation substitute. The
+    // take-closure hands `finish_official` that one held session exactly once.
+    let mut held = Some(held_session);
+    finish_official(
+        golden,
+        scoring,
+        bands,
+        digests,
+        commit,
+        &measured,
+        move || {
+            held.take().ok_or_else(|| {
+                RunnerError::Protocol(
+                    "the window correctness phase was requested but the resident session was \
+                     already consumed"
+                        .to_string(),
+                )
+            })
+        },
+    )
+}
+
+/// The EXACT-MATCH name of the refusal "the serial-control leg did not complete".
+pub const SERIAL_CONTROL_LEG_FAILED: &str = "SERIAL-CONTROL-LEG-FAILED";
+
+/// LEG 1 of a paired ranked run: the SERIAL-CONTROL leg on the organizer-staged REFERENCE tree.
+///
+/// It is the same window the candidate leg runs — same prompt, same 128-token decode depth, same
+/// per-platform prefill warm-up count, same unmeasured warmup leg, same per-phase cool gate — with
+/// ONE difference: **no spec**. The control is serial by construction, because the score is a
+/// speculative leg divided by a serial one.
+///
+/// `golden` is therefore the SERIAL golden: the tape a serial decode of that prompt produces. On a
+/// track whose timed oracle at the candidate's depth is byte-identical to the serial tape it is
+/// the candidate's own golden; on a track with per-depth oracle tapes it is the separate serial
+/// live golden (`--control-golden`). Verifying a serial leg against a per-depth tape refuses at
+/// the first step the two tapes disagree on.
+///
+/// It is also the WHOLE of what `benchd calibrate-baseline` measures: the calibrator calls this
+/// function, once per pass, so a box's band and a box's ranked denominator can never be measured
+/// two different ways. The session is opened and reaped inside this call — leg 1 holds no residency
+/// while leg 2 runs, which is the sequential residency the ruling requires.
+///
+/// Every failure refuses BY NAME ([`SERIAL_CONTROL_LEG_FAILED`]): the reference tree is the
+/// organizer's, so a fault here is never the candidate's fault and must not be reported as one.
+pub fn run_serial_control_leg<T, FB, G>(
+    golden: &GoldenFixture,
+    window: &WindowShape,
+    mut spawn_baseline: FB,
+    mut cool_gate: G,
+) -> Result<TimingResult, String>
+where
+    T: LineTransport,
+    FB: FnMut() -> bench_runner::Result<Session<T>>,
+    G: FnMut(&str) -> bench_runner::Result<()>,
+{
+    let benchmark = golden.benchmark.as_ref().ok_or_else(|| {
+        format!(
+            "{SERIAL_CONTROL_LEG_FAILED}: the golden carries no benchmark oracle, so there is no \
+             prompt for the control leg to measure"
+        )
+    })?;
+    // NO SPEC: the control leg is serial, and `None` is what puts nothing on the wire.
+    let params = official_timed_params(benchmark, None, window);
+    let warmup_params = official_warmup_params(benchmark, None, window);
+    let measured = run_timed_window(
+        &params,
+        warmup_params.as_ref(),
+        &mut spawn_baseline,
+        &mut cool_gate,
+    );
+    // Reap leg 1's residency before returning: leg 2 loads next, and two model residencies must
+    // never be live at once.
+    measured
+        .map(|(timing, session)| {
+            drop(session);
+            timing
+        })
+        .map_err(|e| match e {
+            TimedWindowFailure::Warmup(e) => {
+                format!("{SERIAL_CONTROL_LEG_FAILED}: reference warmup leg failed: {e}")
+            }
+            TimedWindowFailure::Timed(e) => format!("{SERIAL_CONTROL_LEG_FAILED}: {e}"),
+        })
+}
+
+/// What a paired run seals about its baseline beyond the numbers themselves: which box, which
+/// calibration bytes, which reference commit, and whether the band gate ran.
+#[derive(Debug, Clone, Copy)]
+pub struct PairedBaselineSeal<'a> {
+    pub box_name: &'a str,
+    pub calibration_sha256: &'a str,
+    /// The digest of the GOLDEN leg 1 verified its decode tokens against. It is the candidate
+    /// golden's on a track whose timed oracle at the declared depth IS the serial tape, and the
+    /// serial live golden's on a track that carries per-depth oracle tapes.
+    pub control_golden_sha256: &'a str,
+    pub reference_commit: &'a str,
+    /// `true` once the control leg passed this box's band. A run whose leg failed the band seals
+    /// no score, so this is `true` wherever it is sealed.
+    pub band_passed: bool,
+    /// The control leg's measured `(prefill, decode)` seconds-per-token, or `None` when the leg
+    /// never produced a timing (its own failure payload).
+    pub leg: Option<(f64, f64)>,
+}
+
+/// Seal the paired-baseline facts onto a payload's metrics.
+///
+/// The CANDIDATE leg's numbers are READ BACK from the enforced fields
+/// (`prefill_seconds_per_token` / `decode_seconds_per_token`) rather than passed in again, so the
+/// named copies cannot drift from the numbers that were scored — the same discipline
+/// `per_prompt.mtp_seconds_per_token_mean` follows. A payload with no candidate timing (a
+/// preflight or control-leg refusal) seals no candidate keys: absent is "no leg ran", which is a
+/// different claim from zero.
+///
+/// The historical `baseline_{prefill,decode}_seconds_per_token` fields are NOT written here. They
+/// already carry the control leg's values, because the control leg's values are what the scoring
+/// call was given — that is the point of the design, and the board keeps reading them.
+pub fn seal_paired_baseline(metrics: &mut ScoreMetrics, seal: &PairedBaselineSeal<'_>) {
+    metrics.baseline_source = Some(crate::baseline::BASELINE_SOURCE_SERIAL_CONTROL_LEG.to_string());
+    metrics.baseline_box = Some(seal.box_name.to_string());
+    metrics.baseline_calibration_sha256 = Some(seal.calibration_sha256.to_string());
+    metrics.baseline_golden_sha256 = Some(seal.control_golden_sha256.to_string());
+    metrics.baseline_reference_commit = Some(seal.reference_commit.to_string());
+    metrics.baseline_band_passed = Some(seal.band_passed);
+    if let Some((prefill, decode)) = seal.leg {
+        metrics.baseline_leg_prefill_seconds_per_token = Some(prefill);
+        metrics.baseline_leg_decode_seconds_per_token = Some(decode);
+    }
+    metrics.candidate_leg_prefill_seconds_per_token =
+        finite_positive(metrics.prefill_seconds_per_token);
+    metrics.candidate_leg_decode_seconds_per_token =
+        finite_positive(metrics.decode_seconds_per_token);
+}
+
+/// `Some(v)` for a finite, strictly-positive measurement; `None` for the zero placeholder a
+/// payload carries when no leg ran.
+fn finite_positive(v: f64) -> Option<f64> {
+    (v.is_finite() && v > 0.0).then_some(v)
+}
+
+/// A paired REFUSAL: a failed payload carrying the paired seal, so a reader of a refused run
+/// still learns which box, which calibration bytes and which reference commit it ran under. `leg`
+/// is the control leg's measured pair when one was measured, and `None` when no leg completed —
+/// absent is "no leg ran", never zero.
+fn paired_refusal(
+    golden: &GoldenFixture,
+    digests: RunDigests<'_>,
+    commit: &str,
+    error: String,
+    seal: PairedBaselineSeal<'_>,
+    leg: Option<(f64, f64)>,
+    // The rules the run was ARMED with, over a pair of `0.0/0.0`: no denominator was established
+    // and none is invented (`ScoringInputs::no_denominator`).
+    scoring: ScoringInputs,
+) -> ScorePayload {
+    let mut payload = official_failed(golden, digests, commit, error, scoring);
+    let mut seal = seal;
+    seal.band_passed = false;
+    seal.leg = leg;
+    seal_paired_baseline(&mut payload.metrics, &seal);
+    payload
+}
+
+/// THE TWO GOLDENS a paired run verifies against — one per leg, because the two legs decode two
+/// different ways.
+///
+/// `candidate` is the golden the CANDIDATE leg (leg 2) verifies against, at the depth the
+/// submission declares. `control` is the golden the SERIAL-CONTROL leg (leg 1) verifies against.
+/// They are the SAME golden on a track whose timed oracle at that depth is byte-identical to the
+/// serial tape, and DIFFERENT on a track that carries per-depth oracle tapes: leg 1 is serial by
+/// construction, so it can only be verified against the serial tape. On the MLX engine the
+/// per-depth tape diverges from the serial one at step 1, so one shared golden kills leg 1.
+#[derive(Clone, Copy)]
+pub struct PairedGoldens<'a> {
+    pub candidate: &'a GoldenFixture,
+    pub control: &'a GoldenFixture,
+}
+
+/// The ENGINE and WORKER lifecycles of a paired run's two legs, in one value so the paired entry
+/// point states its inputs as two groups — WHO runs the legs, and WHAT window they run.
+///
+/// `open_*_leg` is a leg's per-platform ENGINE lifecycle: it returns a GUARD that is dropped the
+/// moment its leg ends. `spawn_*` opens that leg's WORKER, rooted at that leg's tree.
+pub struct PairedLegs<LB, LC, FB, FT> {
+    pub open_baseline_leg: LB,
+    pub open_candidate_leg: LC,
+    pub spawn_baseline: FB,
+    pub spawn_timed: FT,
+}
+
+/// WHAT window a paired run measures: the acceptance bands, the candidate leg's requested spec, the
+/// measured/checked window shape, and the per-phase cool gate both legs pass.
+///
+/// The PLATFORM used to ride here too, for one reason: it keyed the unmeasured prefill-pass count.
+/// That count is now part of the RESOLVED window below (STEP 1 of the constants→contract
+/// migration, David 2026-09-15), resolved once before the run, so the platform has nothing left to
+/// decide here and is gone rather than carried unused.
+pub struct PairedWindow<G> {
+    pub bands: AcceptanceBands,
+    pub spec: Option<SpecConfig>,
+    /// The run's RESOLVED measurement window (STEP 1, David 2026-09-15): the timed decode depth,
+    /// the checked-step count and the unmeasured prefill passes, from the pinned track fixture when
+    /// it declares them and from the in-tree constants when it does not.
+    pub window: WindowShape,
+    pub cool_gate: G,
+    /// Pairs per scored run, from the pinned track fixture (`official_pairs`; David 2026-09-09
+    /// ruled 2 on both platforms). Every pair is one serial-control leg then one candidate leg.
+    pub pairs: usize,
+    /// The speedup floors this run enforces and seals, from the pinned track fixture
+    /// (`decode_speedup_floor` / `prefill_speedup_floor`; David 2026-09-09 ruled 0.95 / 0.95,
+    /// configurable per project). The fixture is the only source on the scored path.
+    pub floors: SpeedupFloors,
+    /// The composite weights this run scores and gates under, from the pinned track fixture
+    /// (`score_decode_weight` / `score_prefill_weight`; STEP 1 of the constants→contract
+    /// migration, David 2026-09-15), falling back to the 0.75/0.25 constants while no fixture
+    /// declares them.
+    pub weights: ScoringWeights,
+}
+
+/// THE RANKED PAIRED PATH (David ruling 2026-09-08): two legs on one box in one job.
+///
+/// 1. **Serial-control leg** on the REFERENCE tree (`spawn_baseline`), no speculation
+///    ([`run_serial_control_leg`]), verified against `goldens.control` — the SERIAL tape.
+/// 2. **Band check** of that leg against THIS BOX's calibration file. The band is a health gate on
+///    leg 1; no number in the file is ever a denominator. Outside the band, the run dies by name
+///    and seals no score.
+/// 3. **Candidate leg** on the submission tree (`spawn_timed`) at its declared depth, followed by
+///    the full correctness set — [`official_core_windowed`], unchanged, verified against
+///    `goldens.candidate`, with the LIVE measurement from step 1 as its baseline pair. The score is therefore
+///    `(ref_prefill/cand_prefill)^0.25 * (ref_decode/cand_decode)^0.75`, with the floors and the
+///    band shape untouched.
+///
+/// RESIDENCY is sequential, and it brackets each leg on BOTH levels. `open_baseline_leg` /
+/// `open_candidate_leg` are the platform's per-leg ENGINE lifecycle: on a platform whose worker
+/// holds the model they do nothing, and on a platform whose worker is an adapter over a resident
+/// engine they boot that leg's resident from that leg's own tree (see [`crate::legserve`]). Each
+/// returns a GUARD that is dropped the moment its leg ends — before the next leg opens — so two
+/// residents never hold GPU memory at once. Inside a leg, the worker itself is reaped the same
+/// way: one model is loaded at a time, and each leg loads exactly once.
+///
+/// The paired seal rides on EVERY payload this returns, including the refusals, because "which box
+/// and which calibration" is exactly what a reader of a refused run needs.
+pub fn official_core_paired<T, L, LB, LC, FB, FT, G>(
+    goldens: PairedGoldens<'_>,
+    calibration: &crate::baseline::BaselineCalibration,
+    seal: PairedBaselineSeal<'_>,
+    digests: RunDigests<'_>,
+    commit: &str,
+    legs: PairedLegs<LB, LC, FB, FT>,
+    window: PairedWindow<G>,
+) -> ScorePayload
+where
+    T: LineTransport,
+    LB: FnMut() -> Result<L, String>,
+    LC: FnMut() -> Result<L, String>,
+    FB: FnMut() -> bench_runner::Result<Session<T>>,
+    FT: FnMut() -> bench_runner::Result<Session<T>>,
+    G: FnMut(&str) -> bench_runner::Result<()>,
+{
+    let PairedGoldens {
+        candidate: golden,
+        control: control_golden,
+    } = goldens;
+    let PairedLegs {
+        mut open_baseline_leg,
+        mut open_candidate_leg,
+        mut spawn_baseline,
+        mut spawn_timed,
+    } = legs;
+    let PairedWindow {
+        bands,
+        spec,
+        window: window_shape,
+        mut cool_gate,
+        pairs,
+        floors,
+        weights,
+    } = window;
+    if pairs == 0 {
+        return paired_refusal(
+            golden,
+            digests,
+            commit,
+            "the paired official run was asked for 0 pairs; the track fixture must declare at least 1"
+                .to_string(),
+            seal,
+            None,
+            ScoringInputs::no_denominator(floors, weights),
+        );
+    }
+    let benchmark = match &golden.benchmark {
+        Some(b) => b,
+        None => {
+            return paired_refusal(
+                golden,
+                digests,
+                commit,
+                "benchmark golden file must contain a benchmark oracle".to_string(),
+                seal,
+                None,
+                ScoringInputs::no_denominator(floors, weights),
+            )
+        }
+    };
+
+    // PAIR LOOP. Every pair is the same two legs in the same order: the serial-control leg on the
+    // reference tree, band-checked against the box calibration, then the candidate leg. A leg's
+    // ENGINE comes up before its worker and goes down before the next leg's comes up, so two
+    // residents never hold GPU memory at once. The LAST pair's candidate session is kept open on
+    // the load-once residency so the correctness gate runs over the same model residency.
+    let mut records: Vec<PairedLegRecord> = Vec::with_capacity(pairs);
+    let mut candidate_timings: Vec<TimingResult> = Vec::with_capacity(pairs);
+    let mut held_session: Option<Session<T>> = None;
+    let mut held_candidate_leg: Option<L> = None;
+    for pair in 1..=pairs {
+        let baseline_leg = match open_baseline_leg() {
+            Ok(guard) => guard,
+            Err(e) => {
+                return with_measured_pairs(
+                    paired_refusal(
+                        golden,
+                        digests,
+                        commit,
+                        e,
+                        seal,
+                        None,
+                        ScoringInputs::no_denominator(floors, weights),
+                    ),
+                    records,
+                )
+            }
+        };
+        let control_result = run_serial_control_leg(
+            control_golden,
+            &window_shape,
+            &mut spawn_baseline,
+            &mut cool_gate,
+        );
+        drop(baseline_leg);
+        let control = match control_result {
+            Ok(t) => t,
+            Err(e) => {
+                return with_measured_pairs(
+                    paired_refusal(
+                        golden,
+                        digests,
+                        commit,
+                        e,
+                        seal,
+                        None,
+                        ScoringInputs::no_denominator(floors, weights),
+                    ),
+                    records,
+                )
+            }
+        };
+        let measured_leg = Some((
+            control.prefill_seconds_per_token,
+            control.decode_seconds_per_token,
+        ));
+        if let Err(e) = calibration.check_band(
+            control.prefill_seconds_per_token,
+            control.decode_seconds_per_token,
+        ) {
+            let e = if pairs > 1 {
+                format!("pair {pair} of {pairs}: {e}")
+            } else {
+                e
+            };
+            return with_measured_pairs(
+                paired_refusal(
+                    golden,
+                    digests,
+                    commit,
+                    e,
+                    seal,
+                    measured_leg,
+                    ScoringInputs::no_denominator(floors, weights),
+                ),
+                records,
+            );
+        }
+        let candidate_leg = match open_candidate_leg() {
+            Ok(guard) => guard,
+            Err(e) => {
+                return with_measured_pairs(
+                    paired_refusal(
+                        golden,
+                        digests,
+                        commit,
+                        e,
+                        seal,
+                        measured_leg,
+                        ScoringInputs::no_denominator(floors, weights),
+                    ),
+                    records,
+                )
+            }
+        };
+        let (timing, session) = match measure_candidate_window(
+            OfficialParams {
+                golden,
+                // THE LIVE DENOMINATOR: this pair's own control leg, with the track's floors.
+                scoring: ScoringInputs {
+                    baseline_prefill_spt: control.prefill_seconds_per_token,
+                    baseline_decode_spt: control.decode_seconds_per_token,
+                    floors,
+                    weights,
+                },
+                digests,
+                commit,
+                spec: spec.clone(),
+                window: &window_shape,
+            },
+            benchmark,
+            &mut spawn_timed,
+            &mut cool_gate,
+        ) {
+            Ok(measured) => measured,
+            Err(payload) => {
+                let mut payload = *payload;
+                drop(candidate_leg);
+                let mut seal = seal;
+                seal.band_passed = true;
+                seal.leg = measured_leg;
+                seal_paired_baseline(&mut payload.metrics, &seal);
+                payload.metrics.paired_legs = records;
+                return payload;
+            }
+        };
+        let (control_seed_window, control_decode_window) = window_per_token(&control);
+        let (candidate_seed_window, candidate_decode_window) = window_per_token(&timing);
+        records.push(PairedLegRecord {
+            pair: pair as i64,
+            control_prefill_seconds_per_token: control.prefill_seconds_per_token,
+            control_decode_seconds_per_token: control.decode_seconds_per_token,
+            candidate_prefill_seconds_per_token: timing.prefill_seconds_per_token,
+            candidate_decode_seconds_per_token: timing.decode_seconds_per_token,
+            control_seed_prefill_window_seconds_per_token: control_seed_window,
+            control_decode_window_seconds_per_token: control_decode_window,
+            candidate_seed_prefill_window_seconds_per_token: candidate_seed_window,
+            candidate_decode_window_seconds_per_token: candidate_decode_window,
+        });
+        candidate_timings.push(timing);
+        if pair < pairs {
+            drop(session);
+            drop(candidate_leg);
+        } else {
+            held_session = Some(session);
+            held_candidate_leg = Some(candidate_leg);
+        }
+    }
+
+    // AGGREGATE (the track fixture's formula, applied per leg role): the elapsed per-token time of
+    // a role is summed over the pairs, and the ratio of the two sums is the gain — i.e. the mean
+    // per-token time of the control legs over the mean per-token time of the candidate legs, per
+    // component. With ONE pair this is exactly the single-pair ratio.
+    let (control_prefill, control_decode) = aggregate_control(&records);
+    let candidate = aggregate_candidate(&candidate_timings);
+    // The scored run's inputs: the control legs' aggregate as the denominator, the track fixture's
+    // floors as the gate. One value, so the floors this run enforces are the floors it seals.
+    let paired_scoring = ScoringInputs {
+        baseline_prefill_spt: control_prefill,
+        baseline_decode_spt: control_decode,
+        floors,
+        weights,
+    };
+
+    let mut held = held_session;
+    let mut payload = finish_official(
+        golden,
+        paired_scoring,
+        bands,
+        digests,
+        commit,
+        &candidate,
+        move || {
+            held.take().ok_or_else(|| {
+                RunnerError::Protocol(
+                    "the window correctness phase was requested but the resident session was \
+                     already consumed"
+                        .to_string(),
+                )
+            })
+        },
+    );
+    drop(held_candidate_leg);
+    let mut seal = seal;
+    seal.band_passed = true;
+    seal.leg = Some((control_prefill, control_decode));
+    seal_paired_baseline(&mut payload.metrics, &seal);
+    seal_window_means(&mut payload.metrics, &records);
+    payload.metrics.paired_legs = records;
+    payload
+}
+
+/// One pair's two legs, as measured, sealed for the audit trail (`metrics.paired_legs`).
+pub use crate::score::PairedLegRecord;
+
+/// The control legs' aggregate: mean per-token time per component over the pairs (= the ratio of
+/// the summed per-token times, the fixture's aggregate rule).
+/// One leg's free-run window SPLIT per token — `(seed prefill / seed length, decode / N)` — or
+/// `(None, None)` when the leg timed a teacher-forced window that has no split. REPORT-ONLY.
+fn window_per_token(timing: &TimingResult) -> (Option<f64>, Option<f64>) {
+    let Some(w) = timing.phase_window else {
+        return (None, None);
+    };
+    let per = |seconds: f64, tokens: usize| {
+        (tokens > 0 && seconds.is_finite() && seconds > 0.0).then(|| seconds / tokens as f64)
+    };
+    (
+        per(w.seed_prefill_elapsed_seconds, timing.prefill_prompt_tokens),
+        per(w.decode_elapsed_seconds, timing.decode_steps),
+    )
+}
+
+/// Seal the per-role MEANS of the pairs' window splits onto the flat metrics
+/// (`ScoreMetrics::*_leg_*_window_seconds_per_token`). A role's mean is absent unless EVERY
+/// measured pair carried that split, so a mean never quietly averages over fewer pairs than the
+/// enforced figures do.
+fn seal_window_means(metrics: &mut ScoreMetrics, records: &[PairedLegRecord]) {
+    fn mean(values: Vec<Option<f64>>) -> Option<f64> {
+        if values.is_empty() || values.iter().any(Option::is_none) {
+            return None;
+        }
+        Some(values.iter().map(|v| v.unwrap()).sum::<f64>() / values.len() as f64)
+    }
+    metrics.baseline_leg_decode_window_seconds_per_token =
+        mean(records.iter().map(|r| r.control_decode_window_seconds_per_token).collect());
+    metrics.candidate_leg_decode_window_seconds_per_token =
+        mean(records.iter().map(|r| r.candidate_decode_window_seconds_per_token).collect());
+    metrics.baseline_leg_seed_prefill_window_seconds_per_token = mean(
+        records.iter().map(|r| r.control_seed_prefill_window_seconds_per_token).collect(),
+    );
+    metrics.candidate_leg_seed_prefill_window_seconds_per_token = mean(
+        records.iter().map(|r| r.candidate_seed_prefill_window_seconds_per_token).collect(),
+    );
+}
+
+fn aggregate_control(records: &[PairedLegRecord]) -> (f64, f64) {
+    let n = records.len() as f64;
+    let prefill = records
+        .iter()
+        .map(|r| r.control_prefill_seconds_per_token)
+        .sum::<f64>()
+        / n;
+    let decode = records
+        .iter()
+        .map(|r| r.control_decode_seconds_per_token)
+        .sum::<f64>()
+        / n;
+    (prefill, decode)
+}
+
+/// The candidate legs' aggregate: the LAST pair's timing (its spec audit and diagnostics) with the
+/// per-token times replaced by the per-component means over the pairs and the elapsed seconds
+/// summed, so `timed_benchmark_seconds` still reads as the total timed candidate work.
+fn aggregate_candidate(timings: &[TimingResult]) -> TimingResult {
+    let n = timings.len() as f64;
+    let mut agg = timings
+        .last()
+        .cloned()
+        .expect("aggregate_candidate is called with at least one pair");
+    agg.prefill_seconds_per_token = timings
+        .iter()
+        .map(|t| t.prefill_seconds_per_token)
+        .sum::<f64>()
+        / n;
+    agg.decode_seconds_per_token = timings
+        .iter()
+        .map(|t| t.decode_seconds_per_token)
+        .sum::<f64>()
+        / n;
+    agg.prefill_elapsed_seconds = timings.iter().map(|t| t.prefill_elapsed_seconds).sum();
+    agg.decode_elapsed_seconds = timings.iter().map(|t| t.decode_elapsed_seconds).sum();
+    agg
+}
+
+/// A refusal that also seals the pairs already measured before it (`metrics.paired_legs`).
+fn with_measured_pairs(mut payload: ScorePayload, records: Vec<PairedLegRecord>) -> ScorePayload {
+    payload.metrics.paired_legs = records;
+    payload
+}
+
+/// Steps 2-4 of the official flow, given the already-measured `timing`: official GATING
+/// (non-finite → floors → bands), then FULL-scope correctness on a fresh worker, then the
+/// passing-score assembly. Separated from the timed phase so both the gating (with synthetic
+/// in-band timings) and the orchestration (with a mock timed phase) are unit-testable.
+fn finish_official<T, FC>(
+    golden: &GoldenFixture,
+    scoring: ScoringInputs,
+    bands: AcceptanceBands,
+    digests: RunDigests<'_>,
+    commit: &str,
+    timing: &TimingResult,
+    mut spawn_correctness: FC,
+) -> ScorePayload
+where
+    T: LineTransport,
+    FC: FnMut() -> bench_runner::Result<Session<T>>,
+{
+    let (baseline_prefill_spt, baseline_decode_spt) = scoring.baselines();
+    // 2. Official GATING, evaluated BEFORE correctness (Swift Score.swift:50-126,
+    //    QwenRuntimeBenchmark.swift:513-558): non-finite score → floors (0.95) → acceptance
+    //    bands (prefill ±5%, decode +2%/−5%). The FIRST failure reason (in that priority)
+    //    fails the run; real timing is retained.
+    let eval = evaluate_timed_run(
+        timing.decode_seconds_per_token,
+        timing.prefill_seconds_per_token,
+        baseline_decode_spt,
+        baseline_prefill_spt,
+        bands,
+        // THE RUN'S OWN FLOORS (David 2026-09-09), from the `--contract` track fixture. The same
+        // value seals `metrics.{decode,prefill}_speedup_floor` on every payload below, so the
+        // artifact states the floor this gate enforced.
+        scoring.floors,
+        // …and THE RUN'S OWN COMPOSITE WEIGHTS (STEP 1, David 2026-09-15), resolved from the same
+        // fixture. The gate and the published score now read ONE weighting.
+        scoring.weights,
+    );
+    if let Some(reason) = eval.first_failure_reason() {
+        // RULING 2 (trusted-core, official path): this is the TIMED-band failure — non-finite
+        // score / speedup floor / acceptance band — which Swift evaluates BEFORE correctness
+        // runs. `official_failed_timed_band` retains the real measured timing surface but
+        // BLANKS the correctness-derived audit fields (golden_hash="", case_count=0,
+        // checked_steps=0) to byte-match Swift's `correctness == nil` failed score. This is
+        // DISTINCT from the correctness-failure path below, which is left unchanged.
+        return official_failed_timed_band(golden, digests, commit, reason, timing, scoring);
+    }
+
+    // 3. CORRECTNESS on the THIRD fresh worker, FULL scope.
+    //
+    // ⚠️ MINOR-1 (B-2): `CorrectnessScope::Full` evaluates base cases + anchors + free_run,
+    // but NOT the BEHAVIOR / GPQA-TTFT gates — bench-core conformance does not yet execute
+    // them (the report carries no `behavior` vector; `benchmark_requires_runtime_worker`
+    // DETECTS a behavior-carrying golden but nothing evaluates it). Behavior/GPQA execution is
+    // deferred to B-3. UNTIL THEN, official is NOT a complete correctness gate for a
+    // behavior-carrying golden: a corrupted behavior case would PASS. Do not treat a passing
+    // official run over such a golden as full-correctness evidence.
+    //
+    // A spawn failure fails closed.
+    let mut correctness_session = match spawn_correctness() {
+        Ok(s) => s,
+        Err(e) => {
+            return official_failed_with_timing(
+                golden,
+                digests,
+                commit,
+                format!("correctness worker spawn failed: {e}"),
+                timing,
+                scoring,
+            )
+        }
+    };
+    let report = {
+        let mut adapter = SessionEngine {
+            session: &mut correctness_session,
+            drained_once: false,
+        };
+        match run_conformance(
+            &mut adapter,
+            golden,
+            bench_core::constants::CORRECTNESS_STEPS,
+            CorrectnessScope::Full,
+            digests.model.vocab_size,
+        ) {
+            Ok(r) => r,
+            Err(e) => {
+                return official_failed_with_timing(
+                    golden,
+                    digests,
+                    commit,
+                    format!("{e}"),
+                    timing,
+                    scoring,
+                )
+            }
+        }
+    };
+    // Close the final correctness sub-phase (the per-sequence barrier owner, as in
+    // iterate_core) so no completed-work leaks; a barrier failure fails the run.
+    if let Err(e) = correctness_session.close_phase() {
+        return official_failed_with_timing(
+            golden,
+            digests,
+            commit,
+            format!("{e}"),
+            timing,
+            scoring,
+        );
+    }
+
+    if !report.passed {
+        let (case, step, error) = official_correctness_failure(&report);
+        return official_failed_with_timing_and_case(
+            golden,
+            digests,
+            commit,
+            error,
+            timing,
+            scoring,
+            // The REAL partial per-case checked-step sum through the failing gate (Swift
+            // `correctness?.checkedSteps`, :1143): anchor-fail and free-run-fail yield the
+            // accumulated sum, NOT the placeholder case count.
+            CorrectnessFailure {
+                first_failing_case: case,
+                first_failing_step: step,
+                checked_steps: report.checked_steps(),
+            },
+        );
+    }
+
+    // 4. PASSING official score: the weighted-geometric-mean score (never coarsened),
+    //    real timing surface, full correctness case counts, and the resolved commit.
+    let mut metrics = base_metrics(Mode::Official, golden, digests, scoring);
+    apply_timing_metrics(&mut metrics, timing, scoring);
+    seal_official_per_prompt(&mut metrics, golden, timing);
+    metrics.passed_correctness = true;
+    metrics.commit = commit.to_string();
+    // checkGates == true ⇒ caseCount = totalCorrectnessCaseCount (Swift
+    // QwenRuntimeCorrectness.swift:351). checked_steps is now the REAL per-case checked-step
+    // SUM (Swift `runLayeredCorrectness` accumulator, :192-306) — a passing official run sums
+    // every evaluated base/anchor/free-run case, NOT the placeholder case count. (Behavior/GPQA
+    // steps remain the documented B-3 gap; see ConformanceReport::checked_steps.)
+    metrics.case_count = golden.total_correctness_case_count() as i64;
+    metrics.checked_steps = report.checked_steps();
+    ScorePayload {
+        score: Some(eval.score),
+        passed: true,
+        metrics,
+    }
+}
+
+/// GATES-ONLY official run (seam 1): `MLXFAST_BENCHMARK_SKIP_TIMED=1` skips the timed phases and
+/// runs ONLY the correctness gates, sealing a `partial_result=true` gates-score — the seam-1
+/// shape the paired overlay (`overlay-timing`) later completes with the measured timing. This is
+/// benchd's parity implementation of the reference `mlxfast-swift` SKIP_TIMED path
+/// (`main.swift@b26f76f:386,397` → `QwenRuntimeBenchmark.swift@b26f76f:457`; #132/F-7 corrected
+/// this from `main.swift:321-322`, which is the local branch): a passing gates run is
+/// `passed=true`, `partial_result=true`,
+/// `passed_correctness=true`, `error==""`, `score=null`, with the timing fields left at their
+/// zero placeholders (the overlay owns them). No timed phase runs, so no paired baselines are
+/// needed here (correctness is oracle-only). Pure over the transport so tests drive it with an
+/// in-process `MockEngine`.
+/// The OFFICIAL path's baseline pair, in the reference's own resolution order (#132/F-2).
+///
+/// `pairedBaseline ?? benchmarkGolden.resolvedBaseline*`, where `resolvedBaseline*` is itself
+/// `golden's declared pair ?? MLXFastConstants.officialBaseline*`
+/// (`QwenRuntimeBenchmark.swift@b26f76f:441-445`, `Golden.swift@b26f76f:220-226`).
+///
+/// **Why this exists.** The reference OVERWRITES its baseline locals at `:442-445`, and it does so
+/// BEFORE the `skipTimedBenchmark` branch at `:457` and before every `makeFailedScore` in
+/// `benchmarkWithWorker` (`:533,:545,:560,:625,:638,:680,:690`). So on the official path the
+/// initialiser values at `:350-351` are never what a sealed record carries — the resolved pair is.
+/// #132(a) moved benchd's `base_metrics` default from `0.0` to the CONSTANTS, which is right for
+/// the LOCAL surface (there the reference genuinely seals its constants) but leaked into the three
+/// official payloads that no later step overwrites: the gates-only PASSING partial, the gates
+/// failure, and `official_failed`. Those now resolve properly rather than inheriting either the
+/// old `0.0` or the local surface's constants.
+///
+/// The env override is read here, mirroring the reference's inline
+/// `try PairedBaselineOverride.fromEnvironment()` at `:441`. A half-set/invalid pair resolves to
+/// `None` (falling through to the golden) rather than erroring: on the TIMED official path
+/// `execute_iterate` has already hard-errored on exactly that condition before reaching this code,
+/// and on the gates-only path benchd has never validated the env pair at all. That second gap is
+/// PRE-EXISTING and untouched here — noted so it is not mistaken for something this helper
+/// introduced.
+pub fn official_resolved_baselines(
+    contract: &bench_core::contract::Contract,
+    golden: &GoldenFixture,
+    track_id: &str,
+) -> Result<(f64, f64), String> {
+    let pair = official_resolved_baseline_pair(golden, track_id, contract)?;
+    // B2 — the SCORING-TIME REGIME FENCE. A track must declare WHAT it scores — the batch size of
+    // its scored point and the composite exponents (`docs/scored-regime-and-prefill-window.md`) —
+    // before this resolution hands a denominator to a scored run.
+    //
+    // It sits OUTSIDE the resolution above, so EVERY source is fenced: the pair can arrive from
+    // `MLXFAST_PAIRED_BASELINE_*` or from the golden without ever reaching the track table, and a
+    // fence those two paths step around is not a fence. It sits AFTER it so a track missing both
+    // facts still refuses with the more specific message — the baseline refusal names the two
+    // sources it tried, which is what an operator needs first.
+    // CONTRACT-FIRST (STEP 1, David 2026-09-15): the fixture's declared regime when it makes one,
+    // the per-track table when it does not. Same fence, same position, resolved source.
+    bench_core::contract::scored_regime(contract, track_id)?;
+    Ok(pair)
+}
+
+/// The resolution itself: `pairedBaseline ?? golden's declared pair ?? the track's captured pair`,
+/// in the reference's order. Split out of [`official_resolved_baselines`] so its every early return
+/// passes through that function's regime fence.
+fn official_resolved_baseline_pair(
+    golden: &GoldenFixture,
+    track_id: &str,
+    contract: &bench_core::contract::Contract,
+) -> Result<(f64, f64), String> {
+    if let Some((prefill, decode)) = paired_baseline_override()? {
+        return Ok((prefill, decode));
+    }
+    // Per-FIELD `?? officialBaseline*`, exactly as `resolvedBaseline*` is defined. The loader
+    // already enforces the pair all-or-nothing, so the two spellings cannot diverge in practice —
+    // this one just cannot drift from the reference's definition if that ever changes.
+    //
+    // The last source is the TRACK's captured pair, not a global. When the track has no captured
+    // pair the resolution REFUSES BY NAME rather than falling back to some other track's numbers:
+    // the message names the track, the pending sentinel, and the two sources already tried.
+    let declared = golden.benchmark.as_ref();
+    let golden_prefill = declared.and_then(|b| b.baseline_prefill_seconds_per_token);
+    let golden_decode = declared.and_then(|b| b.baseline_decode_seconds_per_token);
+    if let (Some(prefill), Some(decode)) = (golden_prefill, golden_decode) {
+        return Ok((prefill, decode));
+    }
+    let track = bench_core::contract::official_baseline(contract, track_id)
+        .map(|r| r.value)
+        .map_err(|e| {
+            format!(
+                "no official baseline pair: \
+             MLXFAST_PAIRED_BASELINE_{{PREFILL,DECODE}}_SECONDS_PER_TOKEN supplied none and the \
+             golden declares no complete benchmark.baseline_{{prefill,decode}}_seconds_per_token \
+             pair, and {e}"
+            )
+        })?;
+    Ok((
+        golden_prefill.unwrap_or(track.prefill_seconds_per_token),
+        golden_decode.unwrap_or(track.decode_seconds_per_token),
+    ))
+}
+
+/// The strict 40-char lowercase-hex shape of a RECORDED dispatch sha (the workflow-authored
+/// `candidate.sha`). Distinct from the 7..=40 `is_commit_sha_hex` predicate that gates the
+/// `metrics.commit` FIELD: a recorded dispatch sha is always a full commit id, so the record is
+/// held to the strict shape the trusted shell validates before it writes the file.
+fn is_dispatch_record_sha(s: &str) -> bool {
+    s.len() == 40
+        && s.bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// A proposed commit AGREES with the record iff it equals the record or is a hex PREFIX of it (the
+/// engine's `commitIdentifier` may emit `git rev-parse --short HEAD`). The 40-hex record is the
+/// authority either way; this is the disagreement predicate the seal binds on.
+fn commit_agrees_with_record(record: &str, proposed: &str) -> bool {
+    record == proposed || record.starts_with(proposed)
+}
+/// AUTHOR-AT-SEAL (DECIDE-3). The SOLE authority for the sealed `metrics.commit` is the sha the
+/// in-repo dispatch script RECORDED from the CI/yukon dispatch context — the challenger
+/// `candidate.sha` shape: a trusted-workflow-authored 40-hex commit id. benchd AUTHORS the sealed
+/// commit FROM that record; a competitor-proposed commit — `MLXFAST_COMMIT_SHA`, which the engine's
+/// `commitIdentifier` emits — is DEFENCE-IN-DEPTH ONLY: present-and-disagreeing is a die-class
+/// refuse, never a silent override of the record. Participant git state is deliberately NOT an
+/// input here: `git rev-parse` is unusable under the ranked sandbox (dubious-ownership under
+/// `env -i`), which is precisely why the trusted dispatch context, not the checkout, is authority.
+///
+/// - `dispatch_record`: the RECORDED dispatched sha (trimmed `candidate.sha` contents), or `None`
+///   when no dispatch context is present. `Some(_)` means a dispatch PROMISED a record, so a
+///   malformed/empty value is a refuse — never a silent fall-through to the git identity.
+/// - `proposed`: the raw, untrusted `MLXFAST_COMMIT_SHA` (or `None`).
+/// - `scoring_mode`: `true` on a SCORING/ranked seal (the default measure-job mode; `false` only
+///   under `--local-dev`). A scoring seal is FAIL-CLOSED: an absent dispatch record REFUSES rather
+///   than falling back to the box git identity — the `git_rev_parse_head` fallback could
+///   otherwise seal an EMPTY `metrics.commit` on a scoring run whose outer dispatch
+///   never exported the context (the present-but-unwired threat). The git fallback survives ONLY in
+///   dev/local mode, gated on the SAME `--local-dev` signal the official pair loop keys on
+///   (`cfg.local_pair_budget`).
+///
+/// Contract:
+/// - record present → it MUST be strict 40-char lowercase-hex (the workflow-authored shape); else
+///   REFUSE. The sealed commit is AUTHORED from it. If `proposed` is present, valid-hex, and
+///   neither equal to nor a hex prefix of the record (the engine may emit a short form of the SAME
+///   commit), the seal is REFUSED — the proposal disagrees with what was dispatched.
+/// - record absent + `scoring_mode` → REFUSE (die-class): a scoring seal must not fall back to git.
+/// - record absent + dev/local → fallback to [`commit_identifier`] (no bind), behaviour unchanged.
+pub fn author_sealed_commit(
+    dispatch_record: Option<&str>,
+    proposed: Option<&str>,
+    scoring_mode: bool,
+) -> Result<String, String> {
+    let record = match dispatch_record {
+        // A dispatch context was present: this record is the authority even if it is junk (a
+        // dispatch that promised a record must not fall through to the git identity).
+        Some(r) => r.trim(),
+        // No dispatch context. A SCORING/ranked seal fails closed here — never the box git HEAD,
+        // which can seal an empty commit on a scoring run whose dispatch never wired the context.
+        None if scoring_mode => {
+            return Err(
+                "author-at-seal: a scoring/ranked seal requires the dispatched commit record \
+                 (candidate.sha via MLXFAST_CANDIDATE_SHA_FILE); none was present — refusing to \
+                 fall back to the box git identity on a scoring run (pass --local-dev for the \
+                 unbound local resolution)"
+                    .to_string(),
+            );
+        }
+        // Dev/local only: the pre-existing, un-bound resolution.
+        None => return Ok(commit_identifier(proposed)),
+    };
+    if !is_dispatch_record_sha(record) {
+        return Err(format!(
+            "author-at-seal: the dispatch record (candidate.sha) is {record:?}, not a \
+             40-character lowercase-hex commit sha; refusing to seal a score against an \
+             unidentified dispatch"
+        ));
+    }
+    // Defence-in-depth cross-check. The record is already the authority; this only decides whether
+    // a PRESENT proposal is a benign short form of the same commit or an actual DISAGREEMENT.
+    if let Some(p) = proposed.map(str::trim).filter(|s| !s.is_empty()) {
+        if is_commit_sha_hex(p) && !commit_agrees_with_record(record, p) {
+            return Err(format!(
+                "author-at-seal: the proposed commit (MLXFAST_COMMIT_SHA) {p:?} disagrees with the \
+                 dispatched record {record:?}; refusing (the dispatch record is the sole authority \
+                 for metrics.commit)"
+            ));
+        }
+    }
+    Ok(record.to_string())
+}
+
+pub fn official_gates_only<T, FC>(
+    golden: &GoldenFixture,
+    scoring: ScoringInputs,
+    digests: RunDigests<'_>,
+    commit: &str,
+    mut spawn_correctness: FC,
+) -> Result<ScorePayload, String>
+where
+    T: LineTransport,
+    FC: FnMut() -> bench_runner::Result<Session<T>>,
+{
+    // #132/F-2: the BASELINE pair is not a zero placeholder and never was — the reference has
+    // already overwritten it with `pairedBaseline ?? golden.resolvedBaseline*` before it reaches
+    // the gates-only branch (`QwenRuntimeBenchmark.swift@b26f76f:442-445` then `:457`). The pair
+    // is resolved ONCE by the CALLER, before anything spawns, and every record this function
+    // seals carries that one pair. It is a parameter rather than an inline resolution because the
+    // two official flows resolve it from different keys — the per-track table
+    // ([`official_resolved_baselines`]) and, on the single-leg path, the run's PLATFORM — and a
+    // second resolution here could disagree with the one the run was armed under.
+
+    // CORRECTNESS on a fresh (sandboxed, in production) worker, FULL scope — identical to the
+    // timed path's correctness step (official_core step 3), just with no preceding timed phase.
+    // A spawn failure fails closed as a gates-only failed score.
+    let mut correctness_session = match spawn_correctness() {
+        Ok(s) => s,
+        Err(e) => {
+            return Ok(official_gates_failed(
+                golden,
+                scoring,
+                digests,
+                commit,
+                GatesFailure::message(format!("correctness worker spawn failed: {e}")),
+            ))
+        }
+    };
+    let report = {
+        let mut adapter = SessionEngine {
+            session: &mut correctness_session,
+            drained_once: false,
+        };
+        match run_conformance(
+            &mut adapter,
+            golden,
+            bench_core::constants::CORRECTNESS_STEPS,
+            CorrectnessScope::Full,
+            digests.model.vocab_size,
+        ) {
+            Ok(r) => r,
+            Err(e) => {
+                return Ok(official_gates_failed(
+                    golden,
+                    scoring,
+                    digests,
+                    commit,
+                    GatesFailure::message(format!("{e}")),
+                ))
+            }
+        }
+    };
+    // Close the final correctness sub-phase (the per-sequence barrier owner) so no completed-work
+    // leaks; a barrier failure fails the run.
+    if let Err(e) = correctness_session.close_phase() {
+        return Ok(official_gates_failed(
+            golden,
+            scoring,
+            digests,
+            commit,
+            GatesFailure::message(format!("{e}")),
+        ));
+    }
+
+    if !report.passed {
+        let (case, step, error) = official_correctness_failure(&report);
+        return Ok(official_gates_failed(
+            golden,
+            scoring,
+            digests,
+            commit,
+            GatesFailure {
+                error,
+                first_failing_case: case,
+                first_failing_step: step,
+                checked_steps: report.checked_steps(),
+            },
+        ));
+    }
+
+    // PASSING gates-only score: partial_result=true (awaiting the timed overlay), null score,
+    // full correctness case counts, resolved commit, zero timing placeholders.
+    // #132/F-2: the BASELINE pair is not a zero placeholder and never was — the reference has
+    // already overwritten it with `pairedBaseline ?? golden.resolvedBaseline*` before it reaches
+    // the gates-only branch (`QwenRuntimeBenchmark.swift@b26f76f:442-445` then `:457`). `baselines`
+    // is that resolved pair, resolved ONCE in `official_gates_only` before anything spawned, and
+    // `base_metrics` seals it.
+    let mut metrics = base_metrics(Mode::Official, golden, digests, scoring);
+    metrics.passed_correctness = true;
+    metrics.partial_result = true;
+    metrics.commit = commit.to_string();
+    metrics.case_count = golden.total_correctness_case_count() as i64;
+    metrics.checked_steps = report.checked_steps();
+    Ok(ScorePayload {
+        score: None,
+        passed: true,
+        metrics,
+    })
+}
+
+/// The correctness audit surface a gates-only FAILURE carries. One value rather than four
+/// arguments: the four are written together at every site and read together by the seal, and a
+/// step index or a checked-step count that travels apart from the error it belongs to is exactly
+/// the kind of drift the seal cannot detect.
+struct GatesFailure {
+    error: String,
+    first_failing_case: Option<String>,
+    first_failing_step: Option<i64>,
+    checked_steps: i64,
+}
+
+impl GatesFailure {
+    /// A failure with no correctness report behind it (a spawn, conformance, or barrier fault):
+    /// no case, no step, nothing checked.
+    fn message(error: String) -> Self {
+        Self {
+            error,
+            first_failing_case: None,
+            first_failing_step: None,
+            checked_steps: 0,
+        }
+    }
+}
+
+/// A FAILED gates-only payload (`score = null`, `passed = false`) that keeps `partial_result=true`
+/// (it is still a gates-only shape, just fail-closed) with the correctness audit surface. No
+/// timing is retained (the timed phase never ran).
+fn official_gates_failed(
+    golden: &GoldenFixture,
+    scoring: ScoringInputs,
+    digests: RunDigests<'_>,
+    commit: &str,
+    failure: GatesFailure,
+) -> ScorePayload {
+    // #132/F-2 — `baselines` is the pair `official_gates_only` resolved before it spawned
+    // anything; the reference's failure records in `benchmarkWithWorker` are all reached AFTER
+    // the `:442-445` overwrite, so they carry the resolved pair too.
+    let mut payload = failed_score(
+        failed_metrics(Mode::Official, golden, digests, scoring, None),
+        FailureReport::correctness(
+            failure.error,
+            failure.first_failing_case,
+            failure.first_failing_step,
+            None,
+            None,
+        ),
+        FailedAudit::Counts {
+            case_count: golden.total_correctness_case_count() as i64,
+            checked_steps: failure.checked_steps,
+        },
+        Some(commit),
+    );
+    // Still a gates-only shape, just fail-closed.
+    payload.metrics.partial_result = true;
+    payload
+}
+
+/// A FAILED official payload (`score = null`, `passed = false`) with NO retained timing
+/// (used for oracle mismatch, benchmark-less golden, and pre-timing spawn faults).
+/// `baselines` is the pair `official_core` already resolved (env ?? `--baseline-*` flags ??
+/// golden) — #132/F-2. Threaded rather than re-derived, because `official_core`'s value is the
+/// only one that has seen the flags; re-resolving from the golden here would silently drop them.
+/// The reference does the same: its failure records read the locals it overwrote at
+/// `QwenRuntimeBenchmark.swift@b26f76f:442-445`, not the initialisers at `:350-351`.
+fn official_failed(
+    golden: &GoldenFixture,
+    digests: RunDigests<'_>,
+    commit: &str,
+    error: String,
+    scoring: ScoringInputs,
+) -> ScorePayload {
+    let cases = golden.total_correctness_case_count() as i64;
+    failed_score(
+        failed_metrics(Mode::Official, golden, digests, scoring, None),
+        FailureReport::message(error, false),
+        FailedAudit::Counts {
+            case_count: cases,
+            checked_steps: cases,
+        },
+        Some(commit),
+    )
+}
+
+/// A FAILED official payload that RETAINS the real timing surface (floor/band/finite failure
+/// and post-timing correctness/barrier faults): the timed phases DID measure real numbers,
+/// so the payload carries them (Swift's failed score keeps the measured decode/prefill spt +
+/// speedups) while `score` stays `null` and `passed = false`.
+fn official_failed_with_timing(
+    golden: &GoldenFixture,
+    digests: RunDigests<'_>,
+    commit: &str,
+    error: String,
+    timing: &TimingResult,
+    scoring: ScoringInputs,
+) -> ScorePayload {
+    official_failed_with_timing_and_case(
+        golden,
+        digests,
+        commit,
+        error,
+        timing,
+        scoring,
+        // Pre-correctness/barrier timed faults have no ConformanceReport to sum; retain the
+        // prior placeholder (golden case-count) for these UNLISTED fault paths — the listed
+        // correctness-failure path below passes the real `report.checked_steps()`.
+        CorrectnessFailure {
+            first_failing_case: None,
+            first_failing_step: None,
+            checked_steps: golden.total_correctness_case_count() as i64,
+        },
+    )
+}
+
+/// RULING 2 (trusted-core, official path) — a FAILED official payload for a TIMED-BAND
+/// failure (non-finite score / speedup floor / acceptance band), which Swift's official path
+/// evaluates BEFORE correctness runs. Retains the real measured timing surface (like
+/// [`official_failed_with_timing`]) but ALIGNS TO SWIFT by BLANKING the correctness-derived
+/// audit fields: `golden_hash = ""`, `case_count = 0`, `checked_steps = 0`.
+///
+/// Why Swift blanks them here: `benchmarkWithWorker` is timed-FIRST, so the floor/band/finite
+/// gates return via `makeFailedScore(correctness: correctnessReport, …)` while
+/// `correctnessReport` is still `nil` — it is only assigned AFTER the correctness worker runs
+/// (QwenRuntimeBenchmark.swift:520-558 precede :596). `failedScore` then defaults
+/// `checkedSteps → correctness?.checkedSteps ?? 0` = 0, `caseCount → … ?? 0` = 0, and
+/// `goldenHash → correctness?.goldenHash ?? ""` = "" (:1143/1144/1158). Official artifacts
+/// feed downstream/organizer tooling that expects Swift's shape, so benchd (the PRODUCER)
+/// aligns to Swift rather than zeroing in the differ (differ-side zeroing rejected).
+///
+/// SCOPE: only the timed-band-BEFORE-correctness path. The correctness-FAILURE path
+/// ([`official_failed_with_timing_and_case`], where correctness DID run and Swift populates
+/// these fields from the real report) is intentionally left unchanged.
+fn official_failed_timed_band(
+    golden: &GoldenFixture,
+    digests: RunDigests<'_>,
+    commit: &str,
+    error: String,
+    timing: &TimingResult,
+    scoring: ScoringInputs,
+) -> ScorePayload {
+    // Align to Swift: correctness never ran at the timed band, so the correctness-derived
+    // audit fields carry Swift's `correctness == nil` defaults.
+    failed_score(
+        failed_metrics(Mode::Official, golden, digests, scoring, Some(timing)),
+        FailureReport::message(error, false),
+        FailedAudit::Blank,
+        Some(commit),
+    )
+}
+
+/// A FAILED official payload for a benchmark-ORACLE token mismatch — a TIMED-phase failure
+/// that Swift's timed-first official path hits BEFORE correctness runs, so it returns via
+/// `makeFailedScore(correctness: correctnessReport /* still nil */)`
+/// (QwenRuntimeBenchmark.swift:668-676 → failedScore :1143-1158).
+///
+/// Aligns to Swift on BOTH sides of the RULING-2 principle (producer matches Swift):
+/// - BLANK the correctness-derived audit fields: `golden_hash = ""`, `case_count = 0`,
+///   `checked_steps = 0` (`correctness?.… ?? default`).
+/// - RETAIN the resolved baselines: `baseline_{prefill,decode}_seconds_per_token` carry the
+///   golden/paired baseline values (resolved at :434-435, BEFORE the timed phase, and passed
+///   straight into `failedScore`). The MEASURED decode/prefill spt stay 0 (the timed phase
+///   never completed a trustworthy measurement), so `apply_timing_metrics` is NOT used here.
+///
+/// `first_failing_case` is always "benchmark"; `first_failing_step` is the decode-token step
+/// (or None for the prefill/seed classes); expected/actual tokens are ALWAYS null (Swift
+/// makeFailedScore).
+fn official_failed_timed_oracle(
+    golden: &GoldenFixture,
+    digests: RunDigests<'_>,
+    commit: &str,
+    error: String,
+    first_failing_step: Option<i64>,
+    scoring: ScoringInputs,
+) -> ScorePayload {
+    let (baseline_prefill_spt, baseline_decode_spt) = scoring.baselines();
+    // Correctness never ran (timed-first): blank the correctness audit surface to Swift's
+    // `correctness == nil` defaults.
+    let mut payload = failed_score(
+        failed_metrics(Mode::Official, golden, digests, scoring, None),
+        FailureReport::correctness(
+            error,
+            Some("benchmark".to_string()),
+            first_failing_step,
+            None,
+            None,
+        ),
+        FailedAudit::Blank,
+        Some(commit),
+    );
+    // Retain the resolved baselines (Swift keeps them; only the MEASURED spt stay 0).
+    payload.metrics.baseline_prefill_seconds_per_token = finite_nonneg(baseline_prefill_spt);
+    payload.metrics.baseline_decode_seconds_per_token = finite_nonneg(baseline_decode_spt);
+    payload
+}
+
+/// As [`official_failed_with_timing`], plus the correctness `first_failing_*` fields for a
+/// correctness-gate failure.
+fn official_failed_with_timing_and_case(
+    golden: &GoldenFixture,
+    digests: RunDigests<'_>,
+    commit: &str,
+    error: String,
+    timing: &TimingResult,
+    scoring: ScoringInputs,
+    correctness: CorrectnessFailure,
+) -> ScorePayload {
+    let CorrectnessFailure {
+        first_failing_case,
+        first_failing_step,
+        checked_steps,
+    } = correctness;
+    failed_score(
+        failed_metrics(Mode::Official, golden, digests, scoring, Some(timing)),
+        // A floor/band failure means correctness never ran (Swift returns before it); a
+        // correctness failure means it ran and failed. Either way passed_correctness = false.
+        // OFFICIAL leaves expected/actual NULL (Swift `failedScore` reads only the explicit param
+        // — nil on every official path — never `correctness?.expectedToken`;
+        // QwenRuntimeBenchmark.swift:1155-1156). This is the LOCAL/OFFICIAL split: the local path
+        // (iterate.rs) DOES populate them.
+        FailureReport::correctness(error, first_failing_case, first_failing_step, None, None),
+        // caseCount stays the golden TOTAL (Swift correctness-fail `caseCount =
+        // totalCorrectnessCaseCount`); checked_steps is the caller-supplied real per-case sum
+        // (partial through the failing gate) or, for report-less timed faults, the placeholder.
+        FailedAudit::Counts {
+            case_count: golden.total_correctness_case_count() as i64,
+            checked_steps,
+        },
+        Some(commit),
+    )
+}
+
+/// Extract the official correctness failure branding from a conformance report, using the
+/// Swift per-gate message (QwenRuntimeCorrectness.swift): base → "teacher-forced token
+/// mismatch", anchor → "anchor token mismatch", free-run → "free-run token mismatch". Runs
+/// in the layered order Swift evaluates (base → anchors → free_run).
+fn official_correctness_failure(
+    report: &ConformanceReport,
+) -> (Option<String>, Option<i64>, String) {
+    // Reuse the shared first-failure walk (base → anchors → free_run) for case/step, then
+    // attach the Swift per-gate message keyed on which vector produced it. Expected/actual
+    // tokens are NOT returned: the OFFICIAL correctness-fail path leaves them null (see the
+    // call site). first_failing_step follows Swift `correctness.firstFailingStep`.
+    if let Some(f) = first_conformance_failure(report) {
+        let is_anchor = report.anchors.iter().any(|a| a.name == f.case && !a.passed);
+        let error = if f.is_base_case {
+            "teacher-forced token mismatch".to_string()
+        } else if is_anchor {
+            "anchor token mismatch".to_string()
+        } else {
+            "free-run token mismatch".to_string()
+        };
+        // Swift `compareAnchorToken` reports firstFailingStep = 0 on an anchor fail
+        // (QwenRuntimeCorrectnessCompare.swift:481) — NOT nil. `first_conformance_failure`
+        // returns None for anchors (an anchor has no per-token step index), so override to 0
+        // here to byte-match Swift's official anchor-fail shape. Base and free-run keep their
+        // mismatch step (Swift base/free-run firstFailingStep = comparison step).
+        let step = if is_anchor { Some(0) } else { f.step };
+        (Some(f.case), step, error)
+    } else {
+        (None, None, "correctness gate failed".to_string())
+    }
+}
+
+/// THE WINDOW THE TEST-ONLY WRAPPERS AND THE UNIT TESTS MEASURE UNDER — the 125B MLX track's own,
+/// as TEST DATA. Shared with `crate::iterate::test_window`, which states the same four values for
+/// the same reason: STEP 3 (David 2026-09-15) deleted `WindowShape::table`, so a test that needs a
+/// window states one.
+#[cfg(test)]
+pub(crate) fn test_window() -> bench_core::constants::WindowShape {
+    crate::iterate::test_window()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::iterate::{DirDigest, HarnessIdentity};
+    use crate::testgolden::track_baseline;
+
+    use crate::testgolden::TEST_BASELINE;
+    use bench_core::constants::{
+        BENCHMARK_DECODE_SEED_TOKENS, BENCHMARK_DECODE_STEPS, BENCHMARK_PREFILL_PROMPT_TOKENS,
+        CORRECTNESS_PROMPT_TOKENS,
+    };
+    use bench_core::golden::load_golden_fixture;
+    use bench_runner::mock::MockEngine;
+    use serde_json::json;
+    use std::cell::Cell;
+
+    /// THE [`OfficialParams`] THESE TESTS RUN UNDER: the shared `TEST_BASELINE` pair against the
+    /// in-tree window, the stub commit, and no spec — the historical defaults the deleted
+    /// `official_core` wrapper used to supply positionally. A test that varies one of the others
+    /// says so in a struct update: `OfficialParams { spec: Some(spec), ..test_run(…) }`.
+    fn test_run<'a>(
+        golden: &'a GoldenFixture,
+        digests: RunDigests<'a>,
+        window: &'a WindowShape,
+    ) -> OfficialParams<'a> {
+        OfficialParams {
+            golden,
+            scoring: ScoringInputs::local(
+                TEST_BASELINE.prefill_seconds_per_token,
+                TEST_BASELINE.decode_seconds_per_token,
+            ),
+            digests,
+            commit: "deadbeef",
+            spec: None,
+            window,
+        }
+    }
+
+    const PREFILL_TOKEN: i64 = 5;
+    const SEED_TOKEN: i64 = 6;
+
+    /// Distinct oracle decode tokens so a corrupted-oracle test can target one step.
+    fn oracle_decode_tokens() -> Vec<i64> {
+        (0..BENCHMARK_DECODE_STEPS as i64)
+            .map(|i| 700 + i)
+            .collect()
+    }
+
+    /// A golden whose benchmark oracle is (5, 6, [700..828)) and whose primary case is
+    /// conformant to teacher-forced [2; 64]. `gates` is spliced into `correctness_gates`.
+    fn official_golden(gates: Option<serde_json::Value>) -> GoldenFixture {
+        official_golden_with_oracle(oracle_decode_tokens(), gates)
+    }
+
+    /// The same golden with a CHOSEN benchmark oracle tape, so a test can put two goldens that
+    /// disagree on the decode tokens in front of the two legs of a paired run.
+    fn official_golden_with_oracle(
+        decode_tokens: Vec<i64>,
+        gates: Option<serde_json::Value>,
+    ) -> GoldenFixture {
+        let mut doc = json!({
+            "version": 1,
+            "model_type": "qwen4_exp_text",
+            "cases": [
+                { "name": "case-a", "prompt_tokens": vec![1i64; CORRECTNESS_PROMPT_TOKENS], "expected_tokens": vec![2i64; 64] }
+            ],
+            "benchmark": {
+                "prefill_prompt_tokens": vec![1i64; BENCHMARK_PREFILL_PROMPT_TOKENS],
+                "expected_prefill_token": PREFILL_TOKEN,
+                "decode_seed_tokens": vec![1i64; BENCHMARK_DECODE_SEED_TOKENS],
+                "expected_decode_seed_token": SEED_TOKEN,
+                "expected_decode_tokens": decode_tokens,
+            }
+        });
+        if let Some(g) = gates {
+            doc["correctness_gates"] = g;
+        }
+        let bytes = serde_json::to_vec(&doc).unwrap();
+        load_golden_fixture(
+            &bytes,
+            64,
+            CORRECTNESS_PROMPT_TOKENS,
+            crate::testgolden::identity_125b(),
+            Some("qwen4_exp_text"),
+            None,
+            None,
+        )
+        .unwrap()
+    }
+
+    /// #134 — the OFFICIAL `score.json` `metrics.error` SINK. This is the most exposed of the
+    /// three seal boundaries: official worker stderr is never forwarded (so the retained tail is
+    /// its only channel) and the artifact travels. Secret-SHAPED without any `expected`/`actual`
+    /// trigger word, so the pre-existing keyword filter would pass every byte through.
+    #[test]
+    fn official_failed_scrubs_engine_text_before_sealing_metrics_error() {
+        let payload = official_failed(
+            &official_golden(None),
+            RunDigests::for_test(&DirDigest::empty()),
+            "commit",
+            format!(
+                "protocol violation: engine closed the stream before returning a response (worker \
+                 exited with status 9; worker stderr tail: open \
+                 /Users/operator/pool-goldens/sample-001.json failed | \
+                 AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMIK7MDENGbPxRfiCY | host=api.example.internal | \
+                 {})",
+                "P".repeat(8192)
+            ),
+            ScoringInputs::local(
+                TEST_BASELINE.prefill_seconds_per_token,
+                TEST_BASELINE.decode_seconds_per_token,
+            ),
+        );
+        let sealed = payload.metrics.error;
+
+        for secret in [
+            "/Users/operator/pool-goldens",
+            "wJalrXUtnFEMIK7MDENGbPxRfiCY",
+            "api.example.internal",
+        ] {
+            assert!(
+                !sealed.contains(secret),
+                "secret-tier content sealed into official metrics.error: {secret:?}"
+            );
+        }
+        assert!(
+            sealed.len() <= bench_runner::SEALED_REASON_BYTE_LIMIT,
+            "sealed metrics.error not capped: {} bytes",
+            sealed.len()
+        );
+        assert!(
+            sealed.starts_with("protocol violation: engine closed the stream"),
+            "signature lost: {sealed}"
+        );
+        assert!(
+            sealed.contains("sample-001.json"),
+            "diagnosis lost: {sealed}"
+        );
+    }
+
+    /// A stub engine conformant on BOTH the timed oracle and the teacher-forced base case.
+    fn conformant_engine() -> MockEngine {
+        MockEngine::new()
+            .teacher_forced_tokens(vec![2i64; 64])
+            .free_run_capable()
+            .oracle_tokens(PREFILL_TOKEN, SEED_TOKEN, oracle_decode_tokens())
+    }
+
+    /// Run the full official_core against `golden` with a `timed` engine factory and the official
+    /// Qwen baselines. NOTE: a MockEngine's ~0 wall-clock cannot
+    /// sit inside the acceptance band, so a conformant mock FAILS on the band — used to prove
+    /// the timed-first orchestration + oracle passed and the band gate is wired. The passing
+    /// SCORE / correctness-scope assertions go through `finish_official` with a synthetic
+    /// in-band TimingResult (see below).
+    fn run_official<FT>(golden: &GoldenFixture, timed: FT) -> ScorePayload
+    where
+        FT: Fn() -> MockEngine,
+    {
+        official_core_windowed(
+            test_run(
+                golden,
+                RunDigests::for_test(&DirDigest::empty()),
+                &test_window(),
+            ),
+            TEST_BASELINE.bands,
+            || Session::connect(timed()).map(|(s, _)| s),
+            // The historical entry point has no cool gate; the ranked one passes the real gate.
+            |_phase: &str| Ok(()),
+        )
+    }
+
+    /// The free-run audit's effective mean draft length carried by [`in_band_timing`] — an
+    /// arbitrary but DISTINCTIVE value, so a sealed `per_prompt` record proves the number travelled
+    /// from the audit rather than being defaulted.
+    const IN_BAND_MEAN_DRAFT_LEN: f64 = 4.25;
+
+    /// A REAL [`FreeRunAudit`], built the only way one can be built — by passing the §2.6
+    /// consistency triple — so a test's audit is never a shape the live path could not produce.
+    /// `acceptance_lengths` sums to N and the round counter is R+1 by construction.
+    fn audit_for_test(
+        acceptance_lengths: Vec<u32>,
+        drafted_total: u64,
+        accepted_total: u64,
+    ) -> bench_core::free_run::FreeRunAudit {
+        let n: u32 = acceptance_lengths.iter().sum();
+        let rounds = acceptance_lengths.len() as i64;
+        bench_core::free_run::verify_consistency(
+            &bench_core::free_run::FreeRunResponse {
+                tokens_len: n as usize,
+                acceptance_lengths,
+                drafted_total,
+                accepted_total,
+                committed_total: n as u64,
+                verify_replay_disagreements: None,
+                verification: None,
+            },
+            n,
+            rounds + 1,
+        )
+        .expect("synthetic free-run audit must satisfy the consistency triple")
+    }
+
+    /// A synthetic TimingResult sitting EXACTLY on the baselines (speedups 1.0, in-band,
+    /// floors pass, score 1.0) — the only way to drive the passing gate deterministically.
+    fn in_band_timing() -> TimingResult {
+        TimingResult {
+            prefill_seconds_per_token: TEST_BASELINE.prefill_seconds_per_token,
+            decode_seconds_per_token: TEST_BASELINE.decode_seconds_per_token,
+            decode_steps: BENCHMARK_DECODE_STEPS,
+            prefill_prompt_tokens: BENCHMARK_PREFILL_PROMPT_TOKENS,
+            prefill_elapsed_seconds: TEST_BASELINE.prefill_seconds_per_token * 512.0,
+            decode_elapsed_seconds: TEST_BASELINE.decode_seconds_per_token
+                * BENCHMARK_DECODE_STEPS as f64,
+            peak_ram_gb: 20.25,
+            effective_spec: None,
+            // mean(4, 4, 4, 5) == 4.25 == IN_BAND_MEAN_DRAFT_LEN.
+            free_run_audit: Some(audit_for_test(vec![4, 4, 4, 5], 0, 0)),
+            phase_window: None,
+        }
+    }
+
+    /// Drive `finish_official` (gating → correctness → assembly) with an in-band timing and a
+    /// correctness engine — deterministic, no wall-clock dependence.
+    fn finish_with<FC>(golden: &GoldenFixture, correctness: FC) -> ScorePayload
+    where
+        FC: Fn() -> MockEngine,
+    {
+        finish_official(
+            golden,
+            ScoringInputs::local(
+                TEST_BASELINE.prefill_seconds_per_token,
+                TEST_BASELINE.decode_seconds_per_token,
+            ),
+            TEST_BASELINE.bands,
+            RunDigests::for_test(&DirDigest::empty()),
+            "deadbeef",
+            &in_band_timing(),
+            || Session::connect(correctness()).map(|(s, _)| s),
+        )
+    }
+
+    /// An official golden that DECLARES a baseline pair — the fixture that can tell the
+    /// reference's resolution chain apart from the constants fallback (#132/F-2).
+    fn official_golden_with_baselines(prefill: f64, decode: f64) -> GoldenFixture {
+        let mut doc = json!({
+            "version": 1,
+            "model_type": "qwen4_exp_text",
+            "cases": [
+                { "name": "case-a", "prompt_tokens": vec![1i64; CORRECTNESS_PROMPT_TOKENS], "expected_tokens": vec![2i64; 64] }
+            ],
+            "benchmark": {
+                "prefill_prompt_tokens": vec![1i64; BENCHMARK_PREFILL_PROMPT_TOKENS],
+                "expected_prefill_token": PREFILL_TOKEN,
+                "decode_seed_tokens": vec![1i64; BENCHMARK_DECODE_SEED_TOKENS],
+                "expected_decode_seed_token": SEED_TOKEN,
+                "expected_decode_tokens": oracle_decode_tokens(),
+            }
+        });
+        doc["benchmark"]["baseline_prefill_seconds_per_token"] = json!(prefill);
+        doc["benchmark"]["baseline_decode_seconds_per_token"] = json!(decode);
+        let bytes = serde_json::to_vec(&doc).unwrap();
+        load_golden_fixture(
+            &bytes,
+            64,
+            CORRECTNESS_PROMPT_TOKENS,
+            crate::testgolden::identity_125b(),
+            Some("qwen4_exp_text"),
+            None,
+            None,
+        )
+        .unwrap()
+    }
+
+    /// The `MLXFAST_PAIRED_BASELINE_*` pair is process-global, and since #359 EVERY baseline
+    /// resolution reads it. Any test that resolves a baseline — or that asserts the pair is unset —
+    /// takes this lock, so the env-setting case below cannot race one of them.
+    static PAIRED_BASELINE_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// The two keys of the trusted override, in refusal order.
+    const PAIRED_BASELINE_KEYS: [&str; 2] = [
+        "MLXFAST_PAIRED_BASELINE_PREFILL_SECONDS_PER_TOKEN",
+        "MLXFAST_PAIRED_BASELINE_DECODE_SECONDS_PER_TOKEN",
+    ];
+
+    /// Run `f` with the two override keys set as given (`None` = removed), restoring the prior
+    /// values afterwards. Holds [`PAIRED_BASELINE_ENV_LOCK`] for the duration.
+    fn with_paired_baseline_env<T>(vars: [Option<&str>; 2], f: impl FnOnce() -> T) -> T {
+        let _guard = PAIRED_BASELINE_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let prev: Vec<Option<std::ffi::OsString>> =
+            PAIRED_BASELINE_KEYS.iter().map(std::env::var_os).collect();
+        for (key, value) in PAIRED_BASELINE_KEYS.iter().zip(vars) {
+            match value {
+                Some(v) => std::env::set_var(key, v),
+                None => std::env::remove_var(key),
+            }
+        }
+        let out = f();
+        for (key, value) in PAIRED_BASELINE_KEYS.iter().zip(prev) {
+            match value {
+                Some(v) => std::env::set_var(key, v),
+                None => std::env::remove_var(key),
+            }
+        }
+        out
+    }
+
+    /// #359 — A MALFORMED TRUSTED OVERRIDE REFUSES ON THE `official.rs` RESOLUTION PATH TOO.
+    ///
+    /// `MLXFAST_PAIRED_BASELINE_{PREFILL,DECODE}_SECONDS_PER_TOKEN` used to be read here through
+    /// `.ok().flatten()`: a half-set or non-finite pair was SILENTLY discarded and the resolution
+    /// fell through to the golden's declared pair, pricing the run against a denominator the
+    /// operator did not ask for. It now propagates, with the same message `main.rs` has always
+    /// printed.
+    ///
+    /// The golden here DECLARES a pair, so under the old posture this resolved to `(0.0004,
+    /// 0.014)`. That is the fall-through this test forbids.
+    #[test]
+    fn a_half_set_override_refuses_on_the_official_resolution_path() {
+        // The three refusals, spelled out whole — a `\` continuation inside a literal would
+        // smuggle the source indentation into the expectation and hide a padding-space defect.
+        const TOGETHER: &str = "MLXFAST_PAIRED_BASELINE_PREFILL_SECONDS_PER_TOKEN and MLXFAST_PAIRED_BASELINE_DECODE_SECONDS_PER_TOKEN must be provided together";
+        const PREFILL_FINITE: &str = "MLXFAST_PAIRED_BASELINE_PREFILL_SECONDS_PER_TOKEN must be a finite positive seconds-per-token value";
+        const DECODE_FINITE: &str = "MLXFAST_PAIRED_BASELINE_DECODE_SECONDS_PER_TOKEN must be a finite positive seconds-per-token value";
+
+        let golden = official_golden_with_baselines(0.0004, 0.014);
+        for (vars, expect) in [
+            ([Some("0.0004"), None], TOGETHER),
+            ([None, Some("0.014")], TOGETHER),
+            ([Some("0"), Some("0.014")], PREFILL_FINITE),
+            ([Some("0.0004"), Some("nan")], DECODE_FINITE),
+        ] {
+            let err = with_paired_baseline_env(vars, || {
+                official_resolved_baseline_pair(
+                    &golden,
+                    bench_core::constants::TRACK_ID,
+                    &crate::testgolden::track_fixture(),
+                )
+            })
+            .unwrap_err();
+            assert_eq!(err, expect, "vars {vars:?}");
+        }
+
+        // POSITIVE CONTROL — a WELL-FORMED pair still wins over the golden's declared pair, and
+        // an ABSENT pair still falls through to it. Only the malformed case changed.
+        assert_eq!(
+            with_paired_baseline_env([Some("0.0007"), Some("0.021")], || {
+                official_resolved_baseline_pair(
+                    &golden,
+                    bench_core::constants::TRACK_ID,
+                    &crate::testgolden::track_fixture(),
+                )
+            })
+            .unwrap(),
+            (0.0007, 0.021)
+        );
+        assert_eq!(
+            with_paired_baseline_env([None, None], || {
+                official_resolved_baseline_pair(
+                    &golden,
+                    bench_core::constants::TRACK_ID,
+                    &crate::testgolden::track_fixture(),
+                )
+            })
+            .unwrap(),
+            (0.0004, 0.014)
+        );
+    }
+
+    /// B2 — the SCORING-TIME REGIME FENCE, and the proof it CANNOT BE BYPASSED.
+    ///
+    /// The baseline pair has three sources and only the last one reaches the track table, so a
+    /// regime fence placed inside the resolution would be stepped around by either of the first
+    /// two. Here the golden DECLARES a pair: the resolution succeeds for any track id whatsoever,
+    /// and the refusal has to come from the fence outside it.
+    #[test]
+    fn official_resolution_refuses_an_undeclared_regime_even_when_the_golden_supplies_the_pair() {
+        const UNDECLARED: &str = "qwen3.9-27b-mlx-v1";
+        let _env = PAIRED_BASELINE_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        // The golden supplies the pair, so the resolution itself never consults the track table.
+        let golden = official_golden_with_baselines(0.0004, 0.014);
+        assert_eq!(
+            official_resolved_baseline_pair(
+                &golden,
+                UNDECLARED,
+                &bench_core::contract::Contract::NONE_DECLARED
+            )
+            .unwrap(),
+            (0.0004, 0.014),
+            "precondition: the golden's declared pair resolves for ANY track — that is the bypass"
+        );
+
+        let err = official_resolved_baselines(
+            &bench_core::contract::Contract::NONE_DECLARED,
+            &golden,
+            UNDECLARED,
+        )
+        .unwrap_err();
+        assert!(err.contains(UNDECLARED), "must name the track: {err}");
+        assert!(
+            err.contains(bench_core::constants::SCORED_REGIME_PENDING),
+            "must name the pending sentinel: {err}"
+        );
+        assert!(
+            err.contains("scored_batch_size"),
+            "must name what the fixture did not declare: {err}"
+        );
+
+        // POSITIVE CONTROL — the same golden under a fixture that DOES declare the regime
+        // resolves, so the refusal is about the declaration and nothing else.
+        assert_eq!(
+            official_resolved_baselines(
+                &crate::testgolden::track_fixture(),
+                &golden,
+                bench_core::constants::TRACK_ID
+            )
+            .unwrap(),
+            (0.0004, 0.014)
+        );
+    }
+
+    /// The OFFICIAL resolution REFUSES BY NAME for a track with no captured baseline, instead of
+    /// falling through to some other track's numbers.
+    ///
+    /// The precedence is unchanged — trusted env pair, then the golden's declared pair, then the
+    /// track's captured pair — so this fires only on the third source, with the first two silent.
+    /// The message names all three: the track, the pending sentinel, and the sources tried.
+    #[test]
+    fn official_resolution_refuses_an_uncaptured_track_by_name() {
+        const UNCAPTURED: &str = "qwen3.9-27b-mlx-v1";
+        let _env = PAIRED_BASELINE_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        for key in PAIRED_BASELINE_KEYS {
+            assert!(
+                std::env::var(key).is_err(),
+                "precondition: {key} must be unset for this resolution to reach the track table"
+            );
+        }
+        // This golden declares no baseline pair, so the golden source is silent too.
+        let golden = official_golden(None);
+        assert!(golden
+            .benchmark
+            .as_ref()
+            .unwrap()
+            .baseline_prefill_seconds_per_token
+            .is_none());
+
+        let err = official_resolved_baselines(
+            &bench_core::contract::Contract::NONE_DECLARED,
+            &golden,
+            UNCAPTURED,
+        )
+        .unwrap_err();
+        assert!(err.contains(UNCAPTURED), "must name the track: {err}");
+        assert!(
+            err.contains(bench_core::constants::OFFICIAL_BASELINE_PENDING),
+            "must name the pending sentinel: {err}"
+        );
+        // The two tried sources, as ONE contiguous operator-facing phrase. Asserted whole rather
+        // than by fragments: a lost `\` line continuation in the format literal renders as runs of
+        // padding spaces, which every `contains("MLXFAST_PAIRED_BASELINE")`-style fragment check
+        // still passes. This is the assertion that catches it.
+        assert!(
+            err.starts_with(
+                "no official baseline pair: \
+                 MLXFAST_PAIRED_BASELINE_{PREFILL,DECODE}_SECONDS_PER_TOKEN supplied none and \
+                 the golden declares no complete \
+                 benchmark.baseline_{prefill,decode}_seconds_per_token pair, and "
+            ),
+            "exact refusal phrasing: {err}"
+        );
+        assert!(
+            !err.contains("  "),
+            "the message must carry no padding-space runs: {err}"
+        );
+
+        // The SAME golden under this tree's own track FIXTURE resolves, so the refusal is about
+        // the declaration and nothing else.
+        assert_eq!(
+            official_resolved_baselines(
+                &crate::testgolden::track_fixture(),
+                &golden,
+                bench_core::constants::TRACK_ID
+            )
+            .unwrap(),
+            (
+                track_baseline().prefill_seconds_per_token,
+                track_baseline().decode_seconds_per_token
+            )
+        );
+    }
+
+    /// Drive `official_gates_only` (correctness-only, no timed phase) with a correctness engine.
+    fn gates_only_with<FC>(golden: &GoldenFixture, correctness: FC) -> ScorePayload
+    where
+        FC: Fn() -> MockEngine,
+    {
+        // The caller (execute_iterate) resolves the pair: the golden's declared pair first, else
+        // the official constants (pending ⇒ refused before this is reached).
+        let (prefill, decode) = golden
+            .benchmark
+            .as_ref()
+            .and_then(|b| {
+                b.baseline_prefill_seconds_per_token
+                    .zip(b.baseline_decode_seconds_per_token)
+            })
+            .unwrap_or((
+                TEST_BASELINE.prefill_seconds_per_token,
+                TEST_BASELINE.decode_seconds_per_token,
+            ));
+        official_gates_only(
+            golden,
+            ScoringInputs::local(prefill, decode),
+            RunDigests::for_test(&DirDigest::empty()),
+            "deadbeef",
+            || Session::connect(correctness()).map(|(s, _)| s),
+        )
+        .expect("the branch's own track declares a baseline, so the gates path resolves one")
+    }
+
+    #[test]
+    fn official_gates_only_conformant_is_partial_result_true_null_score() {
+        // SKIP_TIMED gates-only (seam 1): a conformant correctness run seals passed=true,
+        // partial_result=true, passed_correctness=true, error empty, NULL score, and the timing
+        // placeholders stay zero (the paired overlay owns them).
+        let golden = official_golden(None);
+        let payload = gates_only_with(&golden, conformant_engine);
+        assert!(payload.passed, "error={}", payload.metrics.error);
+        assert!(
+            payload.metrics.partial_result,
+            "gates score must be partial"
+        );
+        assert!(payload.metrics.passed_correctness);
+        assert!(payload.metrics.error.is_empty());
+        assert!(payload.score.is_none(), "gates-only score must be null");
+        assert_eq!(payload.metrics.commit, "deadbeef");
+        assert_eq!(payload.metrics.runtime, "rust");
+        // No timed phase ran: the MEASURED timing surface stays at its zero placeholders.
+        assert_eq!(payload.metrics.decode_seconds_per_token, 0.0);
+        assert_eq!(payload.metrics.prefill_seconds_per_token, 0.0);
+        assert_eq!(payload.metrics.decode_speedup, 0.0);
+        assert_eq!(payload.metrics.prefill_speedup, 0.0);
+        // #132/F-2 — the BASELINE pair is NOT part of that zero surface, and its absence from
+        // this enumeration is how a whole class of change stayed green: the reference resolves it
+        // (`pairedBaseline ?? golden.resolvedBaseline*`) BEFORE the gates-only branch, so it is
+        // never a placeholder. This golden declares no pair, so the resolution lands on the
+        // constants; `official_gates_only_seals_the_goldens_declared_baselines` covers the arm
+        // where the golden DOES declare one, which is what tells the chain apart.
+        assert_eq!(
+            payload.metrics.baseline_prefill_seconds_per_token,
+            TEST_BASELINE.prefill_seconds_per_token
+        );
+        assert_eq!(
+            payload.metrics.baseline_decode_seconds_per_token,
+            TEST_BASELINE.decode_seconds_per_token
+        );
+        assert_ne!(payload.metrics.baseline_prefill_seconds_per_token, 0.0);
+        assert_ne!(payload.metrics.baseline_decode_seconds_per_token, 0.0);
+        // Correctness DID run: full case count + real checked-step sum.
+        assert_eq!(
+            payload.metrics.case_count,
+            golden.total_correctness_case_count() as i64
+        );
+        assert_eq!(
+            payload.metrics.checked_steps,
+            bench_core::constants::CORRECTNESS_STEPS as i64
+        );
+    }
+
+    /// #132/F-2 — the official path resolves its baseline pair the REFERENCE's way, on all three
+    /// payloads that no later step overwrites.
+    ///
+    /// The reference overwrites its baseline locals with
+    /// `pairedBaseline ?? benchmarkGolden.resolvedBaseline*`
+    /// (`QwenRuntimeBenchmark.swift@b26f76f:442-445`) BEFORE the `skipTimedBenchmark` branch at
+    /// `:457` and before every `makeFailedScore` in `benchmarkWithWorker`. So the golden's declared
+    /// pair — not the constants, and not zero — is what these records carry. A golden declaring a
+    /// DISTINCT pair is the only fixture that can tell those three answers apart.
+    #[test]
+    fn official_gates_only_seals_the_goldens_declared_baselines() {
+        const DECLARED_PREFILL: f64 = 0.000123456;
+        const DECLARED_DECODE: f64 = 0.00987654;
+        // Distinct from BOTH wrong answers, so the assertions below are not satisfiable by
+        // accident.
+        assert_ne!(DECLARED_PREFILL, TEST_BASELINE.prefill_seconds_per_token);
+        assert_ne!(DECLARED_DECODE, TEST_BASELINE.decode_seconds_per_token);
+
+        let golden = official_golden_with_baselines(DECLARED_PREFILL, DECLARED_DECODE);
+
+        // 1. the PASSING gates-only partial.
+        let passing = gates_only_with(&golden, conformant_engine);
+        assert!(passing.passed, "error={}", passing.metrics.error);
+        assert!(passing.metrics.partial_result);
+        assert_eq!(
+            passing.metrics.baseline_prefill_seconds_per_token, DECLARED_PREFILL,
+            "gates-only partial must seal the GOLDEN's pair, not the constants"
+        );
+        assert_eq!(
+            passing.metrics.baseline_decode_seconds_per_token,
+            DECLARED_DECODE
+        );
+
+        // 2. the gates-only FAILURE record.
+        let failing = gates_only_with(&golden, || {
+            MockEngine::new().error_on("correctness_step", "boom")
+        });
+        assert!(!failing.passed);
+        assert!(failing.metrics.partial_result);
+        assert_eq!(
+            failing.metrics.baseline_prefill_seconds_per_token, DECLARED_PREFILL,
+            "gates-only failure must seal the GOLDEN's pair too — the reference's failure records \
+             are all reached after the :442-445 overwrite"
+        );
+        assert_eq!(
+            failing.metrics.baseline_decode_seconds_per_token,
+            DECLARED_DECODE
+        );
+    }
+
+    /// An official golden with NO benchmark oracle — the fixture that reaches `official_core`'s
+    /// oracle-less branch (`official.rs:192`) directly.
+    fn official_golden_without_oracle() -> GoldenFixture {
+        let doc = json!({
+            "version": 1,
+            "model_type": "qwen4_exp_text",
+            "cases": [
+                { "name": "case-a", "prompt_tokens": vec![1i64; CORRECTNESS_PROMPT_TOKENS], "expected_tokens": vec![2i64; 64] }
+            ]
+        });
+        let bytes = serde_json::to_vec(&doc).unwrap();
+        load_golden_fixture(
+            &bytes,
+            64,
+            CORRECTNESS_PROMPT_TOKENS,
+            crate::testgolden::identity_125b(),
+            Some("qwen4_exp_text"),
+            None,
+            None,
+        )
+        .unwrap()
+    }
+
+    /// #132/F-8 — `official_failed` seals the pair `official_core` RESOLVED (env ?? `--baseline-*`
+    /// flags ?? golden), on BOTH branches that reach it.
+    ///
+    /// **This replaces a test that never reached the code it claimed to cover.** The previous
+    /// version drove `finish_official` with an oracle-BEARING golden, so the oracle-less branch at
+    /// `:192` was never taken and the failing spawner routed to `official_failed_timed_oracle`
+    /// (`:760`) — which already threaded the pair before this PR. It pinned pre-existing behavior:
+    /// reverting `official_failed` to re-derive from the golden left the whole suite green.
+    ///
+    /// Each arm below carries a DISTINGUISHING assertion on the error string that only that branch
+    /// can produce, so neither can silently start passing through some other exit.
+    #[test]
+    fn official_failed_seals_the_resolved_pair_on_both_branches_that_reach_it() {
+        const RESOLVED_PREFILL: f64 = 0.000222222;
+        const RESOLVED_DECODE: f64 = 0.00333333;
+        const DECLARED_PREFILL: f64 = 0.000123456;
+        const DECLARED_DECODE: f64 = 0.00987654;
+        // All three candidate answers must be mutually distinct or the assertions prove nothing.
+        assert_ne!(RESOLVED_PREFILL, DECLARED_PREFILL);
+        assert_ne!(RESOLVED_PREFILL, TEST_BASELINE.prefill_seconds_per_token);
+        assert_ne!(RESOLVED_DECODE, DECLARED_DECODE);
+        assert_ne!(RESOLVED_DECODE, TEST_BASELINE.decode_seconds_per_token);
+
+        // --- branch 1: official.rs:192, the ORACLE-LESS golden -------------------------------
+        // Nothing spawns on this path; the golden declares no pair, so a re-derive would land on
+        // the CONSTANTS and the resolved pair is what tells them apart.
+        let no_oracle = official_golden_without_oracle();
+        let a = official_core_windowed(
+            OfficialParams {
+                scoring: ScoringInputs::local(RESOLVED_PREFILL, RESOLVED_DECODE),
+                ..test_run(
+                    &no_oracle,
+                    RunDigests::for_test(&DirDigest::empty()),
+                    &test_window(),
+                )
+            },
+            TEST_BASELINE.bands,
+            || Session::connect(conformant_engine()).map(|(s, _)| s),
+            // The historical entry point has no cool gate; the ranked one passes the real gate.
+            |_phase: &str| Ok(()),
+        );
+        assert!(!a.passed);
+        assert_eq!(
+            a.metrics.error, "benchmark golden file must contain a benchmark oracle",
+            "branch :192 signature — reached a different exit"
+        );
+        assert_eq!(
+            a.metrics.baseline_prefill_seconds_per_token, RESOLVED_PREFILL,
+            ":192 must seal the RESOLVED pair; the constants here would mean official_failed \
+             re-derived it and dropped the --baseline-* flags"
+        );
+        assert_eq!(a.metrics.baseline_decode_seconds_per_token, RESOLVED_DECODE);
+        assert_ne!(
+            a.metrics.baseline_prefill_seconds_per_token,
+            TEST_BASELINE.prefill_seconds_per_token
+        );
+
+        // --- branch 2: official.rs:266, a TIMED failure on an oracle-bearing golden -----------
+        // The golden DECLARES a pair here, so all three answers are distinguishable at once.
+        let with_oracle = official_golden_with_baselines(DECLARED_PREFILL, DECLARED_DECODE);
+        let b = official_core_windowed(
+            OfficialParams {
+                scoring: ScoringInputs::local(RESOLVED_PREFILL, RESOLVED_DECODE),
+                ..test_run(
+                    &with_oracle,
+                    RunDigests::for_test(&DirDigest::empty()),
+                    &test_window(),
+                )
+            },
+            TEST_BASELINE.bands,
+            || -> bench_runner::Result<Session<MockEngine>> {
+                Err(RunnerError::Protocol(
+                    "timed worker spawn failed".to_string(),
+                ))
+            },
+            // The historical entry point has no cool gate; the ranked one passes the real gate.
+            |_phase: &str| Ok(()),
+        );
+        assert!(!b.passed);
+        assert!(
+            b.metrics.error.contains("timed worker spawn failed"),
+            "branch :266 signature — reached a different exit: {:?}",
+            b.metrics.error
+        );
+        assert_eq!(
+            b.metrics.baseline_prefill_seconds_per_token, RESOLVED_PREFILL,
+            ":266 must seal the RESOLVED pair, not the golden's declaration"
+        );
+        assert_eq!(b.metrics.baseline_decode_seconds_per_token, RESOLVED_DECODE);
+        assert_ne!(
+            b.metrics.baseline_prefill_seconds_per_token,
+            DECLARED_PREFILL
+        );
+        assert_ne!(
+            b.metrics.baseline_prefill_seconds_per_token,
+            TEST_BASELINE.prefill_seconds_per_token
+        );
+    }
+
+    #[test]
+    fn official_gates_only_correctness_fail_is_failed_but_partial() {
+        // A correctness mismatch in gates-only mode fails closed: passed=false,
+        // passed_correctness=false, null score — but still the gates-only shape (partial_result
+        // stays true; a failing gates-score never reaches the overlay).
+        let golden = official_golden(None);
+        let bad_correctness = || {
+            MockEngine::new()
+                .teacher_forced_tokens(vec![999i64; 64])
+                .free_run_capable()
+                .oracle_tokens(PREFILL_TOKEN, SEED_TOKEN, oracle_decode_tokens())
+        };
+        let payload = gates_only_with(&golden, bad_correctness);
+        assert!(!payload.passed);
+        assert!(!payload.metrics.passed_correctness);
+        assert!(payload.metrics.partial_result);
+        assert!(payload.score.is_none());
+        assert!(!payload.metrics.error.is_empty());
+    }
+
+    /// A correctness engine that answers the [2;64] base case with `mismatches` non-accepted
+    /// tokens, the FIRST at step 3, and is otherwise conformant (timed oracle included).
+    fn base_case_engine_with_mismatches(mismatches: usize) -> MockEngine {
+        let mut tokens = vec![2i64; 64];
+        // Step 3 first, then from the END of the window, so step 3 stays the first mismatch.
+        tokens[3] = 999;
+        for (n, slot) in (0..64).rev().enumerate() {
+            if n + 1 >= mismatches {
+                break;
+            }
+            if slot != 3 {
+                tokens[slot] = 999;
+            }
+        }
+        MockEngine::new()
+            .teacher_forced_tokens(tokens)
+            .free_run_capable()
+            .oracle_tokens(PREFILL_TOKEN, SEED_TOKEN, oracle_decode_tokens())
+    }
+
+    #[test]
+    fn official_base_case_passes_inside_the_blanket_ten_percent_budget() {
+        // David's ruling (2026-09-02) — "we can differ by 10%" — applied to the OFFICIAL
+        // base-case teacher-forced gate: 6 non-accepted tokens over the 64-step window is
+        // 6 * 1000 = 6000 <= COHORT_TOKEN_TOLERANCE_PER_THOUSAND (100) * 64 = 6400, so the
+        // run PASSES correctness instead of refusing at the first mismatch.
+        let golden = official_golden(None);
+        let payload = finish_with(&golden, || base_case_engine_with_mismatches(6));
+        assert!(payload.passed, "error={}", payload.metrics.error);
+        assert!(payload.metrics.passed_correctness);
+        assert!(payload.metrics.first_failing_case.is_none());
+        assert!(payload.metrics.first_failing_step.is_none());
+    }
+
+    #[test]
+    fn official_base_case_refuses_one_mismatch_over_the_budget() {
+        // 7 * 1000 = 7000 > 6400 -> REFUSE, branded exactly as before, with the FIRST
+        // failing step (3) preserved on the sealed payload.
+        let golden = official_golden(None);
+        let payload = finish_with(&golden, || base_case_engine_with_mismatches(7));
+        assert!(!payload.passed);
+        assert!(!payload.metrics.passed_correctness);
+        assert!(payload.score.is_none());
+        assert_eq!(payload.metrics.error, "teacher-forced token mismatch");
+        assert_eq!(
+            payload.metrics.first_failing_case.as_deref(),
+            Some("case-a")
+        );
+        assert_eq!(payload.metrics.first_failing_step, Some(3));
+        assert_eq!(
+            payload.metrics.checked_steps, 4,
+            "Swift FAIL shape: first mismatch step + 1"
+        );
+    }
+
+    #[test]
+    fn official_conformant_run_passes_with_score_and_commit() {
+        // In-band timing (speedups 1.0) + conformant correctness ⇒ PASS, score ~1.0, commit
+        // stamped, runtime = "rust".
+        let golden = official_golden(None);
+        let payload = finish_with(&golden, conformant_engine);
+        assert!(payload.passed, "error={}", payload.metrics.error);
+        assert!(payload.metrics.passed_correctness);
+        let score = payload.score.expect("passing official run has a score");
+        assert!((score - 1.0).abs() < 1e-9, "score={score}");
+        assert_eq!(payload.metrics.commit, "deadbeef");
+        assert_eq!(payload.metrics.runtime, "rust");
+        // case_count = full correctness total (checkGates == true), not the timing repeats.
+        assert_eq!(
+            payload.metrics.case_count,
+            golden.total_correctness_case_count() as i64
+        );
+        // checked_steps is now the REAL per-case sum (one base case, no gates → the full
+        // teacher-forced window of 64), NOT the placeholder case count (1).
+        assert_eq!(
+            payload.metrics.checked_steps,
+            bench_core::constants::CORRECTNESS_STEPS as i64
+        );
+        assert_ne!(
+            payload.metrics.checked_steps,
+            golden.total_correctness_case_count() as i64,
+            "checked_steps must be the real step sum, not the placeholder case count"
+        );
+    }
+
+    /// A golden with a base case + 2 anchors + 1 free-run case (4 declared correctness cases —
+    /// the same count that used to be the checked_steps PLACEHOLDER). The conformant per-case
+    /// checked-step SUM is 64 (base window) + 1 + 1 (anchors) + 5 (free-run prefix) = 71.
+    fn full_gates_golden(free_run_expected: Vec<i64>) -> GoldenFixture {
+        official_golden(Some(json!({
+            "anchors": [
+                { "name": "anc-1", "context_tokens": vec![1i64; 8], "expected_token": 7, "accepted_tokens": [7] },
+                { "name": "anc-2", "context_tokens": vec![1i64; 8], "expected_token": 9, "accepted_tokens": [9] }
+            ],
+            "free_run": [
+                { "name": "fr-1", "prompt_tokens": vec![1i64; CORRECTNESS_PROMPT_TOKENS], "expected_tokens": free_run_expected }
+            ]
+        })))
+    }
+
+    /// Conformant on base [2;64], anchors (argmax 7 then 9 via per-sequence teacher forcing),
+    /// and the free-run stream (the mock's fixed `correctness` tokens 4000,4001,4002,…).
+    fn full_gates_conformant_engine() -> MockEngine {
+        MockEngine::new()
+            .teacher_forced_sequences(vec![vec![2i64; 64], vec![7], vec![9]])
+            .free_run_capable()
+            .oracle_tokens(PREFILL_TOKEN, SEED_TOKEN, oracle_decode_tokens())
+    }
+
+    #[test]
+    fn official_passing_checked_steps_is_real_per_case_sum() {
+        // Leg-1 PASSING parity: a fully-conformant official run reports the REAL checked-step
+        // SUM (64 + 1 + 1 + 5 = 71), NOT the placeholder total_correctness_case_count (4).
+        let golden = full_gates_golden(vec![4000, 4001, 4002, 4003, 4004]);
+        assert_eq!(
+            golden.total_correctness_case_count(),
+            4,
+            "the old placeholder value"
+        );
+        let payload = finish_with(&golden, full_gates_conformant_engine);
+        assert!(payload.passed, "error={}", payload.metrics.error);
+        assert!(payload.metrics.passed_correctness);
+        assert_eq!(
+            payload.metrics.checked_steps, 71,
+            "64 base + 1 + 1 anchors + 5 free-run"
+        );
+        assert_eq!(
+            payload.metrics.case_count, 4,
+            "caseCount stays the declared total"
+        );
+    }
+
+    #[test]
+    fn official_anchor_fail_partial_checked_steps_and_step_zero() {
+        // Anchor-gate failure: base passes (64), anc-1 fails (+1) → partial sum 65. Swift also
+        // reports first_failing_step = 0 (compareAnchorToken) and NULL expected/actual tokens.
+        let golden = full_gates_golden(vec![4000, 4001, 4002, 4003, 4004]);
+        // Corrupt anc-1: engine argmax 8 ∉ accepted {7}.
+        let engine = || {
+            MockEngine::new()
+                .teacher_forced_sequences(vec![vec![2i64; 64], vec![8], vec![9]])
+                .free_run_capable()
+                .oracle_tokens(PREFILL_TOKEN, SEED_TOKEN, oracle_decode_tokens())
+        };
+        let payload = finish_with(&golden, engine);
+        assert!(!payload.passed);
+        assert_eq!(payload.metrics.error, "anchor token mismatch");
+        assert_eq!(payload.metrics.first_failing_case.as_deref(), Some("anc-1"));
+        assert_eq!(
+            payload.metrics.checked_steps, 65,
+            "64 base + 1 failing anchor"
+        );
+        assert_eq!(
+            payload.metrics.first_failing_step,
+            Some(0),
+            "Swift anchor firstFailingStep=0"
+        );
+        assert_eq!(
+            payload.metrics.expected_token, None,
+            "official nulls expected_token"
+        );
+        assert_eq!(
+            payload.metrics.actual_token, None,
+            "official nulls actual_token"
+        );
+        // case_count + golden_hash stay populated (correctness DID run and fail).
+        assert_eq!(payload.metrics.case_count, 4);
+        assert_eq!(payload.metrics.golden_hash, golden.sha256);
+    }
+
+    #[test]
+    fn official_free_run_fail_partial_checked_steps() {
+        // Free-run-gate failure: base(64) + anc-1(1) + anc-2(1) + free-run fails at step 2 (+3)
+        // → partial sum 69. Free-run stream is 4000,4001,4002,…; expected diverges at index 2.
+        let golden = full_gates_golden(vec![4000, 4001, 999, 4003, 4004]);
+        let payload = finish_with(&golden, full_gates_conformant_engine);
+        assert!(!payload.passed);
+        assert_eq!(payload.metrics.error, "free-run token mismatch");
+        assert_eq!(payload.metrics.first_failing_case.as_deref(), Some("fr-1"));
+        assert_eq!(
+            payload.metrics.checked_steps, 69,
+            "64 + 1 + 1 + 3 (free-run step 2 + 1)"
+        );
+        assert_eq!(
+            payload.metrics.first_failing_step,
+            Some(2),
+            "free-run mismatch step"
+        );
+        assert_eq!(payload.metrics.expected_token, None);
+        assert_eq!(payload.metrics.actual_token, None);
+    }
+
+    #[test]
+    fn official_primary_correctness_fail_nulls_tokens() {
+        // Primary (teacher-forced) correctness failure: Swift leaves expected_token/actual_token
+        // NULL on the OFFICIAL path (unlike LOCAL). checked_steps = the partial base sum (fail
+        // at step 0 → 1).
+        let golden = official_golden(None);
+        let engine = || {
+            MockEngine::new()
+                .teacher_forced_tokens(vec![3i64; 64]) // diverges from golden [2;64] at step 0
+                .free_run_capable()
+                .oracle_tokens(PREFILL_TOKEN, SEED_TOKEN, oracle_decode_tokens())
+        };
+        let payload = finish_with(&golden, engine);
+        assert!(!payload.passed);
+        assert_eq!(payload.metrics.error, "teacher-forced token mismatch");
+        assert_eq!(
+            payload.metrics.first_failing_case.as_deref(),
+            Some("case-a")
+        );
+        assert_eq!(payload.metrics.first_failing_step, Some(0));
+        assert_eq!(
+            payload.metrics.expected_token, None,
+            "official nulls expected_token"
+        );
+        assert_eq!(
+            payload.metrics.actual_token, None,
+            "official nulls actual_token"
+        );
+        assert_eq!(
+            payload.metrics.checked_steps, 1,
+            "fail at base step 0 → checkedSteps 1"
+        );
+    }
+
+    #[test]
+    fn official_timed_first_orchestration_reaches_band_gate() {
+        // The full official_core with a CONFORMANT-ORACLE mock: the timed phases pass the
+        // oracle (no TokenMismatch), and gating then FAILS on the acceptance band because a
+        // mock's ~0 wall-clock is ~1000x faster than the baseline. This proves the timed-first
+        // orchestration ran and the band gate is wired ahead of correctness.
+        let golden = official_golden(None);
+        let payload = run_official(&golden, conformant_engine);
+        assert!(!payload.passed);
+        assert!(
+            payload.metrics.error.starts_with("acceptance band failed:")
+                || payload
+                    .metrics
+                    .error
+                    .starts_with("performance floor failed:"),
+            "expected a band/floor failure (not an oracle mismatch), got: {}",
+            payload.metrics.error
+        );
+    }
+
+    #[test]
+    fn official_timed_prefill_warms_once_in_its_own_session() {
+        // David 2026-09-07: the timed session's first prefill is not a steady reading, so the
+        // official timed leg runs ONE unmeasured prefill in that session before the timed one.
+        let golden = official_golden(None);
+        // The warm-up count is now a value the WINDOW carries, and the window comes from the
+        // track fixture (STEP 3, David 2026-09-15) — so the two cases below differ by the window
+        // handed in, not by a platform the function looks up.
+        let mlx_window = WindowShape {
+            official_prefill_warmup_runs: 1,
+            ..crate::iterate::test_window()
+        };
+        let params = official_timed_params(golden.benchmark.as_ref().unwrap(), None, &mlx_window);
+        assert_eq!(params.prefill_warmup_runs, 1);
+        assert_eq!(params.prefill_timed_runs, 1);
+        // CUDA: the resident engine is warm and the ds4 adapter refuses a second `prefill` opener
+        // without a `phase_diagnostics` barrier, so its fixture declares no warm-up pass.
+        let cuda_window = WindowShape {
+            official_prefill_warmup_runs: 0,
+            ..crate::iterate::test_window()
+        };
+        let cuda = official_timed_params(golden.benchmark.as_ref().unwrap(), None, &cuda_window);
+        assert_eq!(cuda.prefill_warmup_runs, 0);
+        assert_eq!(cuda.prefill_timed_runs, 1);
+        // The local modes are untouched: their default is still the reference's zero.
+        let local = TimingParams::new(vec![1], 1, vec![1], 1, vec![1, 2], 1);
+        assert_eq!(
+            local.prefill_warmup_runs,
+            bench_core::constants::BENCHMARK_PREFILL_WARMUP_RUNS
+        );
+    }
+
+    #[test]
+    fn official_timed_phases_pass_through_the_cool_gate_in_order() {
+        // David 2026-09-06: the 40 C per-phase contract applies to the single-leg path. The
+        // TIMED prefill and decode each call the gate, in that order; the unmeasured warmup leg
+        // does not (it is what heats the GPU). A gate refusal fails the run closed.
+        use std::cell::RefCell;
+        let golden = official_golden(None);
+        let phases: RefCell<Vec<String>> = RefCell::new(Vec::new());
+        let _ = official_core_windowed(
+            test_run(
+                &golden,
+                RunDigests::for_test(&DirDigest::empty()),
+                &test_window(),
+            ),
+            TEST_BASELINE.bands,
+            || Session::connect(conformant_engine()).map(|(s, _)| s),
+            |phase: &str| {
+                phases.borrow_mut().push(phase.to_string());
+                Ok(())
+            },
+        );
+        assert_eq!(phases.borrow().as_slice(), ["prefill", "decode"]);
+        let refused = official_core_windowed(
+            test_run(
+                &golden,
+                RunDigests::for_test(&DirDigest::empty()),
+                &test_window(),
+            ),
+            TEST_BASELINE.bands,
+            || Session::connect(conformant_engine()).map(|(s, _)| s),
+            |phase: &str| {
+                Err(bench_runner::RunnerError::GateRejected {
+                    phase: phase.to_string(),
+                    reason: "GPU stayed above 40 C".to_string(),
+                })
+            },
+        );
+        assert!(!refused.passed);
+        assert!(
+            refused.metrics.error.contains("gate rejected (prefill)"),
+            "{}",
+            refused.metrics.error
+        );
+    }
+
+    #[test]
+    fn official_persistent_window_opens_one_worker_for_the_whole_timed_window() {
+        // Load-once (David 2026-08-30): the window opens the model-holding worker EXACTLY ONCE for
+        // the whole timed window (prefill + decode over one held session). The conformant mock's
+        // ~0 wall-clock still fails the acceptance band ahead of correctness, proving the timed
+        // phase ran and produced a real (out-of-band) timing.
+        let golden = official_golden(None);
+        let timed_spawns = Cell::new(0usize);
+        let corr_spawns = Cell::new(0usize);
+        let payload = official_core_windowed(
+            test_run(
+                &golden,
+                RunDigests::for_test(&DirDigest::empty()),
+                &test_window(),
+            ),
+            TEST_BASELINE.bands,
+            || {
+                timed_spawns.set(timed_spawns.get() + 1);
+                Session::connect(conformant_engine()).map(|(s, _)| s)
+            },
+            |_phase: &str| Ok(()),
+        );
+        assert!(!payload.passed);
+        assert!(
+            payload.metrics.error.starts_with("acceptance band failed:")
+                || payload
+                    .metrics
+                    .error
+                    .starts_with("performance floor failed:"),
+            "expected a band/floor failure, got: {}",
+            payload.metrics.error
+        );
+        assert_eq!(
+            timed_spawns.get(),
+            1,
+            "the persistent window must open exactly ONE model-holding worker for the timed window"
+        );
+        // The band failed before correctness, so no correctness session was needed; and the
+        // persistent path never uses the FRESH correctness spawner regardless — it reuses the
+        // resident session.
+        assert_eq!(corr_spawns.get(), 0);
+    }
+
+    #[test]
+    fn official_warmup_leg_failure_fails_closed_before_timed_legs() {
+        // The measurement-integrity warmup is WIRED and FAIL-CLOSED: a fault in the unmeasured
+        // warmup leg fails the run with a warmup-labelled error and stops BEFORE any timed worker
+        // spawns. The warmup worker (first spawn) faults its `free_decode_run`; because warmup runs
+        // TimeOnly the fault must be a PROTOCOL error (an ok:false), not a token mismatch, to abort.
+        let golden = official_golden(None);
+        let spawn_n = Cell::new(0usize);
+        let payload = official_core_windowed(
+            test_run(
+                &golden,
+                RunDigests::for_test(&DirDigest::empty()),
+                &test_window(),
+            ),
+            TEST_BASELINE.bands,
+            || {
+                let n = spawn_n.get();
+                spawn_n.set(n + 1);
+                let engine = if n == 0 {
+                    conformant_engine().error_on("free_decode_run", "warmup boom")
+                } else {
+                    conformant_engine()
+                };
+                Session::connect(engine).map(|(s, _)| s)
+            },
+            |_phase: &str| Ok(()),
+        );
+        assert!(!payload.passed);
+        assert!(
+            payload.metrics.error.contains("official warmup leg failed"),
+            "warmup fault must surface a warmup-labelled failure, got: {}",
+            payload.metrics.error
+        );
+        assert_eq!(
+            spawn_n.get(),
+            1,
+            "a warmup fault must fail closed before any timed worker spawns"
+        );
+    }
+
+    #[test]
+    fn official_persistent_window_warmup_stays_on_the_one_resident_worker() {
+        // The measurement-integrity warmup runs on the SAME held
+        // session as the measured legs, so the model still loads ONCE: the warmup adds NO extra
+        // spawn. The conformant mock's ~0 wall-clock still fails the acceptance band ahead of
+        // correctness, proving the warmup did not corrupt the resident worker for the timed phases.
+        let golden = official_golden(None);
+        let timed_spawns = Cell::new(0usize);
+        let payload = official_core_windowed(
+            test_run(
+                &golden,
+                RunDigests::for_test(&DirDigest::empty()),
+                &test_window(),
+            ),
+            TEST_BASELINE.bands,
+            || {
+                timed_spawns.set(timed_spawns.get() + 1);
+                Session::connect(conformant_engine()).map(|(s, _)| s)
+            },
+            |_phase: &str| Ok(()),
+        );
+        assert!(!payload.passed);
+        assert!(
+            payload.metrics.error.starts_with("acceptance band failed:")
+                || payload
+                    .metrics
+                    .error
+                    .starts_with("performance floor failed:"),
+            "expected a band/floor failure (warmup ran, timed legs ran), got: {}",
+            payload.metrics.error
+        );
+        assert_eq!(
+            timed_spawns.get(),
+            1,
+            "the warmup shares the ONE resident worker — no extra spawn on the persistent path"
+        );
+    }
+
+    /// The persistent official window closes FOUR phases over its ONE session, in this order:
+    /// the warmup leg's prefill and decode, then the timed prefill and the timed decode. Each
+    /// close is a cache boundary the parent asserts fail-closed, so a test names the boundary it
+    /// proves by this ordinal.
+    const WARMUP_PREFILL_CLOSE: usize = 1;
+    const WARMUP_DECODE_CLOSE: usize = 2;
+    const TIMED_PREFILL_CLOSE: usize = 3;
+    const TIMED_DECODE_CLOSE: usize = 4;
+
+    /// Run the persistent official window against an engine that reports `bytes` of undrained
+    /// allocator cache on the `nth` phase close and a conformant `0` on every other one.
+    fn official_with_undrained_cache_at(nth: usize, bytes: i64) -> ScorePayload {
+        let golden = official_golden(None);
+        official_core_windowed(
+            test_run(
+                &golden,
+                RunDigests::for_test(&DirDigest::empty()),
+                &test_window(),
+            ),
+            TEST_BASELINE.bands,
+            || {
+                Session::connect(conformant_engine().cache_memory_on_nth_phase_close(nth, bytes))
+                    .map(|(s, _)| s)
+            },
+            |_phase: &str| Ok(()),
+        )
+    }
+
+    #[test]
+    fn official_persistent_window_refuses_an_undrained_cache_at_the_warmup_to_prefill_boundary() {
+        // David 2026-09-15: the weights load once per window, so the caches must be PROVEN reset
+        // between the legs that share the one worker. The warmup leg's LAST phase close is the
+        // warmup-to-prefill boundary. An engine that carries 4 KiB of allocator cache across it
+        // fails the run CLOSED, before the timed legs measure anything.
+        let payload = official_with_undrained_cache_at(WARMUP_DECODE_CLOSE, 4096);
+        assert!(!payload.passed);
+        assert!(
+            payload.metrics.error.contains("official warmup leg failed"),
+            "the undrained boundary is inside the warmup leg, got: {}",
+            payload.metrics.error
+        );
+        assert!(
+            payload
+                .metrics
+                .error
+                .contains("failed to clear the MLX allocator cache"),
+            "the refusal must name the allocator drain, got: {}",
+            payload.metrics.error
+        );
+        // The FIRST close of the same leg is asserted too, so the boundary test above is not the
+        // only thing standing between a warmup phase and an undrained cache.
+        let first = official_with_undrained_cache_at(WARMUP_PREFILL_CLOSE, 4096);
+        assert!(!first.passed);
+        assert!(
+            first
+                .metrics
+                .error
+                .contains("failed to clear the MLX allocator cache"),
+            "{}",
+            first.metrics.error
+        );
+    }
+
+    #[test]
+    fn official_persistent_window_refuses_an_undrained_cache_at_the_prefill_to_decode_boundary() {
+        // The timed prefill's close is the prefill-to-decode boundary. On the persistent window
+        // the decode phase runs on the SAME worker, so this close is the only thing that proves
+        // the KV and allocator state of the prefill phase does not subsidize the decode phase.
+        let payload = official_with_undrained_cache_at(TIMED_PREFILL_CLOSE, 4096);
+        assert!(!payload.passed);
+        assert!(
+            payload
+                .metrics
+                .error
+                .contains("failed to clear the MLX allocator cache"),
+            "the refusal must name the allocator drain, got: {}",
+            payload.metrics.error
+        );
+        assert!(
+            !payload.metrics.error.contains("official warmup leg failed"),
+            "this boundary is in the TIMED leg, not the warmup leg: {}",
+            payload.metrics.error
+        );
+        // The window's LAST close is asserted on the same rule, so the measured decode phase
+        // cannot end with an undrained allocator either.
+        let last = official_with_undrained_cache_at(TIMED_DECODE_CLOSE, 4096);
+        assert!(!last.passed);
+        assert!(
+            last.metrics
+                .error
+                .contains("failed to clear the MLX allocator cache"),
+            "{}",
+            last.metrics.error
+        );
+    }
+
+    #[test]
+    fn official_full_scope_evaluates_anchor_gate_unlike_local() {
+        // GATE-SCOPE FLIP: official runs the FULL set. A golden with a CORRUPTED anchor
+        // (engine argmax ≠ 999) that the LOCAL default would SKIP must FAIL official
+        // correctness (reached here via in-band timing so the band does not mask it).
+        let golden = official_golden(Some(json!({
+            "anchors": [
+                { "name": "bad-anchor", "context_tokens": vec![1i64; 8], "expected_token": 999, "accepted_tokens": [999] }
+            ]
+        })));
+        let payload = finish_with(&golden, conformant_engine);
+        assert!(
+            !payload.passed,
+            "official evaluates the full correctness set"
+        );
+        assert!(payload.score.is_none());
+        assert!(!payload.metrics.passed_correctness);
+        assert_eq!(payload.metrics.error, "anchor token mismatch");
+        assert_eq!(
+            payload.metrics.first_failing_case.as_deref(),
+            Some("bad-anchor")
+        );
+        // Swift anchor firstFailingStep = 0 (compareAnchorToken), tokens null on the official path.
+        assert_eq!(payload.metrics.first_failing_step, Some(0));
+        assert_eq!(payload.metrics.expected_token, None);
+        assert_eq!(payload.metrics.actual_token, None);
+        // Partial checked-step sum: base window 64 + failing anchor 1 = 65.
+        assert_eq!(payload.metrics.checked_steps, 65);
+    }
+
+    #[test]
+    fn corrupted_benchmark_oracle_fails_official() {
+        // THE failure class the local path cannot test: the golden's benchmark oracle says
+        // decode step 3 → token 703, but the engine emits 999_999. Official's parent-side
+        // oracle check FAILS the run (BenchmarkTokenMismatchError), branded case="benchmark".
+        let golden = official_golden(None);
+        let mut engine_tokens = oracle_decode_tokens();
+        engine_tokens[3] = 999_999;
+        let payload = run_official(&golden, move || {
+            MockEngine::new()
+                .teacher_forced_tokens(vec![2i64; 64])
+                .free_run_capable()
+                .oracle_tokens(PREFILL_TOKEN, SEED_TOKEN, engine_tokens.clone())
+        });
+        assert!(!payload.passed);
+        assert!(payload.score.is_none());
+        // A8 free-run timed leg: the decode-TOKEN mismatch class KEEPS the step suffix and its
+        // label now names the free-run verb ("benchmark free-run decode token"). makeFailedScore
+        // still nulls the tokens. The string diverges from Swift's teacher-forced description by
+        // design — teacher-forced-per-step is retained only for the untimed correctness gate.
+        assert_eq!(
+            payload.metrics.error, "benchmark free-run decode token mismatch at step 3",
+            "free-run decode-token class keeps the step suffix"
+        );
+        assert_eq!(
+            payload.metrics.first_failing_case.as_deref(),
+            Some("benchmark")
+        );
+        assert_eq!(payload.metrics.first_failing_step, Some(3));
+        // MAJOR-1: Swift makeFailedScore sets expectedToken/actualToken = nil (ALWAYS).
+        assert_eq!(payload.metrics.expected_token, None);
+        assert_eq!(payload.metrics.actual_token, None);
+        // ITEM B (this change): the oracle mismatch is a TIMED-phase failure BEFORE correctness,
+        // so Swift returns via makeFailedScore(correctness: nil) — BLANK the correctness audit
+        // fields but RETAIN the resolved baselines.
+        assert_eq!(
+            payload.metrics.golden_hash, "",
+            "golden_hash blanked (correctness nil)"
+        );
+        assert_eq!(
+            payload.metrics.case_count, 0,
+            "case_count blanked (correctness nil)"
+        );
+        assert_eq!(
+            payload.metrics.checked_steps, 0,
+            "checked_steps blanked (correctness nil)"
+        );
+        assert_eq!(
+            payload.metrics.baseline_decode_seconds_per_token,
+            TEST_BASELINE.decode_seconds_per_token,
+            "resolved decode baseline RETAINED"
+        );
+        assert_eq!(
+            payload.metrics.baseline_prefill_seconds_per_token,
+            TEST_BASELINE.prefill_seconds_per_token,
+            "resolved prefill baseline RETAINED"
+        );
+        // The MEASURED spt stay 0 (the timed phase never completed a trustworthy measurement).
+        assert_eq!(payload.metrics.decode_seconds_per_token, 0.0);
+        assert_eq!(payload.metrics.prefill_seconds_per_token, 0.0);
+    }
+
+    #[test]
+    fn corrupted_prefill_oracle_fails_official_no_step_suffix() {
+        // The PREFILL oracle class: Swift compareOne carries step:nil, so the description has
+        // NO " at step N" suffix and firstFailingStep = nil; tokens are nulled.
+        let golden = official_golden(None);
+        let payload = run_official(&golden, || {
+            MockEngine::new()
+                .teacher_forced_tokens(vec![2i64; 64])
+                // Wrong PREFILL token (seed + decode conformant).
+                .free_run_capable()
+                .oracle_tokens(PREFILL_TOKEN + 1, SEED_TOKEN, oracle_decode_tokens())
+        });
+        assert!(!payload.passed);
+        assert_eq!(
+            payload.metrics.error, "benchmark prefill token mismatch",
+            "prefill class has NO step suffix (Swift compareOne step:nil)"
+        );
+        assert_eq!(
+            payload.metrics.first_failing_case.as_deref(),
+            Some("benchmark")
+        );
+        assert_eq!(payload.metrics.first_failing_step, None);
+        assert_eq!(payload.metrics.expected_token, None);
+        assert_eq!(payload.metrics.actual_token, None);
+    }
+
+    #[test]
+    fn corrupted_seed_oracle_fails_official_no_step_suffix() {
+        // The decode-SEED oracle class: step-less, no suffix, nulled tokens. Under the a8 free-run
+        // timed leg the seed forward is `free_decode_begin`, so the label names the free-run verb.
+        let golden = official_golden(None);
+        let payload = run_official(&golden, || {
+            MockEngine::new()
+                .teacher_forced_tokens(vec![2i64; 64])
+                // Wrong SEED token (prefill + decode conformant).
+                .free_run_capable()
+                .oracle_tokens(PREFILL_TOKEN, SEED_TOKEN + 1, oracle_decode_tokens())
+        });
+        assert!(!payload.passed);
+        assert_eq!(
+            payload.metrics.error, "benchmark free-run decode seed token mismatch",
+            "free-run seed class has NO step suffix"
+        );
+        assert_eq!(payload.metrics.first_failing_step, None);
+        assert_eq!(payload.metrics.expected_token, None);
+        assert_eq!(payload.metrics.actual_token, None);
+    }
+
+    #[test]
+    fn benchmark_less_golden_fails_official() {
+        let doc = json!({
+            "version": 1, "model_type": "qwen4_exp_text",
+            "cases": [{ "name": "p1", "prompt_tokens": vec![1i64; CORRECTNESS_PROMPT_TOKENS], "expected_tokens": vec![2i64; 64] }],
+        });
+        let bytes = serde_json::to_vec(&doc).unwrap();
+        let golden = load_golden_fixture(
+            &bytes,
+            64,
+            CORRECTNESS_PROMPT_TOKENS,
+            crate::testgolden::identity_125b(),
+            Some("qwen4_exp_text"),
+            None,
+            None,
+        )
+        .unwrap();
+        let payload = run_official(&golden, conformant_engine);
+        assert!(!payload.passed);
+        assert_eq!(
+            payload.metrics.error,
+            "benchmark golden file must contain a benchmark oracle"
+        );
+    }
+
+    #[test]
+    fn decode_speedup_below_floor_fails_official() {
+        // Candidate decode +10% slower than baseline ⇒ speedup ≈ 0.909 < 0.95 floor ⇒ the
+        // decode acceptance band (+2% ceiling) trips FIRST in the priority order (finite →
+        // floors → bands), failing official BEFORE correctness with the real timing retained.
+        let golden = official_golden(None);
+        let mut timing = in_band_timing();
+        timing.decode_seconds_per_token = TEST_BASELINE.decode_seconds_per_token * 1.10;
+        let payload = finish_official(
+            &golden,
+            ScoringInputs::local(
+                TEST_BASELINE.prefill_seconds_per_token,
+                TEST_BASELINE.decode_seconds_per_token,
+            ),
+            TEST_BASELINE.bands,
+            RunDigests::for_test(&DirDigest::empty()),
+            "deadbeef",
+            &timing,
+            || Session::connect(conformant_engine()).map(|(s, _)| s),
+        );
+        assert!(!payload.passed);
+        assert!(payload.score.is_none());
+        assert!(
+            payload
+                .metrics
+                .error
+                .starts_with("performance floor failed:")
+                || payload.metrics.error.starts_with("acceptance band failed:"),
+            "floor/band failure expected, got: {}",
+            payload.metrics.error
+        );
+        // Real timing retained (not blanked): the measured decode spt is carried through.
+        assert!(payload.metrics.decode_seconds_per_token > 0.0);
+        assert!(!payload.metrics.passed_correctness, "correctness never ran");
+    }
+
+    /// FLOOR-ONLY GATING BANDS: tolerances wide enough that no acceptance band can fail the run,
+    /// so a boundary run reads the SPEEDUP FLOOR and nothing else.
+    const FLOOR_ONLY_BANDS: AcceptanceBands = AcceptanceBands {
+        prefill_up_tolerance: 10.0,
+        prefill_down_tolerance: 0.99,
+        decode_up_tolerance: 10.0,
+        decode_down_tolerance: 0.99,
+        decode_down_enabled: false,
+        prefill_down_enabled: false,
+    };
+
+    /// One boundary run through the official gate: the candidate's per-token times are POWERS OF
+    /// TWO and the denominator is that time scaled by the wanted speedup, so `baseline / candidate`
+    /// is EXACTLY the literal asked for (scaling by a power of two is exact in binary floating
+    /// point). Only the floors can fail the run.
+    fn floor_boundary_run(
+        golden: &GoldenFixture,
+        decode_speedup: f64,
+        prefill_speedup: f64,
+        floors: SpeedupFloors,
+    ) -> ScorePayload {
+        const CANDIDATE_DECODE_SPT: f64 = 0.125; // 2^-3
+        const CANDIDATE_PREFILL_SPT: f64 = 0.0078125; // 2^-7
+        let timing = TimingResult {
+            prefill_seconds_per_token: CANDIDATE_PREFILL_SPT,
+            decode_seconds_per_token: CANDIDATE_DECODE_SPT,
+            decode_steps: BENCHMARK_DECODE_STEPS,
+            prefill_prompt_tokens: BENCHMARK_PREFILL_PROMPT_TOKENS,
+            prefill_elapsed_seconds: CANDIDATE_PREFILL_SPT * 512.0,
+            decode_elapsed_seconds: CANDIDATE_DECODE_SPT * BENCHMARK_DECODE_STEPS as f64,
+            peak_ram_gb: 20.25,
+            effective_spec: None,
+            free_run_audit: Some(audit_for_test(vec![4, 4, 4, 5], 0, 0)),
+            phase_window: None,
+        };
+        finish_official(
+            golden,
+            ScoringInputs {
+                baseline_prefill_spt: CANDIDATE_PREFILL_SPT * prefill_speedup,
+                baseline_decode_spt: CANDIDATE_DECODE_SPT * decode_speedup,
+                floors,
+                weights: ScoringWeights::DEFAULT,
+            },
+            FLOOR_ONLY_BANDS,
+            RunDigests::for_test(&DirDigest::empty()),
+            "deadbeef",
+            &timing,
+            || Session::connect(conformant_engine()).map(|(s, _)| s),
+        )
+    }
+
+    /// DAVID 2026-09-09 — THE FLOORS ARE THE TRACK'S, THEY ARE ENFORCED ON BOTH AXES, AND WHAT IS
+    /// SEALED IS WHAT WAS ENFORCED.
+    ///
+    /// Decode and prefill are gated separately at the boundary (0.949 refused, exactly 0.95
+    /// accepted), the refusal names the floor the run carried, and `metrics.*_speedup_floor` is
+    /// that same value on the passing and the failing payload alike.
+    ///
+    /// REVERT-PROOF: put `SCORE_*_SPEEDUP_FLOOR` back into the gate or the seal and the 0.90 arm
+    /// goes red; drop either axis and its own arm goes red.
+    #[test]
+    fn official_enforces_and_seals_the_contract_speedup_floors() {
+        let golden = official_golden(None);
+
+        // DECODE, one thousandth below the ruled floor: refused, and the message names 0.95.
+        let below = floor_boundary_run(&golden, 0.949, 1.0, SpeedupFloors::DEFAULT);
+        assert!(!below.passed);
+        assert!(below.score.is_none());
+        assert!(
+            below
+                .metrics
+                .error
+                .contains("decode_speedup=0.949000 floor=0.950000"),
+            "{}",
+            below.metrics.error
+        );
+        assert_eq!(below.metrics.decode_speedup_floor, 0.95);
+        assert_eq!(below.metrics.prefill_speedup_floor, 0.95);
+        assert!(!below.metrics.passed_decode_speedup_floor);
+        assert!(below.metrics.passed_prefill_speedup_floor);
+
+        // DECODE, exactly ON the floor: accepted (the gate is `>=`, not `>`).
+        let at = floor_boundary_run(&golden, 0.95, 1.0, SpeedupFloors::DEFAULT);
+        assert!(at.passed, "at the floor must pass: {}", at.metrics.error);
+        assert!(at.score.is_some());
+        assert!(at.metrics.passed_decode_speedup_floor);
+        assert_eq!(at.metrics.decode_speedup_floor, 0.95);
+
+        // PREFILL is a floor of its own: the same 0.949, on the other axis, refuses the run even
+        // with decode exactly at parity.
+        let prefill_below = floor_boundary_run(&golden, 1.0, 0.949, SpeedupFloors::DEFAULT);
+        assert!(!prefill_below.passed);
+        assert!(
+            prefill_below
+                .metrics
+                .error
+                .contains("prefill_speedup=0.949000 floor=0.950000"),
+            "{}",
+            prefill_below.metrics.error
+        );
+        assert!(!prefill_below.metrics.passed_prefill_speedup_floor);
+        assert!(prefill_below.metrics.passed_decode_speedup_floor);
+        assert!(floor_boundary_run(&golden, 1.0, 0.95, SpeedupFloors::DEFAULT).passed);
+
+        // PER PROJECT: a track whose fixture declares 0.90 is enforced at 0.90 and SEALS 0.90 —
+        // the constants are not consulted anywhere on this path.
+        let looser = SpeedupFloors {
+            decode: 0.90,
+            prefill: 0.90,
+        };
+        let ninety = floor_boundary_run(&golden, 0.949, 0.949, looser);
+        assert!(
+            ninety.passed,
+            "0.949 clears a 0.90 floor: {}",
+            ninety.metrics.error
+        );
+        assert_eq!(ninety.metrics.decode_speedup_floor, 0.90);
+        assert_eq!(ninety.metrics.prefill_speedup_floor, 0.90);
+        assert!(ninety.metrics.passed_decode_speedup_floor);
+        assert!(ninety.metrics.passed_prefill_speedup_floor);
+        // And that same fixture still refuses below ITS floor, naming ITS floor.
+        let under_ninety = floor_boundary_run(&golden, 0.899, 1.0, looser);
+        assert!(!under_ninety.passed);
+        assert!(
+            under_ninety
+                .metrics
+                .error
+                .contains("decode_speedup=0.899000 floor=0.900000"),
+            "{}",
+            under_ninety.metrics.error
+        );
+        assert_eq!(under_ninety.metrics.decode_speedup_floor, 0.90);
+    }
+
+    #[test]
+    fn official_timed_band_failure_blanks_correctness_audit_fields_to_match_swift() {
+        // RULING 2: an OFFICIAL run that fails at the TIMED band (before correctness runs) must
+        // byte-match Swift's `correctness == nil` failed score — golden_hash="", case_count=0,
+        // checked_steps=0 — because Swift's timed-first path returns via
+        // makeFailedScore(correctness: nil) and downstream/organizer tooling expects that shape.
+        // Drive a floor/band failure via +10% slower decode (correctness never runs).
+        let golden = official_golden(None);
+        // Guard: this golden really does carry a non-empty hash and non-zero case count that a
+        // populate-path (or the old official_failed_with_timing) WOULD have surfaced — so the
+        // blanking below is meaningful, not vacuously matching an already-empty golden.
+        assert!(
+            !golden.sha256.is_empty(),
+            "test golden must have a real hash to blank"
+        );
+        assert!(
+            golden.total_correctness_case_count() > 0,
+            "test golden must have >0 correctness cases to blank"
+        );
+
+        let mut timing = in_band_timing();
+        timing.decode_seconds_per_token = TEST_BASELINE.decode_seconds_per_token * 1.10;
+        let payload = finish_official(
+            &golden,
+            ScoringInputs::local(
+                TEST_BASELINE.prefill_seconds_per_token,
+                TEST_BASELINE.decode_seconds_per_token,
+            ),
+            TEST_BASELINE.bands,
+            RunDigests::for_test(&DirDigest::empty()),
+            "deadbeef",
+            &timing,
+            || Session::connect(conformant_engine()).map(|(s, _)| s),
+        );
+        assert!(!payload.passed);
+        assert!(payload.score.is_none());
+        assert!(
+            payload
+                .metrics
+                .error
+                .starts_with("performance floor failed:")
+                || payload.metrics.error.starts_with("acceptance band failed:"),
+            "timed-band failure expected, got: {}",
+            payload.metrics.error
+        );
+        // The RULING-2 alignment: byte-match Swift's blanked correctness-audit surface.
+        assert_eq!(
+            payload.metrics.golden_hash, "",
+            "golden_hash blanked to match Swift"
+        );
+        assert_eq!(
+            payload.metrics.case_count, 0,
+            "case_count blanked to match Swift"
+        );
+        assert_eq!(
+            payload.metrics.checked_steps, 0,
+            "checked_steps blanked to match Swift"
+        );
+        // The REAL timing surface is still retained (only the correctness-audit fields blank).
+        assert!(
+            payload.metrics.decode_seconds_per_token > 0.0,
+            "measured timing retained"
+        );
+        assert!(
+            payload.metrics.prefill_seconds_per_token > 0.0,
+            "measured timing retained"
+        );
+        assert!(
+            !payload.metrics.passed_correctness,
+            "correctness never ran at the timed band"
+        );
+    }
+
+    #[test]
+    fn official_correctness_failure_still_populates_audit_fields_unchanged() {
+        // SCOPE GUARD for RULING 2: the correctness-FAILURE path (correctness DID run and
+        // failed) is NOT the timed-band path and must remain UNCHANGED — golden_hash and the
+        // case counts stay populated. Reuses the corrupted-anchor golden reached via in-band
+        // timing so the band does not mask the correctness failure.
+        let golden = official_golden(Some(json!({
+            "anchors": [
+                { "name": "bad-anchor", "context_tokens": vec![1i64; 8], "expected_token": 999, "accepted_tokens": [999] }
+            ]
+        })));
+        let payload = finish_with(&golden, conformant_engine);
+        assert!(!payload.passed);
+        assert_eq!(payload.metrics.error, "anchor token mismatch");
+        // Correctness-failure path is untouched: golden_hash + case counts stay populated.
+        assert_eq!(
+            payload.metrics.golden_hash, golden.sha256,
+            "correctness-fail path unchanged"
+        );
+        assert_eq!(
+            payload.metrics.case_count,
+            golden.total_correctness_case_count() as i64,
+            "correctness-fail path unchanged"
+        );
+        assert!(
+            payload.metrics.checked_steps > 0,
+            "correctness-fail path unchanged"
+        );
+    }
+
+    #[test]
+    fn behavior_gate_presence_requires_worker() {
+        // benchmarkRequiresRuntimeWorker: a behavior case forces the worker path.
+        let with_behavior = official_golden(Some(json!({
+            "behavior": [
+                { "name": "b1", "prompt_tokens": vec![1i64; 8], "accepted_token_sequences": [[1, 2]], "max_new_tokens": 4 }
+            ]
+        })));
+        assert!(benchmark_requires_runtime_worker(&with_behavior));
+        // No gates / no behavior ⇒ not required by this predicate.
+        assert!(!benchmark_requires_runtime_worker(&official_golden(None)));
+    }
+
+    #[test]
+    fn paired_baseline_env_fail_closed_semantics() {
+        // Both unset ⇒ None (no override).
+        assert_eq!(paired_baseline_from_env(None, None).unwrap(), None);
+        assert_eq!(
+            paired_baseline_from_env(Some("  "), Some("")).unwrap(),
+            None
+        );
+        // Both set + finite positive ⇒ Some (trimmed).
+        assert_eq!(
+            paired_baseline_from_env(Some(" 0.01 "), Some("0.13")).unwrap(),
+            Some((0.01, 0.13))
+        );
+        // Half-set (either side) ⇒ error "must be provided together".
+        let e = paired_baseline_from_env(Some("0.01"), None).unwrap_err();
+        assert!(e.contains("must be provided together"), "got: {e}");
+        let e = paired_baseline_from_env(None, Some("0.13")).unwrap_err();
+        assert!(e.contains("must be provided together"), "got: {e}");
+        // Non-finite / non-positive / non-numeric ⇒ error, per-key.
+        assert!(paired_baseline_from_env(Some("0"), Some("0.13")).is_err());
+        assert!(paired_baseline_from_env(Some("-1"), Some("0.13")).is_err());
+        assert!(paired_baseline_from_env(Some("inf"), Some("0.13")).is_err());
+        assert!(paired_baseline_from_env(Some("nan"), Some("0.13")).is_err());
+        assert!(paired_baseline_from_env(Some("0.01"), Some("cheese")).is_err());
+    }
+
+    #[test]
+    fn commit_identifier_prefers_valid_env_sha() {
+        // 7..=40 lowercase hex from MLXFAST_COMMIT_SHA wins (trimmed).
+        assert_eq!(commit_identifier(Some("  a1b2c3d  ")), "a1b2c3d");
+        assert_eq!(
+            commit_identifier(Some("0123456789abcdef0123456789abcdef01234567")),
+            "0123456789abcdef0123456789abcdef01234567"
+        );
+        // is_commit_sha_hex boundaries.
+        assert!(is_commit_sha_hex("abcdef0")); // 7
+        assert!(!is_commit_sha_hex("abcde")); // 6 too short
+        assert!(!is_commit_sha_hex("A1B2C3D")); // uppercase rejected
+        assert!(!is_commit_sha_hex("g1b2c3d")); // non-hex rejected
+        assert!(!is_commit_sha_hex(
+            "0123456789abcdef0123456789abcdef012345678"
+        )); // 41 too long
+    }
+
+    // -----------------------------------------------------------------------
+    // F1 — the SEAM-1 harness identity
+    // -----------------------------------------------------------------------
+
+    /// F1 MUTATION PROOF (b), at the seam that matters most: the OFFICIAL GATES-ONLY payload — the
+    /// seam-1 artifact the overlay consumes — seals the resolved harness identity.
+    ///
+    /// Reds if `base_metrics` goes back to `harness_hash: String::new()`, or seals anything other
+    /// than the identity the run resolved.
+    #[test]
+    fn official_gates_only_seals_the_resolved_harness_identity() {
+        let golden = official_golden(None);
+        let payload = gates_only_with(&golden, conformant_engine);
+        assert_eq!(
+            payload.metrics.harness_hash,
+            HarnessIdentity::TEST_HASH,
+            "the gates score must seal the harness identity the run resolved"
+        );
+        assert!(!payload.metrics.harness_hash.is_empty());
+        assert!(bench_core::harness_hash::is_well_formed_harness_hash(
+            &payload.metrics.harness_hash
+        ));
+    }
+
+    /// Every OFFICIAL failure payload seals the identity too — a failed gates score is still an
+    /// artifact, and a run that cannot say which harness produced it is the thing F1 removes.
+    #[test]
+    fn official_failure_payloads_seal_the_harness_identity() {
+        let golden = official_golden(None);
+        let failed = official_gates_failed(
+            &golden,
+            ScoringInputs::local(
+                TEST_BASELINE.prefill_seconds_per_token,
+                TEST_BASELINE.decode_seconds_per_token,
+            ),
+            RunDigests::for_test(&DirDigest::empty()),
+            "deadbeef",
+            GatesFailure {
+                error: "boom".to_string(),
+                first_failing_case: None,
+                first_failing_step: None,
+                checked_steps: 0,
+            },
+        );
+        assert_eq!(failed.metrics.harness_hash, HarnessIdentity::TEST_HASH);
+        assert!(!failed.passed);
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // BOARD `metrics.per_prompt` — the single-leg official path's MTP column.
+    // ---------------------------------------------------------------------------------------
+
+    /// The PASSING official payload seals exactly ONE `per_prompt` record — one timed prompt was
+    /// measured, so one entry — carrying the golden's own sha256, the free-run audit's effective
+    /// mean draft length, and the ENFORCED whole-window decode seconds-per-token.
+    #[test]
+    fn official_seals_one_per_prompt_record_for_the_timed_prompt() {
+        let golden = official_golden(None);
+        let payload = finish_with(&golden, conformant_engine);
+        assert!(
+            payload.passed,
+            "precondition: this is the passing official path"
+        );
+
+        assert_eq!(
+            payload.metrics.per_prompt.len(),
+            1,
+            "official times ONE prompt, so it seals ONE record — never an entry per pool prompt"
+        );
+        let pp = &payload.metrics.per_prompt[0];
+        assert_eq!(
+            pp.prompt_sha256, golden.sha256,
+            "prompt identity is the golden's bytes (the same identity golden_hash carries)"
+        );
+        assert_eq!(pp.prompt_sha256, payload.metrics.golden_hash);
+        assert_eq!(
+            pp.effective_mean_draft_len, IN_BAND_MEAN_DRAFT_LEN,
+            "the audit's own value, carried through the TimingResult narrowing"
+        );
+        assert_eq!(
+            pp.mtp_seconds_per_token_mean, payload.metrics.decode_seconds_per_token,
+            "the ENFORCED whole-window figure, never a second decode-only number"
+        );
+    }
+
+    /// END TO END from the ENGINE: a mock that reports 32 rounds of 4 committed tokens must reach
+    /// the sealed score as `effective_mean_draft_len = 4.0`. This is the whole chain the field was
+    /// missing — `FreeRunAudit` -> `TimingResult` -> `ScoreMetrics` — driven through `official_core`
+    /// rather than a synthetic timing. (A mock's ~0 wall clock cannot sit inside the acceptance
+    /// band, so this lands on the band-failure payload, which retains the real timing surface.)
+    #[test]
+    fn official_per_prompt_carries_the_mocked_engines_measured_draft_length() {
+        let golden = official_golden(None);
+        let mtp_engine =
+            || conformant_engine().free_run_acceptance_lengths(vec![4; BENCHMARK_DECODE_STEPS / 4]);
+        let payload = run_official(&golden, mtp_engine);
+
+        assert_eq!(payload.metrics.per_prompt.len(), 1);
+        let pp = &payload.metrics.per_prompt[0];
+        assert_eq!(pp.prompt_sha256, golden.sha256);
+        assert_eq!(
+            pp.effective_mean_draft_len, 4.0,
+            "128 committed tokens over 32 rounds = 4.0 tokens per verify round"
+        );
+        assert_eq!(
+            pp.mtp_seconds_per_token_mean,
+            payload.metrics.decode_seconds_per_token
+        );
+    }
+
+    /// Run the full official window WITH a requested spec, against a mock that reports the given
+    /// acceptance histogram and drafted/accepted counters. A mock's ~0 wall clock cannot sit inside
+    /// the acceptance band, so this lands on the band-failure payload — which RETAINS the real timed
+    /// surface, exactly the payload the spec seal must reach.
+    fn run_official_with_spec(
+        golden: &GoldenFixture,
+        spec: SpecConfig,
+        acceptance_lengths: Vec<u32>,
+        drafted: u64,
+        accepted: u64,
+        disagreements: Option<u64>,
+    ) -> ScorePayload {
+        let committed: u64 = acceptance_lengths.iter().map(|&x| u64::from(x)).sum();
+        let timed = move || {
+            let engine = conformant_engine()
+                .free_run_acceptance_lengths(acceptance_lengths.clone())
+                .free_run_totals(drafted, accepted, committed);
+            match disagreements {
+                Some(d) => engine.free_run_verify_replay_disagreements(d),
+                // Not reported: the field never reaches the wire, which is the pre-field engine.
+                None => engine,
+            }
+        };
+        official_core_windowed(
+            OfficialParams {
+                spec: Some(spec),
+                ..test_run(
+                    golden,
+                    RunDigests::for_test(&DirDigest::empty()),
+                    &test_window(),
+                )
+            },
+            TEST_BASELINE.bands,
+            || Session::connect(timed()).map(|(s, _)| s),
+            |_phase: &str| Ok(()),
+        )
+    }
+
+    /// A histogram of R rounds committing `per_round` tokens each that sums to exactly the official
+    /// decode window, so the §2.6 triple holds for a synthetic depth.
+    fn even_histogram(per_round: u32) -> Vec<u32> {
+        assert_eq!(BENCHMARK_DECODE_STEPS % per_round as usize, 0);
+        vec![per_round; BENCHMARK_DECODE_STEPS / per_round as usize]
+    }
+
+    /// THE DEFECT THIS CLOSES. The official path built its `TimingParams` with NO spec, so
+    /// `free_decode_begin` went out bare and a per-request engine resolved SERIAL while the leg was
+    /// scored against the MTP oracle. With `--mtp-depth` wired, the request carries the spec, the
+    /// engine's echo is validated equal to it, and the SEALED score states the depth that ran —
+    /// DIFFERENTLY for depth 1 and depth 2, so the seal tracks the request rather than a constant.
+    #[test]
+    fn official_seals_the_requested_mtp_depth_and_the_engines_acceptance_counters() {
+        let golden = official_golden(None);
+
+        // Depth 1: 64 rounds of 2 committed tokens; the drafter proposed 64 and 32 were accepted.
+        let d1 =
+            run_official_with_spec(&golden, SpecConfig::mtp(1), even_histogram(2), 64, 32, None);
+        assert_eq!(
+            d1.metrics.effective_spec_mode.as_deref(),
+            Some("mtp"),
+            "the engine's own effective_spec echo, validated equal to the request"
+        );
+        assert_eq!(d1.metrics.effective_spec_depth, Some(1));
+        assert_eq!(d1.metrics.spec_rounds, Some(64));
+        assert_eq!(d1.metrics.spec_drafted_total, Some(64));
+        assert_eq!(d1.metrics.spec_accepted_total, Some(32));
+        assert_eq!(d1.metrics.spec_acceptance_rate, Some(0.5));
+        assert_eq!(
+            d1.metrics.acceptance_lengths,
+            even_histogram(2),
+            "the per-round histogram is persisted VERBATIM (RULED OQ4)"
+        );
+
+        // Depth 2: 32 rounds of 4, a different drafted/accepted pair. The DEPTH differs from the
+        // depth-1 run, which is the whole point — a constant would pass one of these, not both.
+        let d2 =
+            run_official_with_spec(&golden, SpecConfig::mtp(2), even_histogram(4), 96, 72, None);
+        assert_eq!(d2.metrics.effective_spec_depth, Some(2));
+        assert_ne!(
+            d1.metrics.effective_spec_depth,
+            d2.metrics.effective_spec_depth
+        );
+        assert_eq!(d2.metrics.spec_rounds, Some(32));
+        assert_eq!(d2.metrics.spec_drafted_total, Some(96));
+        assert_eq!(d2.metrics.spec_accepted_total, Some(72));
+        assert_eq!(d2.metrics.spec_acceptance_rate, Some(0.75));
+        assert_eq!(d2.metrics.acceptance_lengths.len(), 32);
+
+        // The per-prompt entry mirrors the same counters the board reads per prompt.
+        let pp = &d2.metrics.per_prompt[0];
+        assert_eq!(pp.spec_rounds, Some(32));
+        assert_eq!(pp.spec_drafted_total, Some(96));
+        assert_eq!(pp.spec_accepted_total, Some(72));
+        assert_eq!(pp.effective_mean_draft_len, 4.0);
+    }
+
+    /// A drafting leg whose drafter proposed NOTHING seals no RATE: a zero denominator has no rate,
+    /// and `0.0` would read as "drafted plenty, accepted none". The counters themselves still seal.
+    #[test]
+    fn official_omits_the_acceptance_rate_when_nothing_was_drafted() {
+        let golden = official_golden(None);
+        let payload =
+            run_official_with_spec(&golden, SpecConfig::mtp(1), even_histogram(1), 0, 0, None);
+        assert_eq!(payload.metrics.spec_drafted_total, Some(0));
+        assert_eq!(payload.metrics.spec_acceptance_rate, None);
+        let json = payload.to_sealed_json().unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(v["metrics"]
+            .as_object()
+            .unwrap()
+            .get("spec_acceptance_rate")
+            .is_none());
+    }
+
+    /// THE DEFAULT IS SERIAL, AND SAYS SO. With no spec flag the wire request is bare — today's
+    /// behaviour byte-for-byte — and the seal records what that means: mode `serial`, depth `0`, and
+    /// NONE of the drafting counters (a serial leg drafts nothing, and its all-ones histogram is
+    /// structurally constant).
+    #[test]
+    fn official_serial_default_seals_mode_serial_depth_zero_and_no_counters() {
+        let golden = official_golden(None);
+        let payload = run_official(&golden, conformant_engine);
+        assert_eq!(
+            payload.metrics.effective_spec_mode.as_deref(),
+            Some("serial")
+        );
+        assert_eq!(payload.metrics.effective_spec_depth, Some(0));
+        assert_eq!(payload.metrics.spec_rounds, None);
+        assert_eq!(payload.metrics.spec_drafted_total, None);
+        assert_eq!(payload.metrics.spec_accepted_total, None);
+        assert_eq!(payload.metrics.spec_acceptance_rate, None);
+        assert!(payload.metrics.acceptance_lengths.is_empty());
+        // ...and none of them reach the sealed bytes.
+        let json = payload.to_sealed_json().unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let obj = v["metrics"].as_object().unwrap();
+        for absent in [
+            "spec_rounds",
+            "spec_drafted_total",
+            "spec_accepted_total",
+            "spec_acceptance_rate",
+            "spec_verify_replay_disagreements",
+            "spec_verification_mode",
+            "spec_rectangular_verification_rounds",
+            "spec_serial_verification_rounds",
+            "acceptance_lengths",
+        ] {
+            assert!(
+                !obj.contains_key(absent),
+                "{absent} must stay absent on a serial leg"
+            );
+        }
+    }
+
+    /// SPEC-NEVER-IGNORED IS NOT WEAKENED BY THE WIRING. An engine that echoes a DIFFERENT depth
+    /// than the one requested has its leg DISCARDED — the run fails with the divergence, and no
+    /// depth is sealed from the engine's word.
+    #[test]
+    fn official_discards_a_leg_whose_engine_echoes_a_different_depth() {
+        let golden = official_golden(None);
+        let liar = || {
+            conformant_engine()
+                .free_run_acceptance_lengths(even_histogram(4))
+                .diverge_spec_echo(SpecConfig::mtp(3))
+        };
+        let payload = official_core_windowed(
+            OfficialParams {
+                spec: Some(SpecConfig::mtp(2)),
+                ..test_run(
+                    &golden,
+                    RunDigests::for_test(&DirDigest::empty()),
+                    &test_window(),
+                )
+            },
+            TEST_BASELINE.bands,
+            || Session::connect(liar()).map(|(s, _)| s),
+            |_phase: &str| Ok(()),
+        );
+        assert!(!payload.passed);
+        assert!(
+            payload.metrics.error.contains("spec"),
+            "expected a spec-echo divergence, got: {}",
+            payload.metrics.error
+        );
+        assert_eq!(payload.metrics.effective_spec_depth, None);
+        assert!(payload.metrics.per_prompt.is_empty());
+    }
+
+    /// THE VERIFY/REPLAY DISAGREEMENT COUNT IS SEALED WHEN THE ENGINE REPORTS IT.
+    ///
+    /// The depth-1 MTP cycle's rejecting rounds compare the two-row verify's argmax against the
+    /// one-row replay's argmax; the tower is not batch-invariant, so the two can differ. The REPLAY
+    /// stands — the divergence is never a refusal — and the engine COUNTS it. This seals that count
+    /// on the timed leg beside the other spec counters, so a scored artifact states how often the
+    /// two row shapes disagreed instead of leaving it invisible.
+    #[test]
+    fn official_seals_the_engines_verify_replay_disagreement_count() {
+        let golden = official_golden(None);
+        // 64 drafted, 32 accepted => 32 rejecting rounds; 30 of them disagreed.
+        let payload = run_official_with_spec(
+            &golden,
+            SpecConfig::mtp(1),
+            even_histogram(2),
+            64,
+            32,
+            Some(30),
+        );
+        assert_eq!(payload.metrics.spec_verify_replay_disagreements, Some(30));
+        let json = payload.to_sealed_json().unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            v["metrics"]["spec_verify_replay_disagreements"],
+            serde_json::json!(30),
+            "the sealed key is spec_verify_replay_disagreements"
+        );
+        // The counters it sits beside are untouched, and NOTHING ENFORCED moved.
+        assert_eq!(payload.metrics.spec_drafted_total, Some(64));
+        assert_eq!(payload.metrics.spec_accepted_total, Some(32));
+        assert_eq!(payload.metrics.spec_acceptance_rate, Some(0.5));
+    }
+
+    /// THE VERIFY PATH IS SEALED WHEN THE ENGINE REPORTS IT. A rectangular window (one target
+    /// forward over the 1+k candidates) and the serial oracle (one forward per candidate) produce
+    /// the same tokens and very different decode numbers; the seal names which one ran so the
+    /// number can be read. Absent on the wire ⇒ no key (a pre-field engine seals unchanged bytes).
+    #[test]
+    fn official_seals_the_engines_verification_path_when_reported() {
+        let golden = official_golden(None);
+        let hist = even_histogram(2);
+        let committed: u64 = hist.iter().map(|&x| u64::from(x)).sum();
+        let engine = move || {
+            conformant_engine()
+                .free_run_acceptance_lengths(hist.clone())
+                .free_run_totals(64, 32, committed)
+                .free_run_verification("rectangular", 64, 0)
+        };
+        let payload = official_core_windowed(
+            OfficialParams {
+                spec: Some(SpecConfig::mtp(1)),
+                ..test_run(
+                    &golden,
+                    RunDigests::for_test(&DirDigest::empty()),
+                    &test_window(),
+                )
+            },
+            TEST_BASELINE.bands,
+            || Session::connect(engine()).map(|(s, _)| s),
+            |_phase: &str| Ok(()),
+        );
+        assert_eq!(
+            payload.metrics.spec_verification_mode.as_deref(),
+            Some("rectangular")
+        );
+        assert_eq!(
+            payload.metrics.spec_rectangular_verification_rounds,
+            Some(64)
+        );
+        assert_eq!(payload.metrics.spec_serial_verification_rounds, Some(0));
+        let v: serde_json::Value =
+            serde_json::from_str(&payload.to_sealed_json().unwrap()).unwrap();
+        assert_eq!(v["metrics"]["spec_verification_mode"], "rectangular");
+        assert_eq!(v["metrics"]["spec_rectangular_verification_rounds"], 64);
+        assert_eq!(v["metrics"]["spec_serial_verification_rounds"], 0);
+        let silent =
+            run_official_with_spec(&golden, SpecConfig::mtp(1), even_histogram(2), 64, 32, None);
+        assert_eq!(silent.metrics.spec_verification_mode, None);
+        let v: serde_json::Value = serde_json::from_str(&silent.to_sealed_json().unwrap()).unwrap();
+        assert!(v["metrics"]
+            .as_object()
+            .unwrap()
+            .get("spec_verification_mode")
+            .is_none());
+    }
+
+    /// ABSENT IS NOT ZERO. An engine that does not put the counter on the wire — every engine built
+    /// before the field existed — seals NO key, so its score bytes are unchanged. `0` would claim a
+    /// measurement that engine never made.
+    #[test]
+    fn official_omits_the_disagreement_count_when_the_engine_does_not_report_it() {
+        let golden = official_golden(None);
+        let payload =
+            run_official_with_spec(&golden, SpecConfig::mtp(1), even_histogram(2), 64, 32, None);
+        assert_eq!(payload.metrics.spec_verify_replay_disagreements, None);
+        let json = payload.to_sealed_json().unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(
+            v["metrics"]
+                .as_object()
+                .unwrap()
+                .get("spec_verify_replay_disagreements")
+                .is_none(),
+            "a non-reporting engine must seal no disagreement key at all"
+        );
+    }
+
+    /// AN IMPOSSIBLE COUNT IS A DEFECT, NOT A DATUM. Only a REJECTING round runs the one-row replay
+    /// that can disagree, so the count is bounded by the rejected drafts
+    /// (`drafted_total - accepted_total`). An engine claiming more describes rounds that did not
+    /// happen: the leg is DISCARDED by name rather than sealed.
+    #[test]
+    fn official_discards_a_leg_reporting_more_disagreements_than_rejected_drafts() {
+        let golden = official_golden(None);
+        // 64 drafted, 32 accepted => 32 rejected. 33 is one more than can exist.
+        let payload = run_official_with_spec(
+            &golden,
+            SpecConfig::mtp(1),
+            even_histogram(2),
+            64,
+            32,
+            Some(33),
+        );
+        assert!(!payload.passed);
+        assert!(
+            payload
+                .metrics
+                .error
+                .contains("verify_replay_disagreements 33"),
+            "expected the named disagreement refusal, got: {}",
+            payload.metrics.error
+        );
+        assert_eq!(payload.metrics.spec_verify_replay_disagreements, None);
+
+        // The BOUNDARY still passes: exactly as many disagreements as rejected drafts is possible.
+        let ok = run_official_with_spec(
+            &golden,
+            SpecConfig::mtp(1),
+            even_histogram(2),
+            64,
+            32,
+            Some(32),
+        );
+        assert_eq!(ok.metrics.spec_verify_replay_disagreements, Some(32));
+    }
+
+    /// The ENGINE IDENTITY seal takes the TIMED worker's hello verbatim and mirrors the head digest
+    /// onto the per-prompt entry the board reads.
+    #[test]
+    fn engine_identity_seal_records_the_hello_and_mirrors_the_head_digest() {
+        let mut metrics = ScoreMetrics {
+            per_prompt: vec![crate::score::ScorePerPrompt::default()],
+            ..Default::default()
+        };
+        let hello = bench_runner::Hello {
+            nonce: "n".to_string(),
+            protocol_version: Some(1),
+            backend: Some("ds4-dfm-rs@abc123 overlay=def nvcc=12.8 driver=580".to_string()),
+            device: Some("cuda sm_121".to_string()),
+            capabilities: Vec::new(),
+            spec_modes: Vec::new(),
+            head_provenance: Some(bench_protocol::HeadProvenance {
+                sha256: "ab".repeat(32),
+                bytes: 7,
+                file_count: 1,
+            }),
+            max_batch_size: None,
+            runner: None,
+            resident: None,
+        };
+        seal_engine_identity(&mut metrics, &hello);
+        assert_eq!(
+            metrics.engine_backend.as_deref(),
+            Some("ds4-dfm-rs@abc123 overlay=def nvcc=12.8 driver=580")
+        );
+        assert_eq!(metrics.engine_device.as_deref(), Some("cuda sm_121"));
+        assert_eq!(metrics.engine_protocol_version, Some(1));
+        assert_eq!(metrics.head_provenance_sha256, Some("ab".repeat(32)));
+        assert_eq!(
+            metrics.per_prompt[0].head_provenance_sha256, metrics.head_provenance_sha256,
+            "the board reads the head digest off the per-prompt entry"
+        );
+
+        // An engine that announces none of it seals no key at all (a pre-#106 engine is unchanged).
+        let mut bare = ScoreMetrics::default();
+        seal_engine_identity(
+            &mut bare,
+            &bench_runner::Hello {
+                nonce: "n".to_string(),
+                protocol_version: None,
+                backend: None,
+                device: None,
+                capabilities: Vec::new(),
+                spec_modes: Vec::new(),
+                head_provenance: None,
+                max_batch_size: None,
+                runner: None,
+                resident: None,
+            },
+        );
+        let json = ScorePayload {
+            score: None,
+            passed: false,
+            metrics: bare,
+        }
+        .to_sealed_json()
+        .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let obj = v["metrics"].as_object().unwrap();
+        // Every identity key is ABSENT, never sealed as 0 or "": an absent key says "the worker
+        // said nothing", which is a different claim from "the worker said zero".
+        for absent in [
+            "engine_backend",
+            "engine_device",
+            "engine_protocol_version",
+            "head_provenance_sha256",
+            "runner_id",
+            "runner_model_type",
+            "runner_manifest_sha256",
+            "runner_build",
+            "resident_pid",
+            "resident_load_epoch",
+        ] {
+            assert!(!obj.contains_key(absent), "{absent} must stay absent");
+        }
+    }
+
+    /// The RUNNER and RESIDENT identities are sealed exactly like the head provenance — recorded in
+    /// the score.json metrics, and read back out of the sealed bytes unchanged.
+    #[test]
+    fn runner_and_resident_identities_are_sealed_into_the_metrics() {
+        let mut metrics = ScoreMetrics::default();
+        seal_engine_identity(
+            &mut metrics,
+            &bench_runner::Hello {
+                nonce: "n".to_string(),
+                protocol_version: Some(1),
+                backend: Some("mlx".to_string()),
+                device: Some("m5".to_string()),
+                capabilities: Vec::new(),
+                spec_modes: Vec::new(),
+                head_provenance: None,
+                max_batch_size: None,
+                runner: Some(bench_protocol::RunnerIdentity {
+                    id: "layr/qwen4exp-125b-a6b".to_string(),
+                    model_type: "qwen4_exp".to_string(),
+                    manifest_sha256: "ab".repeat(32),
+                    build: "c4089870".to_string(),
+                }),
+                resident: Some(bench_protocol::ResidentIdentity {
+                    pid: 4242,
+                    load_epoch: 1_756_944_000,
+                }),
+            },
+        );
+        assert_eq!(metrics.runner_id.as_deref(), Some("layr/qwen4exp-125b-a6b"));
+        assert_eq!(metrics.runner_model_type.as_deref(), Some("qwen4_exp"));
+        assert_eq!(metrics.runner_manifest_sha256, Some("ab".repeat(32)));
+        assert_eq!(metrics.runner_build.as_deref(), Some("c4089870"));
+        assert_eq!(metrics.resident_pid, Some(4242));
+        assert_eq!(metrics.resident_load_epoch, Some(1_756_944_000));
+
+        // ROUND TRIP through the sealed bytes: Yukon reads score.json as {score, metrics}, so the
+        // keys must survive serialization under their sealed names and read back identically.
+        let json = ScorePayload {
+            score: Some(1.0),
+            passed: true,
+            metrics: metrics.clone(),
+        }
+        .to_sealed_json()
+        .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let obj = v["metrics"].as_object().unwrap();
+        assert_eq!(obj["runner_id"], "layr/qwen4exp-125b-a6b");
+        assert_eq!(obj["runner_model_type"], "qwen4_exp");
+        assert_eq!(obj["runner_manifest_sha256"], "ab".repeat(32));
+        assert_eq!(obj["runner_build"], "c4089870");
+        assert_eq!(obj["resident_pid"], 4242);
+        assert_eq!(obj["resident_load_epoch"], 1_756_944_000u64);
+        let back: ScorePayload = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.metrics, metrics);
+    }
+
+    /// WEIGHTS-LOAD-ONCE. A timed window assembled from several worker sessions must see ONE
+    /// resident identity across every phase; a changed pid or load_epoch is a mid-window reload and
+    /// is refused BY NAME rather than sealed.
+    #[test]
+    fn a_resident_identity_that_changes_mid_window_is_refused_by_name() {
+        let hello_with = |pid: u32, load_epoch: u64| bench_runner::Hello {
+            nonce: "n".to_string(),
+            protocol_version: Some(1),
+            backend: Some("mlx".to_string()),
+            device: Some("m5".to_string()),
+            capabilities: Vec::new(),
+            spec_modes: Vec::new(),
+            head_provenance: None,
+            max_batch_size: None,
+            runner: None,
+            resident: Some(bench_protocol::ResidentIdentity { pid, load_epoch }),
+        };
+
+        // Same resident across both phases: retained, and the FIRST hello is the one kept.
+        let mut slot = None;
+        retain_timed_hello(&mut slot, hello_with(4242, 7)).unwrap();
+        retain_timed_hello(&mut slot, hello_with(4242, 7)).unwrap();
+        assert_eq!(slot.as_ref().unwrap().resident.as_ref().unwrap().pid, 4242);
+
+        // A RELOAD inside the window (same pid, new load_epoch) is refused by name.
+        let mut slot = None;
+        retain_timed_hello(&mut slot, hello_with(4242, 7)).unwrap();
+        let err = retain_timed_hello(&mut slot, hello_with(4242, 8))
+            .expect_err("a changed load_epoch is a mid-window reload");
+        assert_eq!(err.name(), "resident_identity_changed_within_window");
+        assert!(err.to_string().contains("load_epoch 7"));
+        assert!(err.to_string().contains("load_epoch 8"));
+
+        // A DIFFERENT resident process is refused too.
+        let mut slot = None;
+        retain_timed_hello(&mut slot, hello_with(4242, 7)).unwrap();
+        assert!(retain_timed_hello(&mut slot, hello_with(9001, 7)).is_err());
+
+        // ...and so is a phase that reports no resident at all when the first one did: half a
+        // window on a resident process and half on a self-loading worker is the same lie.
+        let mut slot = None;
+        retain_timed_hello(&mut slot, hello_with(4242, 7)).unwrap();
+        let mut no_resident = hello_with(4242, 7);
+        no_resident.resident = None;
+        assert!(retain_timed_hello(&mut slot, no_resident).is_err());
+
+        // A window with NO resident anywhere is untouched: a worker without one stays legal.
+        let mut plain = hello_with(0, 0);
+        plain.resident = None;
+        let mut slot = None;
+        retain_timed_hello(&mut slot, plain.clone()).unwrap();
+        retain_timed_hello(&mut slot, plain).unwrap();
+        assert!(slot.unwrap().resident.is_none());
+    }
+
+    /// A NON-DRAFTING free-run leg seals what the audit actually computed — one committed token per
+    /// verify round — and a genuinely empty histogram seals 0.0 with the KEY STILL PRESENT. Neither
+    /// is a placeholder: the board treats 0 as a real value, so benchd must never fabricate one.
+    #[test]
+    fn official_per_prompt_draft_length_is_never_fabricated() {
+        let golden = official_golden(None);
+
+        // The mock's conformant default is `vec![1; N]` — a leg that committed exactly one token
+        // per round, i.e. no drafting gain. The honest seal is 1.0, not 0.0.
+        let serial = run_official(&golden, conformant_engine);
+        assert_eq!(serial.metrics.per_prompt[0].effective_mean_draft_len, 1.0);
+
+        // A zero the audit really computed survives serialization as an explicit 0 (never dropped).
+        let mut timing = in_band_timing();
+        // An EMPTY histogram: zero rounds, zero committed tokens — mean 0.0, really computed.
+        timing.free_run_audit = Some(audit_for_test(Vec::new(), 0, 0));
+        let mut metrics = base_metrics(
+            Mode::Official,
+            &golden,
+            RunDigests::for_test(&DirDigest::empty()),
+            ScoringInputs::local(
+                TEST_BASELINE.prefill_seconds_per_token,
+                TEST_BASELINE.decode_seconds_per_token,
+            ),
+        );
+        apply_timing_metrics(
+            &mut metrics,
+            &timing,
+            ScoringInputs::local(
+                TEST_BASELINE.prefill_seconds_per_token,
+                TEST_BASELINE.decode_seconds_per_token,
+            ),
+        );
+        seal_official_per_prompt(&mut metrics, &golden, &timing);
+        let sealed = ScorePayload {
+            score: Some(1.0),
+            passed: true,
+            metrics,
+        }
+        .to_sealed_json()
+        .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&sealed).unwrap();
+        assert_eq!(
+            v["metrics"]["per_prompt"][0]["effective_mean_draft_len"],
+            json!(0.0),
+            "0 is a REAL measured value the board reads; it must be sealed, not omitted"
+        );
+    }
+
+    /// The GATES-ONLY official payload measured no timed prompt, so it seals NO record and the key
+    /// stays out of its JSON entirely.
+    #[test]
+    fn official_gates_only_seals_no_per_prompt() {
+        let golden = official_golden(None);
+        let payload = official_gates_failed(
+            &golden,
+            ScoringInputs::local(
+                TEST_BASELINE.prefill_seconds_per_token,
+                TEST_BASELINE.decode_seconds_per_token,
+            ),
+            RunDigests::for_test(&DirDigest::empty()),
+            "deadbeef",
+            GatesFailure {
+                error: "boom".to_string(),
+                first_failing_case: None,
+                first_failing_step: None,
+                checked_steps: 0,
+            },
+        );
+        assert!(payload.metrics.per_prompt.is_empty());
+        let sealed = payload.to_sealed_json().unwrap();
+        let v: serde_json::Value = serde_json::from_str(&sealed).unwrap();
+        assert!(
+            v["metrics"].get("per_prompt").is_none(),
+            "an empty array is omitted, so a no-timing payload's bytes are unchanged"
+        );
+    }
+
+    // ---- THE RANKED PAIRED PATH (David 2026-09-08) --------------------------------------
+
+    /// A calibration whose band is deliberately WIDE. The mock engine's wall clock is ~0, so its
+    /// measured seconds-per-token is a real but tiny positive number that no realistic band could
+    /// contain; a wide band lets the orchestration under test run to its end instead of stopping
+    /// at the health gate. The NARROW band is exercised on its own, against real numbers, in
+    /// `baseline.rs` (`the_band_check_holds_on_both_axes_and_in_both_directions`).
+    fn wide_calibration() -> crate::baseline::BaselineCalibration {
+        crate::baseline::BaselineCalibration {
+            version: crate::baseline::CALIBRATION_VERSION,
+            track_id: "qwen3.8-125b-a6b-mlx-v1".to_string(),
+            box_name: "m5-max-128gb-4-qwen38-125b-a6b-mlx".to_string(),
+            reference_commit: "a".repeat(40),
+            prompt: "botany".to_string(),
+            passes: 4,
+            prefill_seconds_per_token_mean: 1e-6,
+            decode_seconds_per_token_mean: 1e-6,
+            prefill_cv: 0.0,
+            decode_cv: 0.0,
+            prefill_band_low: 1e-6,
+            prefill_band_high: 1e6,
+            decode_band_low: 1e-6,
+            decode_band_high: 1e6,
+            captured_at: "2026-09-08T00:00:00Z".to_string(),
+            benchd_source_commit: "b".repeat(40),
+        }
+    }
+
+    /// A calibration the mock's measurement can never satisfy: a mean of one second per token with
+    /// the shipped band literals.
+    /// A calibration every real leg is SLOWER than: means of a nanosecond per token, so the
+    /// control leg lands above the band's ceiling and the health gate refuses.
+    fn narrow_calibration() -> crate::baseline::BaselineCalibration {
+        crate::baseline::BaselineCalibration {
+            prefill_seconds_per_token_mean: 1e-9,
+            decode_seconds_per_token_mean: 1e-9,
+            prefill_band_low: crate::baseline::DEFAULT_PREFILL_BAND_LOW,
+            prefill_band_high: crate::baseline::DEFAULT_PREFILL_BAND_HIGH,
+            decode_band_low: crate::baseline::DEFAULT_DECODE_BAND_LOW,
+            decode_band_high: crate::baseline::DEFAULT_DECODE_BAND_HIGH,
+            ..wide_calibration()
+        }
+    }
+
+    fn paired_seal_for_test<'a>(
+        calibration: &'a crate::baseline::BaselineCalibration,
+    ) -> PairedBaselineSeal<'a> {
+        PairedBaselineSeal {
+            box_name: &calibration.box_name,
+            calibration_sha256: "c0ffee",
+            control_golden_sha256: "5e21a1",
+            reference_commit: &calibration.reference_commit,
+            band_passed: false,
+            leg: None,
+        }
+    }
+
+    /// The paired WINDOW every paired test drives: the test bands, the load-once residency, no
+    /// spec, MLX, and the caller's cool gate.
+    fn paired_window_for_test<G>(cool_gate: G) -> PairedWindow<G>
+    where
+        G: FnMut(&str) -> bench_runner::Result<()>,
+    {
+        PairedWindow {
+            bands: TEST_BASELINE.bands,
+            spec: None,
+            window: test_window(),
+            cool_gate,
+            pairs: 1,
+            // The tests drive the ruled floors; the per-project arms set their own.
+            floors: SpeedupFloors::DEFAULT,
+            weights: ScoringWeights::DEFAULT,
+        }
+    }
+
+    /// TWO ROOTS, ONE BOX, IN ORDER. The paired run spawns leg 1's worker from the REFERENCE root
+    /// and leg 2's from the CANDIDATE root, and the score's denominator is the number leg 1
+    /// MEASURED — not any number in the calibration file.
+    ///
+    /// The mock's ~0 wall clock cannot sit inside the ACCEPTANCE band, so this lands on the
+    /// band-failure payload; that payload retains the real timing surface and the paired seal,
+    /// which is exactly the surface under test. The per-leg ENGINE lifecycle is asserted too: leg
+    /// 1's guard is opened and dropped before leg 2's is opened.
+    #[test]
+    fn the_paired_run_measures_two_roots_in_order_and_scores_against_leg_one() {
+        use std::rc::Rc;
+        let golden = official_golden(None);
+        let calibration = wide_calibration();
+        let baseline_spawns = Cell::new(0usize);
+        let candidate_spawns = Cell::new(0usize);
+        // The lifecycle log: each entry is what happened, in the order it happened.
+        let events: Rc<std::cell::RefCell<Vec<&'static str>>> =
+            Rc::new(std::cell::RefCell::new(Vec::new()));
+
+        /// A leg guard that records its own teardown, so the ordering claim is behavioural.
+        struct LegGuard {
+            events: Rc<std::cell::RefCell<Vec<&'static str>>>,
+            label: &'static str,
+        }
+        impl Drop for LegGuard {
+            fn drop(&mut self) {
+                self.events.borrow_mut().push(self.label);
+            }
+        }
+
+        let payload = official_core_paired(
+            PairedGoldens {
+                candidate: &golden,
+                control: &golden,
+            },
+            &calibration,
+            paired_seal_for_test(&calibration),
+            RunDigests::for_test(&DirDigest::empty()),
+            "deadbeef",
+            PairedLegs {
+                open_baseline_leg: || {
+                    events.borrow_mut().push("baseline-engine-up");
+                    Ok(LegGuard {
+                        events: Rc::clone(&events),
+                        label: "baseline-engine-down",
+                    })
+                },
+                open_candidate_leg: || {
+                    events.borrow_mut().push("candidate-engine-up");
+                    Ok(LegGuard {
+                        events: Rc::clone(&events),
+                        label: "candidate-engine-down",
+                    })
+                },
+                spawn_baseline: || {
+                    baseline_spawns.set(baseline_spawns.get() + 1);
+                    Session::connect(conformant_engine()).map(|(s, _)| s)
+                },
+                spawn_timed: || {
+                    candidate_spawns.set(candidate_spawns.get() + 1);
+                    Session::connect(conformant_engine()).map(|(s, _)| s)
+                },
+            },
+            paired_window_for_test(|_phase: &str| Ok(())),
+        );
+
+        // ONE worker per leg on the load-once residency, from each root, and BOTH roots were used.
+        assert_eq!(
+            baseline_spawns.get(),
+            1,
+            "leg 1 opens exactly one worker, from the reference root"
+        );
+        assert_eq!(
+            candidate_spawns.get(),
+            1,
+            "leg 2 opens exactly one worker, from the candidate root"
+        );
+        // SEQUENTIAL: leg 1's engine is torn down before leg 2's comes up.
+        assert_eq!(
+            events.borrow().as_slice(),
+            [
+                "baseline-engine-up",
+                "baseline-engine-down",
+                "candidate-engine-up",
+                "candidate-engine-down",
+            ]
+        );
+
+        // THE DENOMINATOR IS THE MEASURED LEG. It is a live measurement, so it is asserted by its
+        // PROPERTIES rather than a literal: finite, positive, equal on both of the names that
+        // carry it, and NOT the calibration file's mean (which no path may use as a denominator).
+        let m = &payload.metrics;
+        let leg_prefill = m.baseline_leg_prefill_seconds_per_token.unwrap();
+        let leg_decode = m.baseline_leg_decode_seconds_per_token.unwrap();
+        assert!(leg_prefill.is_finite() && leg_prefill > 0.0);
+        assert!(leg_decode.is_finite() && leg_decode > 0.0);
+        assert_eq!(m.baseline_prefill_seconds_per_token, leg_prefill);
+        assert_eq!(m.baseline_decode_seconds_per_token, leg_decode);
+        assert_ne!(
+            leg_prefill, calibration.prefill_seconds_per_token_mean,
+            "the calibration's mean must never be the denominator"
+        );
+        assert_eq!(m.baseline_source.as_deref(), Some("serial-control-leg"));
+        assert_eq!(
+            m.baseline_box.as_deref(),
+            Some(calibration.box_name.as_str())
+        );
+        assert_eq!(m.baseline_calibration_sha256.as_deref(), Some("c0ffee"));
+        assert_eq!(
+            m.baseline_reference_commit.as_deref(),
+            Some(calibration.reference_commit.as_str())
+        );
+        assert_eq!(m.baseline_band_passed, Some(true));
+        // The CANDIDATE leg's numbers are read back from the enforced fields.
+        assert_eq!(
+            m.candidate_leg_prefill_seconds_per_token,
+            Some(m.prefill_seconds_per_token)
+        );
+        assert_eq!(
+            m.candidate_leg_decode_seconds_per_token,
+            Some(m.decode_seconds_per_token)
+        );
+    }
+
+    /// TWO PAIRS (David 2026-09-09): the same two legs, in the same order, TWICE — control, then
+    /// candidate, engine up and down around each leg — and the enforced denominator / numerator
+    /// are the per-role MEANS over the pairs, with both pairs sealed as measured.
+    #[test]
+    fn two_pairs_run_both_legs_twice_and_score_on_the_per_role_means() {
+        use std::rc::Rc;
+        let golden = official_golden(None);
+        let calibration = wide_calibration();
+        let baseline_spawns = Cell::new(0usize);
+        let candidate_spawns = Cell::new(0usize);
+        let events: Rc<std::cell::RefCell<Vec<&'static str>>> =
+            Rc::new(std::cell::RefCell::new(Vec::new()));
+        struct LegGuard {
+            events: Rc<std::cell::RefCell<Vec<&'static str>>>,
+            label: &'static str,
+        }
+        impl Drop for LegGuard {
+            fn drop(&mut self) {
+                self.events.borrow_mut().push(self.label);
+            }
+        }
+        let mut window = paired_window_for_test(|_phase: &str| Ok(()));
+        window.pairs = 2;
+
+        let payload = official_core_paired(
+            PairedGoldens {
+                candidate: &golden,
+                control: &golden,
+            },
+            &calibration,
+            paired_seal_for_test(&calibration),
+            RunDigests::for_test(&DirDigest::empty()),
+            "deadbeef",
+            PairedLegs {
+                open_baseline_leg: || {
+                    events.borrow_mut().push("baseline-engine-up");
+                    Ok(LegGuard {
+                        events: Rc::clone(&events),
+                        label: "baseline-engine-down",
+                    })
+                },
+                open_candidate_leg: || {
+                    events.borrow_mut().push("candidate-engine-up");
+                    Ok(LegGuard {
+                        events: Rc::clone(&events),
+                        label: "candidate-engine-down",
+                    })
+                },
+                spawn_baseline: || {
+                    baseline_spawns.set(baseline_spawns.get() + 1);
+                    Session::connect(conformant_engine()).map(|(s, _)| s)
+                },
+                spawn_timed: || {
+                    candidate_spawns.set(candidate_spawns.get() + 1);
+                    Session::connect(conformant_engine()).map(|(s, _)| s)
+                },
+            },
+            window,
+        );
+
+        assert_eq!(baseline_spawns.get(), 2, "one control worker per pair");
+        assert_eq!(candidate_spawns.get(), 2, "one candidate worker per pair");
+        assert_eq!(
+            events.borrow().as_slice(),
+            [
+                "baseline-engine-up",
+                "baseline-engine-down",
+                "candidate-engine-up",
+                "candidate-engine-down",
+                "baseline-engine-up",
+                "baseline-engine-down",
+                "candidate-engine-up",
+                "candidate-engine-down",
+            ],
+            "each pair is control then candidate, engines strictly sequential"
+        );
+
+        let m = &payload.metrics;
+        assert_eq!(m.paired_legs.len(), 2, "both pairs are sealed as measured");
+        assert_eq!(m.paired_legs[0].pair, 1);
+        assert_eq!(m.paired_legs[1].pair, 2);
+        for r in &m.paired_legs {
+            assert!(
+                r.control_prefill_seconds_per_token.is_finite()
+                    && r.control_prefill_seconds_per_token > 0.0
+            );
+            assert!(
+                r.control_decode_seconds_per_token.is_finite()
+                    && r.control_decode_seconds_per_token > 0.0
+            );
+            assert!(
+                r.candidate_prefill_seconds_per_token.is_finite()
+                    && r.candidate_prefill_seconds_per_token > 0.0
+            );
+            assert!(
+                r.candidate_decode_seconds_per_token.is_finite()
+                    && r.candidate_decode_seconds_per_token > 0.0
+            );
+        }
+        let mean = |f: fn(&PairedLegRecord) -> f64| {
+            m.paired_legs.iter().map(f).sum::<f64>() / m.paired_legs.len() as f64
+        };
+        let close = |a: f64, b: f64| (a - b).abs() <= 1e-12 * a.abs().max(b.abs()).max(1.0);
+        // The ENFORCED denominator is the mean of the control legs, on both names that carry it.
+        let control_prefill = mean(|r| r.control_prefill_seconds_per_token);
+        let control_decode = mean(|r| r.control_decode_seconds_per_token);
+        assert!(close(
+            m.baseline_leg_prefill_seconds_per_token.unwrap(),
+            control_prefill
+        ));
+        assert!(close(
+            m.baseline_leg_decode_seconds_per_token.unwrap(),
+            control_decode
+        ));
+        assert!(close(m.baseline_prefill_seconds_per_token, control_prefill));
+        assert!(close(m.baseline_decode_seconds_per_token, control_decode));
+        // The ENFORCED numerator is the mean of the candidate legs.
+        assert!(close(
+            m.prefill_seconds_per_token,
+            mean(|r| r.candidate_prefill_seconds_per_token)
+        ));
+        assert!(close(
+            m.decode_seconds_per_token,
+            mean(|r| r.candidate_decode_seconds_per_token)
+        ));
+        assert_eq!(m.baseline_band_passed, Some(true));
+        assert_eq!(m.baseline_source.as_deref(), Some("serial-control-leg"));
+    }
+
+    /// A FAULT IN PAIR 2 ends the run by name, seals no score, and keeps pair 1's measurement in
+    /// the audit trail — nothing measured is thrown away, nothing unmeasured is invented.
+    #[test]
+    fn a_fault_in_the_second_pair_refuses_and_seals_the_first_pair() {
+        let golden = official_golden(None);
+        let calibration = wide_calibration();
+        let candidate_spawns = Cell::new(0usize);
+        let gates = Cell::new(0usize);
+        let mut window = paired_window_for_test(|_phase: &str| {
+            // Gate calls: pair 1 control (prefill, decode), pair 1 candidate (prefill, decode),
+            // then pair 2's control prefill gate — which is refused.
+            gates.set(gates.get() + 1);
+            if gates.get() == 5 {
+                Err(RunnerError::Protocol(
+                    "GPU never cooled for pair 2".to_string(),
+                ))
+            } else {
+                Ok(())
+            }
+        });
+        window.pairs = 2;
+
+        let payload = official_core_paired(
+            PairedGoldens {
+                candidate: &golden,
+                control: &golden,
+            },
+            &calibration,
+            paired_seal_for_test(&calibration),
+            RunDigests::for_test(&DirDigest::empty()),
+            "deadbeef",
+            PairedLegs {
+                open_baseline_leg: || Ok(()),
+                open_candidate_leg: || Ok(()),
+                spawn_baseline: || Session::connect(conformant_engine()).map(|(s, _)| s),
+                spawn_timed: || {
+                    candidate_spawns.set(candidate_spawns.get() + 1);
+                    Session::connect(conformant_engine()).map(|(s, _)| s)
+                },
+            },
+            window,
+        );
+
+        assert!(!payload.passed, "a faulted pair seals no score");
+        assert!(payload.score.is_none());
+        assert!(
+            payload
+                .metrics
+                .error
+                .contains("GPU never cooled for pair 2"),
+            "the run dies by name: {}",
+            payload.metrics.error
+        );
+        assert_eq!(
+            candidate_spawns.get(),
+            1,
+            "pair 2's candidate leg never opens"
+        );
+        assert_eq!(
+            payload.metrics.paired_legs.len(),
+            1,
+            "pair 1 stays in the audit trail"
+        );
+        assert_eq!(payload.metrics.paired_legs[0].pair, 1);
+    }
+
+    /// LEG 1 OUTSIDE THE BAND: the run dies BY NAME, seals no score, and leg 2 never opens — not
+    /// its engine and not its worker. The seal still states which box and which calibration, and
+    /// records the leg it measured.
+    #[test]
+    fn a_control_leg_outside_the_box_band_seals_no_score_and_never_opens_leg_two() {
+        let golden = official_golden(None);
+        let calibration = narrow_calibration();
+        let candidate_spawns = Cell::new(0usize);
+        let candidate_engine_ups = Cell::new(0usize);
+
+        let payload = official_core_paired(
+            PairedGoldens {
+                candidate: &golden,
+                control: &golden,
+            },
+            &calibration,
+            paired_seal_for_test(&calibration),
+            RunDigests::for_test(&DirDigest::empty()),
+            "deadbeef",
+            PairedLegs {
+                open_baseline_leg: || Ok(()),
+                open_candidate_leg: || {
+                    candidate_engine_ups.set(candidate_engine_ups.get() + 1);
+                    Ok(())
+                },
+                spawn_baseline: || Session::connect(conformant_engine()).map(|(s, _)| s),
+                spawn_timed: || {
+                    candidate_spawns.set(candidate_spawns.get() + 1);
+                    Session::connect(conformant_engine()).map(|(s, _)| s)
+                },
+            },
+            paired_window_for_test(|_phase: &str| Ok(())),
+        );
+
+        assert!(!payload.passed);
+        assert!(payload.score.is_none(), "a refused run seals no score");
+        assert!(
+            payload
+                .metrics
+                .error
+                .contains("serial-control leg outside this box's band"),
+            "{}",
+            payload.metrics.error
+        );
+        assert!(
+            payload
+                .metrics
+                .error
+                .contains(crate::baseline::SERIAL_CONTROL_LEG_OUTSIDE_BAND),
+            "{}",
+            payload.metrics.error
+        );
+        assert_eq!(
+            candidate_engine_ups.get(),
+            0,
+            "leg 2's engine must not boot"
+        );
+        assert_eq!(candidate_spawns.get(), 0, "leg 2's worker must not spawn");
+        assert_eq!(payload.metrics.baseline_band_passed, Some(false));
+        assert_eq!(
+            payload.metrics.baseline_source.as_deref(),
+            Some("serial-control-leg")
+        );
+        assert!(payload
+            .metrics
+            .baseline_leg_prefill_seconds_per_token
+            .is_some());
+        // No candidate leg ran, so no candidate number is invented.
+        assert_eq!(
+            payload.metrics.candidate_leg_prefill_seconds_per_token,
+            None
+        );
+        assert_eq!(payload.metrics.candidate_leg_decode_seconds_per_token, None);
+        // And NO denominator was established: the enforced fields stay at their placeholders.
+        assert_eq!(payload.metrics.baseline_prefill_seconds_per_token, 0.0);
+        assert_eq!(payload.metrics.baseline_decode_seconds_per_token, 0.0);
+    }
+
+    /// A LEG-1 ENGINE that will not come up stops the run before anything is measured, and the
+    /// refusal is the engine's own — never attributed to the candidate.
+    #[test]
+    fn a_control_leg_engine_that_cannot_boot_refuses_before_any_measurement() {
+        let golden = official_golden(None);
+        let calibration = wide_calibration();
+        let baseline_spawns = Cell::new(0usize);
+        let payload = official_core_paired(
+            PairedGoldens {
+                candidate: &golden,
+                control: &golden,
+            },
+            &calibration,
+            paired_seal_for_test(&calibration),
+            RunDigests::for_test(&DirDigest::empty()),
+            "deadbeef",
+            PairedLegs {
+                open_baseline_leg: || {
+                    Err::<(), String>(
+                        "LEG-SERVE-BOOT-FAILED: the reference resident died".to_string(),
+                    )
+                },
+                open_candidate_leg: || Ok(()),
+                spawn_baseline: || {
+                    baseline_spawns.set(baseline_spawns.get() + 1);
+                    Session::connect(conformant_engine()).map(|(s, _)| s)
+                },
+                spawn_timed: || Session::connect(conformant_engine()).map(|(s, _)| s),
+            },
+            paired_window_for_test(|_phase: &str| Ok(())),
+        );
+        assert!(!payload.passed);
+        assert!(
+            payload.metrics.error.contains("LEG-SERVE-BOOT-FAILED"),
+            "{}",
+            payload.metrics.error
+        );
+        assert_eq!(baseline_spawns.get(), 0, "no worker before its engine");
+        assert_eq!(payload.metrics.baseline_band_passed, Some(false));
+        assert_eq!(payload.metrics.baseline_leg_prefill_seconds_per_token, None);
+    }
+
+    /// The MLX shape: a per-depth oracle tape that agrees with the serial tape at step 0 and
+    /// DIVERGES at step 1 — `botany.mtp1.golden.json` against `botany.golden.json`.
+    fn per_depth_oracle_tokens() -> Vec<i64> {
+        let mut tokens = oracle_decode_tokens();
+        tokens[1] += 1_000;
+        tokens
+    }
+
+    /// A stub engine conformant on the teacher-forced base case and on the oracle tape it is
+    /// given, so the two legs of a paired run can be driven with two different tapes.
+    fn engine_on_tape(decode_tokens: Vec<i64>) -> MockEngine {
+        MockEngine::new()
+            .teacher_forced_tokens(vec![2i64; 64])
+            .free_run_capable()
+            .oracle_tokens(PREFILL_TOKEN, SEED_TOKEN, decode_tokens)
+    }
+
+    /// EACH LEG VERIFIES AGAINST ITS OWN TAPE. On a track with per-depth oracle tapes the serial
+    /// leg decodes the SERIAL tape and the candidate leg decodes the depth-N tape, and the two
+    /// disagree from step 1 on. Given the serial golden as the CONTROL golden, leg 1 passes
+    /// against the serial tape and leg 2 still verifies against the candidate golden's — so the
+    /// run reaches the band gate, which is as far as a ~0-wall-clock mock can go.
+    #[test]
+    fn the_control_leg_verifies_against_the_control_golden_and_the_candidate_against_its_own() {
+        let candidate_golden = official_golden_with_oracle(per_depth_oracle_tokens(), None);
+        let control_golden = official_golden_with_oracle(oracle_decode_tokens(), None);
+        let calibration = wide_calibration();
+        let candidate_spawns = Cell::new(0usize);
+
+        let payload = official_core_paired(
+            PairedGoldens {
+                candidate: &candidate_golden,
+                control: &control_golden,
+            },
+            &calibration,
+            paired_seal_for_test(&calibration),
+            RunDigests::for_test(&DirDigest::empty()),
+            "deadbeef",
+            PairedLegs {
+                open_baseline_leg: || Ok(()),
+                open_candidate_leg: || Ok(()),
+                // The REFERENCE tree runs serial, so its engine emits the SERIAL tape.
+                spawn_baseline: || {
+                    Session::connect(engine_on_tape(oracle_decode_tokens())).map(|(s, _)| s)
+                },
+                // The CANDIDATE runs at its declared depth, so its engine emits the depth-N tape.
+                spawn_timed: || {
+                    candidate_spawns.set(candidate_spawns.get() + 1);
+                    Session::connect(engine_on_tape(per_depth_oracle_tokens())).map(|(s, _)| s)
+                },
+            },
+            paired_window_for_test(|_phase: &str| Ok(())),
+        );
+
+        // LEG 1 PASSED: it was verified against the control golden's tape, not the candidate's.
+        assert!(
+            !payload.metrics.error.contains(SERIAL_CONTROL_LEG_FAILED),
+            "{}",
+            payload.metrics.error
+        );
+        assert_eq!(payload.metrics.baseline_band_passed, Some(true));
+        let leg_decode = payload
+            .metrics
+            .baseline_leg_decode_seconds_per_token
+            .expect("leg 1 measured");
+        assert!(leg_decode.is_finite() && leg_decode > 0.0);
+        // LEG 2 RAN, and it verified against the CANDIDATE golden's tape — a leg driven on the
+        // depth-N tape and checked against the serial one would have failed the oracle here.
+        assert_eq!(candidate_spawns.get(), 1);
+        assert!(
+            !payload
+                .metrics
+                .error
+                .contains("benchmark free-run decode token mismatch"),
+            "{}",
+            payload.metrics.error
+        );
+        assert!(payload
+            .metrics
+            .candidate_leg_decode_seconds_per_token
+            .is_some());
+        // The seal names the golden leg 1 was verified against.
+        assert_eq!(
+            payload.metrics.baseline_golden_sha256.as_deref(),
+            Some("5e21a1")
+        );
+    }
+
+    /// THE BUG THIS FLAG FIXES. The SAME two engines, with NO separate control golden: leg 1 is
+    /// verified against the candidate's per-depth tape, which its serial decode cannot produce, so
+    /// the run dies BY NAME at the first step the two tapes disagree on — step 1 — and leg 2 never
+    /// runs. This is the MLX ranked failure `--control-golden` exists for.
+    #[test]
+    fn one_shared_golden_kills_the_serial_control_leg_on_a_per_depth_oracle_track() {
+        let candidate_golden = official_golden_with_oracle(per_depth_oracle_tokens(), None);
+        let calibration = wide_calibration();
+        let candidate_spawns = Cell::new(0usize);
+
+        let payload = official_core_paired(
+            PairedGoldens {
+                candidate: &candidate_golden,
+                control: &candidate_golden,
+            },
+            &calibration,
+            paired_seal_for_test(&calibration),
+            RunDigests::for_test(&DirDigest::empty()),
+            "deadbeef",
+            PairedLegs {
+                open_baseline_leg: || Ok(()),
+                open_candidate_leg: || Ok(()),
+                spawn_baseline: || {
+                    Session::connect(engine_on_tape(oracle_decode_tokens())).map(|(s, _)| s)
+                },
+                spawn_timed: || {
+                    candidate_spawns.set(candidate_spawns.get() + 1);
+                    Session::connect(engine_on_tape(per_depth_oracle_tokens())).map(|(s, _)| s)
+                },
+            },
+            paired_window_for_test(|_phase: &str| Ok(())),
+        );
+
+        assert!(!payload.passed);
+        assert!(payload.score.is_none());
+        assert!(
+            payload.metrics.error.contains(SERIAL_CONTROL_LEG_FAILED),
+            "{}",
+            payload.metrics.error
+        );
+        assert!(
+            payload
+                .metrics
+                .error
+                .contains("benchmark free-run decode token mismatch at step 1"),
+            "{}",
+            payload.metrics.error
+        );
+        assert_eq!(candidate_spawns.get(), 0, "leg 2 never runs");
+    }
+
+    /// THE SEALED FIELDS OF A PASSING PAIRED RUN. The control leg is MEASURED through the mock
+    /// engine from the reference root; the candidate leg is then driven at exactly that leg's
+    /// seconds-per-token, which is the only deterministic way to put a mock inside the acceptance
+    /// band (its ~0 wall clock is real, so a measured-against-measured ratio is not reproducible).
+    /// What is under test is the SEAL and the SCORE of a passing paired run: speedups 1.0, score
+    /// 1.0, both legs named, and the historical `baseline_*` fields carrying the leg-1 values so
+    /// the board keeps reading.
+    #[test]
+    fn a_passing_paired_run_seals_both_legs_and_scores_the_live_ratio() {
+        let golden = official_golden(None);
+        let control = run_serial_control_leg(
+            &golden,
+            &test_window(),
+            || Session::connect(conformant_engine()).map(|(s, _)| s),
+            |_phase: &str| Ok(()),
+        )
+        .expect("the reference root's control leg must measure");
+        assert!(control.prefill_seconds_per_token > 0.0);
+        assert!(control.decode_seconds_per_token > 0.0);
+
+        // The candidate leg, exactly on the control leg: speedups 1.0, in band, floors pass.
+        let mut candidate = in_band_timing();
+        candidate.prefill_seconds_per_token = control.prefill_seconds_per_token;
+        candidate.decode_seconds_per_token = control.decode_seconds_per_token;
+        let mut payload = finish_official(
+            &golden,
+            ScoringInputs::local(
+                control.prefill_seconds_per_token,
+                control.decode_seconds_per_token,
+            ),
+            TEST_BASELINE.bands,
+            RunDigests::for_test(&DirDigest::empty()),
+            "deadbeef",
+            &candidate,
+            || Session::connect(conformant_engine()).map(|(s, _)| s),
+        );
+        let calibration = wide_calibration();
+        let mut seal = paired_seal_for_test(&calibration);
+        seal.band_passed = true;
+        seal.leg = Some((
+            control.prefill_seconds_per_token,
+            control.decode_seconds_per_token,
+        ));
+        seal_paired_baseline(&mut payload.metrics, &seal);
+
+        assert!(payload.passed, "{}", payload.metrics.error);
+        assert_eq!(payload.score, Some(1.0));
+        let m = &payload.metrics;
+        assert_eq!(m.prefill_speedup, 1.0);
+        assert_eq!(m.decode_speedup, 1.0);
+        // The historical names carry the LEG-1 values, so the board reads them unchanged.
+        assert_eq!(
+            m.baseline_prefill_seconds_per_token,
+            control.prefill_seconds_per_token
+        );
+        assert_eq!(
+            m.baseline_decode_seconds_per_token,
+            control.decode_seconds_per_token
+        );
+        assert_eq!(m.baseline_source.as_deref(), Some("serial-control-leg"));
+        assert_eq!(
+            m.baseline_box.as_deref(),
+            Some(calibration.box_name.as_str())
+        );
+        assert_eq!(m.baseline_calibration_sha256.as_deref(), Some("c0ffee"));
+        assert_eq!(
+            m.baseline_reference_commit.as_deref(),
+            Some(calibration.reference_commit.as_str())
+        );
+        assert_eq!(m.baseline_band_passed, Some(true));
+        assert_eq!(
+            m.baseline_leg_prefill_seconds_per_token,
+            Some(control.prefill_seconds_per_token)
+        );
+        assert_eq!(
+            m.baseline_leg_decode_seconds_per_token,
+            Some(control.decode_seconds_per_token)
+        );
+        assert_eq!(
+            m.candidate_leg_prefill_seconds_per_token,
+            Some(candidate.prefill_seconds_per_token)
+        );
+        assert_eq!(
+            m.candidate_leg_decode_seconds_per_token,
+            Some(candidate.decode_seconds_per_token)
+        );
+
+        // EVERY paired key reaches the sealed JSON, and none of them is null.
+        let sealed: serde_json::Value =
+            serde_json::from_str(&payload.to_sealed_json().unwrap()).unwrap();
+        for key in [
+            "baseline_source",
+            "baseline_box",
+            "baseline_calibration_sha256",
+            "baseline_reference_commit",
+            "baseline_band_passed",
+            "baseline_leg_prefill_seconds_per_token",
+            "baseline_leg_decode_seconds_per_token",
+            "candidate_leg_prefill_seconds_per_token",
+            "candidate_leg_decode_seconds_per_token",
+        ] {
+            assert!(
+                !sealed["metrics"][key].is_null(),
+                "{key} must reach the sealed score"
+            );
+        }
+        // …and a run that measured no control leg seals NONE of them: absent is not zero.
+        let single_leg = finish_with(&golden, conformant_engine);
+        let sealed: serde_json::Value =
+            serde_json::from_str(&single_leg.to_sealed_json().unwrap()).unwrap();
+        assert!(sealed["metrics"]["baseline_source"].is_null());
+        assert!(sealed["metrics"]["baseline_leg_prefill_seconds_per_token"].is_null());
+    }
+
+    /// The CONTROL LEG IS SERIAL BY CONSTRUCTION: it never puts a spec on the wire, whatever the
+    /// candidate declares. Proved through the engine's own `effective_spec` echo — a mock that
+    /// would refuse an mtp request answers this leg, and the leg reports no spec.
+    #[test]
+    fn the_control_leg_requests_no_spec() {
+        let golden = official_golden(None);
+        let control = run_serial_control_leg(
+            &golden,
+            &test_window(),
+            || Session::connect(conformant_engine().spec_modes(None)).map(|(s, _)| s),
+            |_phase: &str| Ok(()),
+        )
+        .expect("a serial control leg must run against an engine that advertises no spec modes");
+        assert!(
+            control.effective_spec.is_none(),
+            "the control leg carried a spec: {:?}",
+            control.effective_spec
+        );
+    }
+
+    /// A golden with no benchmark oracle has no prompt for a control leg, and the refusal names
+    /// the leg rather than the candidate.
+    #[test]
+    fn a_control_leg_without_an_oracle_refuses_by_name() {
+        let mut doc = serde_json::json!({
+            "version": 1,
+            "model_type": "qwen4_exp_text",
+            "cases": [
+                { "name": "case-a", "prompt_tokens": vec![1i64; CORRECTNESS_PROMPT_TOKENS], "expected_tokens": vec![2i64; 64] }
+            ]
+        });
+        doc["cases"][0]["name"] = serde_json::json!("case-a");
+        let bytes = serde_json::to_vec(&doc).unwrap();
+        let golden = load_golden_fixture(
+            &bytes,
+            64,
+            CORRECTNESS_PROMPT_TOKENS,
+            crate::testgolden::identity_125b(),
+            Some("qwen4_exp_text"),
+            None,
+            None,
+        )
+        .unwrap();
+        let err = run_serial_control_leg(
+            &golden,
+            &test_window(),
+            || Session::connect(conformant_engine()).map(|(s, _)| s),
+            |_phase: &str| Ok(()),
+        )
+        .unwrap_err();
+        assert!(err.contains(SERIAL_CONTROL_LEG_FAILED), "{err}");
+        assert!(err.contains("benchmark oracle"), "{err}");
+    }
+}

@@ -1,0 +1,22 @@
+{
+  "track_id": "qwen3.8-27b-mtp-v1",
+  "scored_batch_size": 1,
+  "prefill_gain_exponent": 0.0,
+  "decode_gain_exponent": 1.0,
+  "scores_against_live_control_leg": false,
+  "paired_flow_retired": false,
+  "official_baseline_prefill_seconds_per_token": 0.00036751938916015625,
+  "official_baseline_decode_seconds_per_token": 0.01385621216015625,
+  "prefill_band_up_tolerance": 0.03,
+  "prefill_band_down_tolerance": 0.03,
+  "decode_band_up_tolerance": 0.01,
+  "decode_band_down_tolerance": 0.025,
+  "decode_band_down_enabled": true,
+  "prefill_band_down_enabled": true,
+  "score_decode_weight": 0.75,
+  "score_prefill_weight": 0.25,
+  "vocab_size": 248320,
+  "num_hidden_layers": 64,
+  "seed_tokens": 512,
+  "golden_model_type": "qwen3_5_text"
+}
