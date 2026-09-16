@@ -38,9 +38,9 @@ platform namespace**. They are not the same string.
 
 | Thing | Value | Rule |
 |---|---|---|
-| project branch | `qwen3.8-125b-a6b-v1` | ONE branch serves both engines (MLX and CUDA). |
+| project branch | `main` | benchd is developed and published from `main`. The `qwen3.8-125b-a6b-v1` branch is `main` plus merge and republish commits. It stays until each 125B engine repository re-pins to `main`. ONE branch serves both engines (MLX and CUDA). |
 | track id | `qwen3.8-125b-a6b-mlx-v1`, `qwen3.8-125b-a6b-cuda-v1` | The platform token before `-v{N}` keys every platform fact (`bench_core::constants::Platform`). The R2 prefix is the track id. |
-| dist channel `branch` field | `qwen3.8-125b-a6b-v1` | The channel manifest names the PROJECT branch, never a track id. One channel carries one binary for each platform; the platform is keyed by directory, not by branch. |
+| dist channel `branch` field | `main` on `main`; `qwen3.8-125b-a6b-v1` on that branch | The channel manifest names the branch it was published from, never a track id. One channel carries one binary for each platform; the platform is keyed by directory, not by branch. |
 
 A run resolves its platform from the track id it declares (`--contract` `track_id` or
 `MLXFAST_QWEN_MTP_TRACK_ID`). Nothing in the code reads a branch name.

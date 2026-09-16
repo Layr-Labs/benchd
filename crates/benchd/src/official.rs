@@ -1179,15 +1179,29 @@ fn seal_window_means(metrics: &mut ScoreMetrics, records: &[PairedLegRecord]) {
         }
         Some(values.iter().map(|v| v.unwrap()).sum::<f64>() / values.len() as f64)
     }
-    metrics.baseline_leg_decode_window_seconds_per_token =
-        mean(records.iter().map(|r| r.control_decode_window_seconds_per_token).collect());
-    metrics.candidate_leg_decode_window_seconds_per_token =
-        mean(records.iter().map(|r| r.candidate_decode_window_seconds_per_token).collect());
+    metrics.baseline_leg_decode_window_seconds_per_token = mean(
+        records
+            .iter()
+            .map(|r| r.control_decode_window_seconds_per_token)
+            .collect(),
+    );
+    metrics.candidate_leg_decode_window_seconds_per_token = mean(
+        records
+            .iter()
+            .map(|r| r.candidate_decode_window_seconds_per_token)
+            .collect(),
+    );
     metrics.baseline_leg_seed_prefill_window_seconds_per_token = mean(
-        records.iter().map(|r| r.control_seed_prefill_window_seconds_per_token).collect(),
+        records
+            .iter()
+            .map(|r| r.control_seed_prefill_window_seconds_per_token)
+            .collect(),
     );
     metrics.candidate_leg_seed_prefill_window_seconds_per_token = mean(
-        records.iter().map(|r| r.candidate_seed_prefill_window_seconds_per_token).collect(),
+        records
+            .iter()
+            .map(|r| r.candidate_seed_prefill_window_seconds_per_token)
+            .collect(),
     );
 }
 
