@@ -1,0 +1,12 @@
+{
+  "version": "0.0.0",
+  "branch": "main",
+  "source_commit": "17254d4ec83ff2a9a2c833ec1351c8687ed05467",
+  "target_triple": "x86_64-unknown-linux-gnu",
+  "sha256": "a37db86ba998990b11cf6554677a5260cbfb47d11ab4a22ee4e14f48e11e99f8",
+  "bytes": 4021960,
+  "binaries": {
+    "benchd": {"sha256": "a37db86ba998990b11cf6554677a5260cbfb47d11ab4a22ee4e14f48e11e99f8", "bytes": 4021960},
+    "record-correctness-golden": {"sha256": "8afe9e7c32bbf89d9bd546ef4804bda65834e0b480086ea6384940d75cd68def", "bytes": 1667128}
+  }
+}
