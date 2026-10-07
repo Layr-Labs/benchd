@@ -779,7 +779,7 @@ fn validate_tokens(tokens: &[Token], field: &str, vocab_size: usize) -> Result<(
     for (index, token) in tokens.iter().enumerate() {
         if *token < 0 || *token >= vocab_size as i64 {
             return Err(invalid(format!(
-                "{field}[{index}]={token} is outside configured vocab range 0..<{vocab_size}"
+                "{field}[{index}] is outside configured vocab range 0..<{vocab_size}"
             )));
         }
     }
@@ -2111,10 +2111,13 @@ mod tests {
     #[test]
     fn out_of_range_token_rejected() {
         let mut v = minimal_doc(3, 4);
-        v["cases"][0]["expected_tokens"][0] = json!(VOCAB_SIZE as i64);
+        v["cases"][0]["expected_tokens"][0] = json!(VOCAB_SIZE as i64 + 12_345);
         let err = load(&v).unwrap_err();
+        // The message locates the token by field and index and never prints its value.
+        let over = (VOCAB_SIZE as i64 + 12_345).to_string();
         assert!(
-            matches!(err, BenchError::InvalidInput(m) if m.contains("outside configured vocab range"))
+            matches!(err, BenchError::InvalidInput(ref m) if m.contains("outside configured vocab range") && !m.contains(&over)),
+            "{err}"
         );
     }
 

@@ -19,6 +19,12 @@ serde_json = "1"
 # The digest is unchanged; only the time to compute it is.
 sha2 = { version = "0.10", features = ["asm"] }
 
+# Tests read sealed artifacts back and compare floats bit for bit, so their parse must be exact.
+# The default serde_json parse can land one ulp off a float that `to_sealed_json` wrote exactly.
+# A dev-dependency feature: the release binaries do not get it.
+[dev-dependencies]
+serde_json = { version = "1", features = ["float_roundtrip"] }
+
 # Weights-seal reads use F_NOCACHE (macOS) / posix_fadvise (Linux) so hashing the ~105 GB
 # tree does not pollute the OS file cache right before the model load. Unix-only, no
 # platform matters on Windows.

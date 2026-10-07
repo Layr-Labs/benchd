@@ -382,6 +382,27 @@ pub fn corrupt_beyond_budget(tokens: &mut [i64], first: usize, token: i64) {
     );
 }
 
+/// Assert that no value of `tokens` appears as a whole number anywhere in `text` — a sealed
+/// artifact, a refusal message or a stderr line. A failing correctness or timed leg must seal no
+/// token id (David 2026-09-27: "benchd is the reporter, it should be making sure its output is
+/// clean"), so the tests that inject distinctive ids scan the WHOLE serialized output with this,
+/// not a list of keys.
+pub fn assert_carries_no_token(text: &str, tokens: &[i64]) {
+    let numbers: std::collections::BTreeSet<i64> = text
+        .split(|c: char| !c.is_ascii_digit())
+        .filter_map(|run| run.parse().ok())
+        .collect();
+    let leaked: Vec<i64> = tokens
+        .iter()
+        .copied()
+        .filter(|t| numbers.contains(t))
+        .collect();
+    assert!(
+        leaked.is_empty(),
+        "token id(s) {leaked:?} appear in: {text}"
+    );
+}
+
 /// Run one git command in `repo` and return its trimmed stdout, asserting success.
 ///
 /// The ONE git driver for the on-disk repo fixtures in this crate's tests. `byte_budget`

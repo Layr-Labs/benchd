@@ -151,16 +151,11 @@ impl fmt::Display for CohortReplayIntegrityError {
                  oracle echoed {echoed} — the oracle replayed a different journal (hard integrity \
                  error)"
             ),
-            CohortReplayIntegrityError::TokenMismatch {
-                slot,
-                position,
-                committed,
-                echoed,
-            } => write!(
+            CohortReplayIntegrityError::TokenMismatch { slot, position, .. } => write!(
                 f,
-                "cohort replay integrity (N2): stream {slot} position {position} committed token \
-                 {committed} but the oracle echoed {echoed} — the oracle replayed a different token \
-                 (hard integrity error, not a tolerance decision)"
+                "cohort replay integrity (N2): stream {slot} position {position}: the oracle echoed \
+                 a token other than the one the candidate committed — the oracle replayed a \
+                 different token (hard integrity error, not a tolerance decision)"
             ),
         }
     }
@@ -408,6 +403,13 @@ mod tests {
         echoed[1][3] = 999; // the oracle replayed a different journal here.
         let err = verify_replay_echo_matches_committed(&committed, &echoed)
             .expect_err("an echo divergence must be a hard integrity error");
+        // The message names the slot and the position, never the candidate's or the oracle's
+        // token.
+        let text = err.to_string();
+        assert!(
+            text.contains("stream 1 position 3") && !text.contains("13") && !text.contains("999"),
+            "{text}"
+        );
         match err {
             CohortReplayIntegrityError::TokenMismatch {
                 slot,

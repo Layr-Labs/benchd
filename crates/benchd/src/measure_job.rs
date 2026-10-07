@@ -7441,6 +7441,21 @@ mod seal_boundary_tests {
         // And the diagnosis is still there.
         assert!(sealed.contains("sample-001.json"), "{sealed}");
     }
+
+    /// A pair rejected for a timed token mismatch seals the phase and the step into
+    /// `rejected_pairs[].reason`, and neither the golden's token nor the engine's.
+    #[test]
+    fn sealed_reject_reason_names_no_token() {
+        let e = RunnerError::TokenMismatch {
+            label: "benchmark decode token".to_string(),
+            step: 7,
+            expected: 123_457,
+            actual: 234_568,
+        };
+        let sealed = sealed_reject_reason("candidate", &e);
+        assert!(sealed.contains("mismatch at step 7"), "{sealed}");
+        crate::testgolden::assert_carries_no_token(&sealed, &[123_457, 234_568]);
+    }
 }
 
 #[cfg(test)]

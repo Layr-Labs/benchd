@@ -146,7 +146,7 @@ fn validate_tokens(tokens: &[Token], field: &str, vocab_size: usize) -> Result<(
     for (index, token) in tokens.iter().enumerate() {
         if *token < 0 || *token >= vocab_size as i64 {
             return Err(invalid(format!(
-                "timed-prompt tape {field}[{index}]={token} is outside configured vocab range \
+                "timed-prompt tape {field}[{index}] is outside configured vocab range \
                  0..<{vocab_size}"
             )));
         }
@@ -467,11 +467,14 @@ mod tests {
     #[test]
     fn out_of_vocab_token_is_refused() {
         let mut doc = synth_tape(4, 4);
-        doc["rows"][1]["sequential_argmax"] = json!(identity().vocab_size as i64);
-        doc["emitted_tokens"][1] = json!(identity().vocab_size as i64);
+        let over = identity().vocab_size as i64 + 12_345;
+        doc["rows"][1]["sequential_argmax"] = json!(over);
+        doc["emitted_tokens"][1] = json!(over);
         let err = load_timed_prompt_tape(&bytes_of(&doc), &identity(), None).unwrap_err();
+        // The message locates the token by field and index and never prints its value.
         assert!(
-            format!("{err}").contains("outside configured vocab range"),
+            format!("{err}").contains("outside configured vocab range")
+                && !format!("{err}").contains(&over.to_string()),
             "{err}"
         );
     }

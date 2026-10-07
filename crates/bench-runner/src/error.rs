@@ -152,14 +152,11 @@ impl fmt::Display for RunnerError {
                 f,
                 "runtime worker failed to clear the MLX allocator cache at phase start (cache_memory={reported} bytes, expected 0)"
             ),
-            RunnerError::TokenMismatch {
-                label,
-                step,
-                expected: _,
-                actual,
-            } => write!(
+            // No token value is named: the golden's token is hidden material, and the engine's
+            // token at that step would tell a reader where the golden goes next.
+            RunnerError::TokenMismatch { label, step, .. } => write!(
                 f,
-                "{label} mismatch at step {step}: the engine returned token {actual}, which is not the token the golden expects at this step"
+                "{label} mismatch at step {step}: the engine returned a token that is not the token the golden expects at this step"
             ),
             RunnerError::SessionDiscarded => {
                 write!(f, "session discarded by a prior error; no further requests permitted")
@@ -261,3 +258,30 @@ impl From<serde_json::Error> for RunnerError {
 
 /// Convenience alias used throughout the runner.
 pub type Result<T> = std::result::Result<T, RunnerError>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A timed token mismatch names the phase and the step, never the golden's token or the
+    /// engine's: this Display is what reaches `metrics.error`, `rejected_pairs[].reason` and
+    /// stderr on every timed path.
+    #[test]
+    fn a_token_mismatch_names_no_token() {
+        let text = RunnerError::TokenMismatch {
+            label: "benchmark free-run decode token".to_string(),
+            step: 3,
+            expected: 123_457,
+            actual: 234_568,
+        }
+        .to_string();
+        assert!(
+            text.starts_with("benchmark free-run decode token mismatch at step 3"),
+            "{text}"
+        );
+        assert!(
+            !text.contains("123457") && !text.contains("234568"),
+            "{text}"
+        );
+    }
+}

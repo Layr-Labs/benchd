@@ -7244,4 +7244,191 @@ mod tests {
             );
         }
     }
+
+    /// LANE L — THE OFFICIAL PATHS SEAL NO TOKEN VALUE (David 2026-09-27: "benchd is the
+    /// reporter, it should be making sure its output is clean"). Every golden token here is a
+    /// distinctive six-digit id (tape 120_000.., base case 130_000..) and every wrong engine token
+    /// is distinctive too, so a scan of the WHOLE sealed artifact finds any of them wherever it
+    /// went: a key, `paired_legs`, or the text of `metrics.error`.
+    mod sealed_output_carries_no_token {
+        use super::*;
+        use crate::testgolden::assert_carries_no_token;
+
+        fn tape() -> Vec<i64> {
+            (0..BENCHMARK_DECODE_STEPS as i64)
+                .map(|i| 120_000 + i)
+                .collect()
+        }
+
+        /// Every golden token and every token `candidate_with_changes` can emit off this tape.
+        fn every_token() -> Vec<i64> {
+            tape()
+                .into_iter()
+                .flat_map(|t| [t, t + 1, t + 1_000])
+                .chain([234_568])
+                .collect()
+        }
+
+        fn assert_sealed_clean(payload: &ScorePayload, tokens: &[i64]) {
+            assert!(!payload.passed);
+            let sealed = payload.to_sealed_json().unwrap();
+            assert_carries_no_token(&sealed, tokens);
+            let m = &serde_json::from_str::<serde_json::Value>(&sealed).unwrap()["metrics"];
+            for key in [
+                "first_failing_case",
+                "first_failing_layer",
+                "first_failing_step",
+                "expected_token",
+                "actual_token",
+            ] {
+                assert_eq!(m[key], serde_json::Value::Null, "{key}");
+            }
+        }
+
+        /// Single-leg official: the timed decode returns 234_568 at step 3.
+        #[test]
+        fn a_timed_mismatch_on_the_single_leg_path() {
+            let golden = official_golden_with_oracle(tape(), None);
+            let mut emitted = tape();
+            emitted[3] = 234_568;
+            let payload = run_official(&golden, move || engine_on_tape(emitted.clone()));
+            assert!(
+                payload.metrics.error.contains("mismatch at step 3"),
+                "{}",
+                payload.metrics.error
+            );
+            assert_sealed_clean(&payload, &every_token());
+        }
+
+        /// Paired, exact rule: the candidate leg returns a different token at step 5.
+        #[test]
+        fn a_candidate_leg_mismatch_on_the_paired_path() {
+            let golden = official_golden_with_oracle(tape(), None);
+            let spawns = Cell::new(0usize);
+            let payload = run_with_tolerance(
+                &golden,
+                None,
+                None,
+                1,
+                || candidate_with_changes(&tape(), &[5], false),
+                &spawns,
+            );
+            assert!(
+                payload.metrics.error.contains("mismatch at step 5"),
+                "{}",
+                payload.metrics.error
+            );
+            assert_sealed_clean(&payload, &every_token());
+        }
+
+        /// Paired: the CONTROL leg returns a different token at step 3.
+        #[test]
+        fn a_control_leg_mismatch_on_the_paired_path() {
+            let golden = official_golden_with_oracle(tape(), None);
+            let calibration = crate::baseline::BaselineCalibration {
+                prompts: vec![wide_prompt_calibration("p1")],
+                ..wide_calibration()
+            };
+            let payload = official_core_paired(
+                &[PairedGoldens {
+                    candidate: &golden,
+                    control: &golden,
+                    prompt: "p1",
+                }],
+                &calibration,
+                paired_seal_for_test(&calibration),
+                RunDigests::for_test(&DirDigest::empty()),
+                "deadbeef",
+                PairedLegs {
+                    open_baseline_leg: |_| Ok(()),
+                    open_candidate_leg: |_| Ok(()),
+                    spawn_baseline: || {
+                        Session::connect(candidate_with_changes(&tape(), &[3], false))
+                            .map(|(s, _)| s)
+                    },
+                    spawn_timed: || Session::connect(engine_on_tape(tape())).map(|(s, _)| s),
+                },
+                paired_window_for_test(|_phase: &str| Ok(())),
+            );
+            assert!(
+                payload.metrics.error.contains(SERIAL_CONTROL_LEG_FAILED),
+                "{}",
+                payload.metrics.error
+            );
+            assert_sealed_clean(&payload, &every_token());
+        }
+
+        /// Paired with a tolerance: 13 of 129 tokens differ, the replay counts them, and the
+        /// refusal over the limit names counts only.
+        #[test]
+        fn an_over_tolerance_refusal_after_the_replay() {
+            let golden = official_golden_with_oracle(tape(), None);
+            let spawns = Cell::new(0usize);
+            let changed: Vec<usize> = (10..23).collect();
+            let payload = run_with_tolerance(
+                &golden,
+                Some(100),
+                None,
+                1,
+                || candidate_with_changes(&tape(), &changed, false),
+                &spawns,
+            );
+            assert!(
+                payload
+                    .metrics
+                    .error
+                    .contains(TIMED_DIVERGENCE_OVER_TOLERANCE),
+                "{}",
+                payload.metrics.error
+            );
+            assert_eq!(payload.metrics.token_mismatch_count, Some(13));
+            assert_sealed_clean(&payload, &every_token());
+        }
+
+        /// Paired with a near-tie limit: a different token that is not the reference engine's
+        /// second choice is refused, and the second-choice fields seal counts and gaps only.
+        #[test]
+        fn a_not_a_near_tie_refusal_after_the_replay() {
+            let golden = official_golden_with_oracle(tape(), None);
+            let spawns = Cell::new(0usize);
+            let payload = run_with_tolerance(
+                &golden,
+                Some(100),
+                Some(0.5),
+                1,
+                || candidate_with_changes(&tape(), &[7], false),
+                &spawns,
+            );
+            assert!(
+                payload
+                    .metrics
+                    .error
+                    .contains(TIMED_DIVERGENCE_NOT_A_NEAR_TIE),
+                "{}",
+                payload.metrics.error
+            );
+            assert_sealed_clean(&payload, &every_token());
+        }
+
+        /// The official correctness gate: the base case expects 130_000.. and the engine returns
+        /// 140_000.. at every step.
+        #[test]
+        fn a_correctness_gate_failure() {
+            let mut golden = official_golden_with_oracle(tape(), None);
+            let expected: Vec<i64> = (0..64).map(|i| 130_000 + i).collect();
+            let engine: Vec<i64> = (0..64).map(|i| 140_000 + i).collect();
+            golden.cases[0].expected_tokens = expected.clone();
+            let payload = finish_with(&golden, move || {
+                MockEngine::new()
+                    .teacher_forced_tokens(engine.clone())
+                    .free_run_capable()
+                    .oracle_tokens(PREFILL_TOKEN, SEED_TOKEN, tape())
+            });
+            assert!(!payload.metrics.passed_correctness);
+            let mut tokens = every_token();
+            tokens.extend(expected);
+            tokens.extend((0..64).map(|i| 140_000 + i));
+            assert_sealed_clean(&payload, &tokens);
+        }
+    }
 }

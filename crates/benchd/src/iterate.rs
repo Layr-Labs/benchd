@@ -5443,4 +5443,89 @@ mod tests {
         );
         let _ = fs::remove_dir_all(&root);
     }
+
+    /// A FAILING LOCAL CORRECTNESS LEG SEALS NO TOKEN VALUE (David 2026-09-27). The golden
+    /// expects 123_457 from index 3 on and the engine returns 234_568 there; both modes carry the
+    /// pair in memory (the positive control) and the sealed artifact names neither, nor the case
+    /// or the step that locates them.
+    #[test]
+    fn a_failing_local_correctness_leg_seals_no_token_value() {
+        for mode in [Mode::LocalIterate, Mode::LocalSubmit] {
+            let mut expected = vec![2i64; 1025];
+            corrupt_beyond_budget(&mut expected, 3, 123_457);
+            let mut engine = vec![2i64; 1025];
+            corrupt_beyond_budget(&mut engine, 3, 234_568);
+            let golden = submit_golden(expected);
+            let (mut session, _) = Session::connect(window_engine(&golden, engine)).unwrap();
+            let (bp, bs, bd) = bench_oracle(&golden);
+            let payload = iterate_flow_windowed(
+                Some(&mut session),
+                test_flow(
+                    &golden,
+                    mode,
+                    false,
+                    RunDigests::for_test(&DirDigest::empty()),
+                    &test_window(),
+                ),
+                move || {
+                    Session::connect(MockEngine::new().free_run_capable().oracle_tokens(
+                        bp,
+                        bs,
+                        bd.clone(),
+                    ))
+                    .map(|(s, _)| s)
+                },
+                no_cool_gate,
+            );
+            assert!(!payload.passed);
+            assert_eq!(payload.metrics.expected_token, Some(123_457), "{mode:?}");
+            assert_eq!(payload.metrics.actual_token, Some(234_568), "{mode:?}");
+            let sealed = payload.to_sealed_json().unwrap();
+            crate::testgolden::assert_carries_no_token(&sealed, &[123_457, 234_568]);
+            let m = &serde_json::from_str::<serde_json::Value>(&sealed).unwrap()["metrics"];
+            assert_eq!(m["first_failing_case"], serde_json::Value::Null, "{mode:?}");
+            assert_eq!(m["first_failing_step"], serde_json::Value::Null, "{mode:?}");
+        }
+    }
+
+    /// A FAILING LOCAL TIMED LEG SEALS NO TOKEN VALUE. Correctness passes; the timed decode
+    /// returns 234_568 at step 5 where the golden's oracle says 120_000. The refusal is the
+    /// runner's token-mismatch error, and neither token reaches `metrics.error` or any other key.
+    #[test]
+    fn a_failing_local_timed_leg_seals_no_token_value() {
+        let golden = TestGolden::new()
+            .required_steps(li_expected())
+            .expected_tokens(vec![2i64; 1025])
+            .benchmark(benchmark_oracle_windowed(1, 120_000, 1024))
+            .fixture();
+        let (bp, bs, mut bd) = bench_oracle(&golden);
+        bd[5] = 234_568;
+        let timed = move || {
+            MockEngine::new()
+                .teacher_forced_tokens(vec![2i64; 1025])
+                .free_run_capable()
+                .oracle_tokens(bp, bs, bd.clone())
+        };
+        let (mut session, _) = Session::connect(timed()).unwrap();
+        let payload = iterate_flow_windowed(
+            Some(&mut session),
+            test_flow(
+                &golden,
+                Mode::LocalIterate,
+                false,
+                RunDigests::for_test(&DirDigest::empty()),
+                &test_window(),
+            ),
+            move || Session::connect(timed()).map(|(s, _)| s),
+            no_cool_gate,
+        );
+        assert!(!payload.passed);
+        assert!(
+            payload.metrics.error.contains("mismatch at step 5"),
+            "{}",
+            payload.metrics.error
+        );
+        let sealed = payload.to_sealed_json().unwrap();
+        crate::testgolden::assert_carries_no_token(&sealed, &[120_000, 234_568]);
+    }
 }

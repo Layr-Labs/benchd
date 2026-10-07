@@ -577,12 +577,15 @@ impl ScoreMetrics {
             expert_read_seconds: r(self.expert_read_seconds),
             expert_peak_cached_tensors: self.expert_peak_cached_tensors,
             expert_hit_rate: r(self.expert_hit_rate),
-            first_failing_layer: self.first_failing_layer,
-            first_failing_case: self.first_failing_case.clone(),
-            first_failing_step: self.first_failing_step,
-            // The golden's token is never published. The case and the step locate the failure.
+            // Token-level failure detail is never published (David 2026-09-27): not the golden's
+            // token, not the engine's token, and not the case, layer or step that locates them.
+            // `passed_correctness`, `error`, the counts and `acceptance_lengths` say that the run
+            // failed; the token mismatch counts and steps of the timed replay stay below.
+            first_failing_layer: None,
+            first_failing_case: None,
+            first_failing_step: None,
             expected_token: None,
-            actual_token: self.actual_token,
+            actual_token: None,
             max_abs_diff: r(self.max_abs_diff),
             golden_hash: self.golden_hash.clone(),
             contract_sha256: self.contract_sha256.clone(),
@@ -750,6 +753,60 @@ mod tests {
         assert_eq!(top_keys, vec!["metrics", "passed", "score"]);
         // null nullable fields present, not omitted
         assert!(json.contains("\"first_failing_layer\": null"));
+    }
+
+    /// THE SEAL POINT carries no token-level failure detail (David 2026-09-27). A metrics block
+    /// that holds the golden's token, the engine's token and the case, layer and step of a
+    /// failure seals all five as null, and no injected value appears anywhere in the artifact.
+    /// The counts, the timed-replay step and `acceptance_lengths` stay public.
+    #[test]
+    fn the_seal_publishes_no_token_level_failure_detail() {
+        let metrics = ScoreMetrics {
+            error: "teacher-forced token mismatch".to_string(),
+            first_failing_layer: Some(912_345_671),
+            first_failing_case: Some("case-912345672".to_string()),
+            first_failing_step: Some(912_345_673),
+            expected_token: Some(912_345_674),
+            actual_token: Some(912_345_675),
+            case_count: 3,
+            checked_steps: 65,
+            token_mismatch_count: Some(13),
+            token_mismatch_first_step: Some(11),
+            acceptance_lengths: vec![1, 2, 3],
+            ..zero_metrics()
+        };
+        let json = ScorePayload {
+            score: None,
+            passed: false,
+            metrics,
+        }
+        .to_sealed_json()
+        .unwrap();
+        crate::testgolden::assert_carries_no_token(
+            &json,
+            &[
+                912_345_671,
+                912_345_672,
+                912_345_673,
+                912_345_674,
+                912_345_675,
+            ],
+        );
+        let m = &serde_json::from_str::<serde_json::Value>(&json).unwrap()["metrics"];
+        for key in [
+            "first_failing_layer",
+            "first_failing_case",
+            "first_failing_step",
+            "expected_token",
+            "actual_token",
+        ] {
+            assert_eq!(m[key], serde_json::Value::Null, "{key}");
+        }
+        assert_eq!(m["case_count"], 3);
+        assert_eq!(m["checked_steps"], 65);
+        assert_eq!(m["token_mismatch_count"], 13);
+        assert_eq!(m["token_mismatch_first_step"], 11);
+        assert_eq!(m["acceptance_lengths"], serde_json::json!([1, 2, 3]));
     }
 
     #[test]
@@ -1503,7 +1560,7 @@ mod sealed_key_pin_tests {
       2,
       3
     ],
-    "actual_token": 49,
+    "actual_token": null,
     "bandwidth_gb_per_token": 2.5,
     "bandwidth_source": "v54",
     "baseline_band_passed": true,
@@ -1551,9 +1608,9 @@ mod sealed_key_pin_tests {
     "expert_hit_rate": 40.0,
     "expert_peak_cached_tensors": 38,
     "expert_read_seconds": 38.0,
-    "first_failing_case": "v43",
-    "first_failing_layer": 41,
-    "first_failing_step": 45,
+    "first_failing_case": null,
+    "first_failing_layer": null,
+    "first_failing_step": null,
     "gates": [
       {
         "cool": {
