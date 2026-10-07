@@ -126,7 +126,7 @@ per axis and no flag can relax it.
 
 ```json
 {
-  "version": 2,
+  "version": 3,
   "track_id": "qwen3.8-125b-a6b-mlx-v1",
   "box": "m5-max-128gb-4-qwen38-125b-a6b-mlx",
   "reference_commit": "<40 hex>",
@@ -155,8 +155,11 @@ the order given. `box` must equal the runner name the ranked job runs under, and
 each golden the ranked run measures must have an entry whose `prompt` equals its
 name (the file name minus `.golden.json`). A band describes the leg it was
 measured from, so a file captured on another box, or with no entry for a prompt,
-is refused. benchd still reads a version 1 file (the fields of one entry at the
-top level, with `prompt`) as a file with one entry. benchd reads the band from
+is refused. `decode_seconds_per_token_mean` is the mean decode window per token:
+decode-run time / N, with no seed prefill in it. Versions 1 and 2 recorded the
+whole window (seed prefill plus decode) as decode, so benchd refuses them by name
+(`BASELINE-CALIBRATION-WHOLE-WINDOW-DECODE`). Recalibrate the box to write version 3.
+benchd reads the band from
 the file; the values above are the defaults the calibrator writes. The CV fields
 are fractions: `0.004` is 0.4 %.
 
@@ -351,11 +354,16 @@ A ranked paired run seals these fields in `score.json` `metrics`:
 - `baseline_band_passed`.
 - `baseline_leg_prefill_seconds_per_token`,
   `baseline_leg_decode_seconds_per_token` — the scored pair's serial-control
-  leg, per token.
+  leg, per token. Decode is the decode window over N; the seed prefill is not in
+  it. `baseline_leg_decode_window_seconds_per_token` and
+  `candidate_leg_decode_window_seconds_per_token` carry the same decode values,
+  and `*_leg_seed_prefill_window_seconds_per_token` the seed prefill per seed
+  token, report-only.
 - `candidate_leg_prefill_seconds_per_token`,
   `candidate_leg_decode_seconds_per_token` — the scored pair's candidate leg,
   per token. The scored pair is the one whose composite is the lower median
-  over the pairs. Pairs are never averaged.
+  over the pairs. Under `official_pair_combine: "mean"` these four fields are
+  the means of the per-pair figures instead.
 - `paired_legs` — one row per pair, in order: `pair`,
   `control_prefill_seconds_per_token`, `control_decode_seconds_per_token`,
   `candidate_prefill_seconds_per_token`, `candidate_decode_seconds_per_token`,

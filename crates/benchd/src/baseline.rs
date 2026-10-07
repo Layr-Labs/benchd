@@ -40,10 +40,14 @@ pub const BASELINE_CALIBRATION_ENV: &str = "MLXFAST_BASELINE_CALIBRATION";
 /// file's `box` field whenever it is set; absent, the operator states the box with `--box`.
 pub const RUNNER_NAME_ENV: &str = "RUNNER_NAME";
 
-/// The schema version this benchd writes. It reads this version and [`CALIBRATION_VERSION_SINGLE_PROMPT`].
-pub const CALIBRATION_VERSION: u32 = 2;
-/// The earlier single-prompt form. This benchd still reads it, as a file with one prompt entry.
-pub const CALIBRATION_VERSION_SINGLE_PROMPT: u32 = 1;
+/// The schema version this benchd writes, and the only one it reads. Version 3 (David 2026-10-07):
+/// `decode_seconds_per_token_mean` is the mean DECODE WINDOW per token
+/// (`bench_core::score::decode_window_seconds_per_token`), with no seed prefill in it.
+pub const CALIBRATION_VERSION: u32 = 3;
+/// The newest version whose decode mean is the WHOLE window (seed prefill plus decode, over N).
+/// Versions 1 and 2 are refused by name ([`BASELINE_CALIBRATION_WHOLE_WINDOW_DECODE`]): their band
+/// does not describe the decode window a control leg now measures.
+pub const CALIBRATION_VERSION_LAST_WHOLE_WINDOW: u32 = 2;
 
 /// The value sealed as `metrics.baseline_source` on a paired run: the denominator was MEASURED by
 /// the serial-control leg of this same job, not read from anywhere.
@@ -65,6 +69,10 @@ pub const BASELINE_CALIBRATION_PROMPT_MISMATCH: &str = "BASELINE-CALIBRATION-PRO
 pub const BASELINE_CALIBRATION_MISSING: &str = "BASELINE-CALIBRATION-MISSING";
 /// The calibration file was read but is not a valid calibration.
 pub const BASELINE_CALIBRATION_INVALID: &str = "BASELINE-CALIBRATION-INVALID";
+/// EXACT-MATCH name of the refusal "this calibration file records decode as the whole window (seed
+/// prefill plus decode); recalibrate the box".
+pub const BASELINE_CALIBRATION_WHOLE_WINDOW_DECODE: &str =
+    "BASELINE-CALIBRATION-WHOLE-WINDOW-DECODE";
 /// The calibration file names another track.
 pub const BASELINE_CALIBRATION_TRACK_MISMATCH: &str = "BASELINE-CALIBRATION-TRACK-MISMATCH";
 /// The calibration file names another box.
@@ -163,61 +171,7 @@ pub struct PromptCalibration {
     pub decode_band_high: f64,
 }
 
-/// The single-prompt file form ([`CALIBRATION_VERSION_SINGLE_PROMPT`]). This benchd reads it as a
-/// file with one prompt entry, so a box that holds this form keeps working.
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct SinglePromptCalibration {
-    #[serde(rename = "version")]
-    _version: u32,
-    track_id: String,
-    #[serde(rename = "box")]
-    box_name: String,
-    reference_commit: String,
-    prompt: String,
-    passes: u32,
-    prefill_seconds_per_token_mean: f64,
-    decode_seconds_per_token_mean: f64,
-    prefill_cv: f64,
-    decode_cv: f64,
-    prefill_band_low: f64,
-    prefill_band_high: f64,
-    decode_band_low: f64,
-    decode_band_high: f64,
-    captured_at: String,
-    benchd_source_commit: String,
-    #[serde(default)]
-    gates: Vec<crate::quiescegate::GateRecord>,
-}
-
-impl From<SinglePromptCalibration> for BaselineCalibration {
-    fn from(f: SinglePromptCalibration) -> Self {
-        BaselineCalibration {
-            // The in-memory value is the current form, so it serializes as one.
-            version: CALIBRATION_VERSION,
-            track_id: f.track_id,
-            box_name: f.box_name,
-            reference_commit: f.reference_commit,
-            captured_at: f.captured_at,
-            benchd_source_commit: f.benchd_source_commit,
-            prompts: vec![PromptCalibration {
-                prompt: f.prompt,
-                passes: f.passes,
-                prefill_seconds_per_token_mean: f.prefill_seconds_per_token_mean,
-                decode_seconds_per_token_mean: f.decode_seconds_per_token_mean,
-                prefill_cv: f.prefill_cv,
-                decode_cv: f.decode_cv,
-                prefill_band_low: f.prefill_band_low,
-                prefill_band_high: f.prefill_band_high,
-                decode_band_low: f.decode_band_low,
-                decode_band_high: f.decode_band_high,
-            }],
-            gates: f.gates,
-        }
-    }
-}
-
-/// Only the `version` key, read first to choose the file form.
+/// Only the `version` key, read first so an old file is refused by name before its fields are read.
 #[derive(Deserialize)]
 struct CalibrationVersion {
     version: u32,
@@ -240,22 +194,28 @@ fn is_commit_sha40(s: &str) -> bool {
 }
 
 impl BaselineCalibration {
-    /// Parse and VALIDATE one calibration file's bytes, in either file form. Every refusal names
+    /// Parse and VALIDATE one calibration file's bytes. A version 1 or 2 file refuses as
+    /// [`BASELINE_CALIBRATION_WHOLE_WINDOW_DECODE`]; every other refusal names
     /// [`BASELINE_CALIBRATION_INVALID`] and the field that failed.
     pub fn parse(bytes: &[u8]) -> Result<BaselineCalibration, String> {
         let invalid = |e: serde_json::Error| format!("{BASELINE_CALIBRATION_INVALID}: {e}");
         let CalibrationVersion { version } = serde_json::from_slice(bytes).map_err(invalid)?;
         let calibration: BaselineCalibration = match version {
             CALIBRATION_VERSION => serde_json::from_slice(bytes).map_err(invalid)?,
-            CALIBRATION_VERSION_SINGLE_PROMPT => {
-                serde_json::from_slice::<SinglePromptCalibration>(bytes)
-                    .map_err(invalid)?
-                    .into()
+            old if old <= CALIBRATION_VERSION_LAST_WHOLE_WINDOW => {
+                return Err(format!(
+                    "{BASELINE_CALIBRATION_WHOLE_WINDOW_DECODE}: this calibration file is version \
+                     {old}, which recorded decode as the whole window (seed prefill plus decode, \
+                     over N). Decode is now the decode window only (decode-run time / N), so its \
+                     band does not describe the control leg this benchd measures. Recalibrate this \
+                     box with this benchd's calibrate-baseline, which writes version \
+                     {CALIBRATION_VERSION}"
+                ))
             }
             other => {
                 return Err(format!(
                     "{BASELINE_CALIBRATION_INVALID}: version is {other}, and this benchd reads \
-                     versions {CALIBRATION_VERSION_SINGLE_PROMPT} and {CALIBRATION_VERSION}"
+                     version {CALIBRATION_VERSION} only"
                 ))
             }
         };
@@ -860,6 +820,15 @@ pub struct PromptPasses<'a> {
     pub decode_legs: &'a [f64],
 }
 
+/// The `(prefill, decode)` seconds per token of each measured control leg, in pass order: the
+/// values a calibration entry averages. The decode value is the leg's decode window per token
+/// (`bench_core::score::decode_window_seconds_per_token`); the seed prefill is not in it.
+pub fn control_leg_seconds(legs: &[bench_runner::TimingResult]) -> (Vec<f64>, Vec<f64>) {
+    legs.iter()
+        .map(|leg| (leg.prefill_seconds_per_token, leg.decode_seconds_per_token))
+        .unzip()
+}
+
 /// Author the calibration file from the control legs `benchd calibrate-baseline` measured, one
 /// entry per prompt, in the order given.
 ///
@@ -970,33 +939,52 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    /// The header keys of a calibration file. Every other key lives in a `prompts` entry.
+    const HEADER_FIELDS: [&str; 6] = [
+        "version",
+        "track_id",
+        "box",
+        "reference_commit",
+        "captured_at",
+        "benchd_source_commit",
+    ];
+
     fn valid_document() -> serde_json::Value {
         json!({
-            "version": 1,
+            "version": CALIBRATION_VERSION,
             "track_id": "qwen3.8-125b-a6b-mlx-v1",
             "box": "m5-max-128gb-4-qwen38-125b-a6b-mlx",
             "reference_commit": "a".repeat(40),
-            "prompt": "botany",
-            "passes": 4,
-            "prefill_seconds_per_token_mean": 0.0006282488193359375,
-            "decode_seconds_per_token_mean": 0.0329116748046875,
-            "prefill_cv": 0.004,
-            "decode_cv": 0.002,
-            "prefill_band_low": 0.95,
-            "prefill_band_high": 1.05,
-            "decode_band_low": 0.98,
-            "decode_band_high": 1.02,
             "captured_at": "2026-09-08T00:00:00Z",
             "benchd_source_commit": "b".repeat(40),
+            "prompts": [{
+                "prompt": "botany",
+                "passes": 4,
+                "prefill_seconds_per_token_mean": 0.0006282488193359375,
+                "decode_seconds_per_token_mean": 0.0329116748046875,
+                "prefill_cv": 0.004,
+                "decode_cv": 0.002,
+                "prefill_band_low": 0.95,
+                "prefill_band_high": 1.05,
+                "decode_band_low": 0.98,
+                "decode_band_high": 1.02,
+            }],
         })
+    }
+
+    /// The object in `doc` that holds `field`: the header, or the first prompt entry.
+    fn holder<'a>(doc: &'a mut serde_json::Value, field: &str) -> &'a mut serde_json::Value {
+        if HEADER_FIELDS.contains(&field) {
+            doc
+        } else {
+            &mut doc["prompts"][0]
+        }
     }
 
     fn parse(doc: &serde_json::Value) -> Result<BaselineCalibration, String> {
         BaselineCalibration::parse(serde_json::to_vec(doc).unwrap().as_slice())
     }
 
-    /// THE SINGLE-PROMPT FILE FORM STILL LOADS, as a file with one prompt entry, so a box that
-    /// holds it keeps working.
     #[test]
     fn a_valid_calibration_parses_with_every_field_carried() {
         let cal = parse(&valid_document()).unwrap();
@@ -1090,7 +1078,7 @@ mod tests {
             })
         };
         json!({
-            "version": 2,
+            "version": CALIBRATION_VERSION,
             "track_id": "track-a",
             "box": "box-a",
             "reference_commit": "a".repeat(40),
@@ -1166,7 +1154,10 @@ mod tests {
             "benchd_source_commit",
         ] {
             let mut doc = valid_document();
-            doc.as_object_mut().unwrap().remove(field);
+            holder(&mut doc, field)
+                .as_object_mut()
+                .unwrap()
+                .remove(field);
             let err = parse(&doc).unwrap_err();
             assert!(
                 err.contains(BASELINE_CALIBRATION_INVALID) && err.contains(field),
@@ -1180,10 +1171,40 @@ mod tests {
         assert!(err.contains(BASELINE_CALIBRATION_INVALID), "{err}");
     }
 
+    /// A CALIBRATION FILE FROM BEFORE THE DECODE-WINDOW DEFINITION IS REFUSED BY NAME. Versions
+    /// 1 and 2 recorded decode as the whole window (seed prefill plus decode), so their band does
+    /// not describe the decode window a control leg measures now. The refusal names the cause and
+    /// tells the operator to recalibrate; it never reads the old band.
+    #[test]
+    fn an_old_whole_window_calibration_file_is_refused_with_recalibrate() {
+        // Version 1 was the single-prompt form, version 2 the multi-prompt form; both refuse.
+        let mut single_prompt = valid_document();
+        let entry = single_prompt["prompts"][0].clone();
+        let obj = single_prompt.as_object_mut().unwrap();
+        obj.remove("prompts");
+        for (k, v) in entry.as_object().unwrap() {
+            obj.insert(k.clone(), v.clone());
+        }
+        obj.insert("version".into(), json!(1));
+        let mut multi_prompt = valid_document();
+        multi_prompt["version"] = json!(2);
+        for doc in [single_prompt, multi_prompt] {
+            let err = parse(&doc).unwrap_err();
+            assert!(
+                err.starts_with(BASELINE_CALIBRATION_WHOLE_WINDOW_DECODE),
+                "{err}"
+            );
+            assert!(err.contains("Recalibrate"), "{err}");
+            assert!(err.contains("decode-run time / N"), "{err}");
+        }
+        // The current version loads.
+        assert!(parse(&valid_document()).is_ok());
+    }
+
     #[test]
     fn a_wrong_version_a_short_commit_and_a_noisy_capture_refuse_by_name() {
         let mut doc = valid_document();
-        doc["version"] = json!(3);
+        doc["version"] = json!(CALIBRATION_VERSION + 1);
         let err = parse(&doc).unwrap_err();
         assert!(
             err.contains(BASELINE_CALIBRATION_INVALID) && err.contains("version"),
@@ -1196,14 +1217,14 @@ mod tests {
         assert!(err.contains("reference_commit"), "{err}");
 
         let mut doc = valid_document();
-        doc["passes"] = json!(1);
+        doc["prompts"][0]["passes"] = json!(1);
         let err = parse(&doc).unwrap_err();
         assert!(err.contains("passes"), "{err}");
 
         // A file whose recorded CV is above the fixed maximum is refused at READ time too, not
         // only when it is written: the file is the only evidence a reader has.
         let mut doc = valid_document();
-        doc["decode_cv"] = json!(0.02);
+        doc["prompts"][0]["decode_cv"] = json!(0.02);
         let err = parse(&doc).unwrap_err();
         assert!(err.contains(CALIBRATION_CV_EXCEEDED), "{err}");
     }
@@ -1218,7 +1239,7 @@ mod tests {
             ("prefill_band_low", json!("wide")),
         ] {
             let mut doc = valid_document();
-            doc[field] = value.clone();
+            doc["prompts"][0][field] = value.clone();
             let err = parse(&doc).unwrap_err();
             assert!(
                 err.contains(BASELINE_CALIBRATION_INVALID),
@@ -1506,6 +1527,71 @@ mod tests {
         let err = calibration_from_passes(&identity, &[passes(&[0.001], &[0.030])], Vec::new())
             .unwrap_err();
         assert!(err.contains(BASELINE_CALIBRATION_INVALID), "{err}");
+    }
+
+    /// DECODE MEANS THE DECODE WINDOW IN CALIBRATION AND IN THE BAND (David 2026-10-07). Control
+    /// legs with the same windows and different seed prefills author a byte-identical calibration
+    /// file, and a control leg whose seed prefill alone would put a whole-window figure far out of
+    /// band passes the band, because the band reads the decode window.
+    #[test]
+    fn calibration_decode_mean_and_band_are_byte_identical_whatever_the_seed_prefill_takes() {
+        let identity = CalibrationIdentity {
+            track_id: "track-a",
+            box_name: "box-a",
+            reference_commit: &"a".repeat(40),
+            benchd_source_commit: &"b".repeat(40),
+            captured_at: "2026-10-07T00:00:00Z",
+        };
+        let windows = [0.843, 0.844, 0.845];
+        let author = |seeds: [f64; 3]| {
+            let legs: Vec<bench_runner::TimingResult> = windows
+                .iter()
+                .zip(seeds)
+                .map(|(&decode, seed)| crate::testgolden::leg_timing(0.000_35, seed, decode))
+                .collect();
+            let (prefill_legs, decode_legs) = control_leg_seconds(&legs);
+            let cal = calibration_from_passes(
+                &identity,
+                &[PromptPasses {
+                    prompt: "botany",
+                    prefill_legs: &prefill_legs,
+                    decode_legs: &decode_legs,
+                }],
+                Vec::new(),
+            )
+            .unwrap();
+            serde_json::to_string(&cal).unwrap()
+        };
+        let base = author([0.22, 0.22, 0.22]);
+        for seeds in [[0.40, 0.40, 0.40], [0.01, 2.0, 7.5]] {
+            assert_eq!(author(seeds), base, "seeds {seeds:?} moved the calibration");
+        }
+        let cal = BaselineCalibration::parse(base.as_bytes()).unwrap();
+        let mean = cal.prompts[0].decode_seconds_per_token_mean;
+        let expected = windows.iter().sum::<f64>()
+            / 3.0
+            / bench_core::constants::BENCHMARK_DECODE_STEPS as f64;
+        assert!((mean - expected).abs() < 1e-15, "{mean} vs {expected}");
+
+        // A leg with a 3 s seed prefill: its whole window over N would sit ~4.5x above the band.
+        let slow_seed = crate::testgolden::leg_timing(0.000_35, 3.0, 0.844);
+        assert!(cal
+            .check_band(
+                "botany",
+                slow_seed.prefill_seconds_per_token,
+                slow_seed.decode_seconds_per_token
+            )
+            .is_ok());
+        // A leg whose decode window itself is 5% slower is refused.
+        let slow_decode = crate::testgolden::leg_timing(0.000_35, 0.22, 0.844 * 1.05);
+        let err = cal
+            .check_band(
+                "botany",
+                slow_decode.prefill_seconds_per_token,
+                slow_decode.decode_seconds_per_token,
+            )
+            .unwrap_err();
+        assert!(err.contains(SERIAL_CONTROL_LEG_OUTSIDE_BAND), "{err}");
     }
 
     /// `benchd calibrate-baseline` over two goldens writes ONE file with one entry per prompt, in

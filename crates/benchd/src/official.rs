@@ -33,6 +33,7 @@
 
 use bench_core::conformance::{run_conformance, ConformanceReport, CorrectnessScope};
 use bench_core::constants::{AcceptanceBands, WindowShape};
+use bench_core::contract::PairCombine;
 use bench_core::golden::GoldenFixture;
 use bench_core::score::{evaluate_timed_run, ScoringWeights, SpeedupFloors};
 use bench_protocol::SpecConfig;
@@ -63,10 +64,8 @@ use crate::score::{ScoreMetrics, ScorePayload};
 /// carries and the same rule the paired flow uses for its records.
 ///
 /// NOTHING ENFORCED CHANGES. `mtp_seconds_per_token_mean` is READ BACK from
-/// `metrics.decode_seconds_per_token` — the enforced whole-window figure `apply_timing_metrics` just
-/// wrote — so the two cannot drift and no second, decode-only quantity is introduced (the RED-TEAM
-/// REVERT notes in `bench-runner/src/timing.rs`). The array is additive: it feeds no score, floor or
-/// band.
+/// `metrics.decode_seconds_per_token` — the decode-window figure `apply_timing_metrics` just wrote —
+/// so the two cannot drift. The array is additive: it feeds no score, floor or band.
 ///
 /// NO `head_provenance_sha256`. The engine's loaded-head digest arrives on the `hello`
 /// (`bench_runner::Hello::head_provenance`), which the timed-worker spawn closures discard — a
@@ -772,7 +771,9 @@ pub struct PairedBaselineSeal<'a> {
 ///
 /// The CANDIDATE leg's numbers are READ BACK from the enforced fields
 /// (`prefill_seconds_per_token` / `decode_seconds_per_token`) rather than passed in again, so the
-/// named copies cannot drift from the numbers that were scored — the same discipline
+/// named copies cannot drift from the numbers that were scored. Decode is the decode window, so
+/// each role's `*_leg_decode_window_seconds_per_token` is the same value as its
+/// `*_leg_decode_seconds_per_token` — the same discipline
 /// `per_prompt.mtp_seconds_per_token_mean` follows. A payload with no candidate timing (a
 /// preflight or control-leg refusal) seals no candidate keys: absent is "no leg ran", which is a
 /// different claim from zero.
@@ -794,11 +795,14 @@ pub fn seal_paired_baseline(
     if let Some((prefill, decode)) = seal.leg {
         metrics.baseline_leg_prefill_seconds_per_token = Some(prefill);
         metrics.baseline_leg_decode_seconds_per_token = Some(decode);
+        metrics.baseline_leg_decode_window_seconds_per_token = Some(decode);
     }
     metrics.candidate_leg_prefill_seconds_per_token =
         finite_positive(metrics.prefill_seconds_per_token);
     metrics.candidate_leg_decode_seconds_per_token =
         finite_positive(metrics.decode_seconds_per_token);
+    metrics.candidate_leg_decode_window_seconds_per_token =
+        metrics.candidate_leg_decode_seconds_per_token;
 }
 
 /// `Some(v)` for a finite, strictly-positive measurement; `None` for the zero placeholder a
@@ -886,6 +890,9 @@ pub struct PairedWindow<G> {
     /// ruled 2 on both platforms). Every pair is one serial-control leg then one candidate leg.
     /// Pair `k` (1-based) measures goldens `(k - 1) mod N` of the N the run was given.
     pub pairs: usize,
+    /// How the run combines its pairs into one score, from the pinned track fixture
+    /// (`official_pair_combine`; absent is [`PairCombine::LowerMedian`]).
+    pub combine: PairCombine,
     /// The speedup floors this run enforces and seals, from the pinned track fixture
     /// (`decode_speedup_floor` / `prefill_speedup_floor`; David 2026-09-09 ruled 0.95 / 0.95,
     /// configurable per project). The fixture is the only source on the scored path.
@@ -920,10 +927,17 @@ pub struct PairedWindow<G> {
 ///    against the pair's `candidate` golden, with the LIVE measurement from step 1 as its baseline
 ///    pair.
 ///
-/// The run then scores ONE pair, the lower median over all pairs ([`scored_pair_index`]), and runs
-/// the full correctness set on the scored pair's candidate golden. The score is therefore
-/// `(ref_prefill/cand_prefill)^0.25 * (ref_decode/cand_decode)^0.75` of that pair, with the floors
-/// and the band shape untouched.
+/// Each pair's composite is `(ref_prefill/cand_prefill)^0.25 * (ref_decode/cand_decode)^0.75` over
+/// its OWN control leg. The fixture's `official_pair_combine` then decides the score:
+///
+/// * `lower_median` (the default): the run scores ONE pair, the lower median of the composites
+///   ([`scored_pair_index`]). The floors and the acceptance bands gate that pair.
+/// * `mean`: the score is the arithmetic mean of the composites. Every pair is scored, so the
+///   floors and the acceptance bands gate every pair, each against its own control leg, and the
+///   first pair that fails refuses the run ([`first_failing_pair`]). The run-level timing figures
+///   are the means of the per-pair figures ([`seal_pair_means`]).
+///
+/// Either way the full correctness set runs on the candidate golden of the lower-median pair.
 ///
 /// RESIDENCY is sequential, and it brackets each leg on BOTH levels. `open_baseline_leg` /
 /// `open_candidate_leg` are the platform's per-leg ENGINE lifecycle: on a platform whose worker
@@ -958,9 +972,12 @@ where
     let gate_log = std::rc::Rc::clone(&window.gate_log);
     let tolerance = window.token_tolerance_per_thousand;
     let near_tie_gap = window.near_tie_relative_gap;
+    let combine = window.combine;
     let mut payload =
         official_core_paired_inner(goldens, calibration, seal, digests, commit, legs, window);
     payload.metrics.gates = gate_log.records();
+    // The pair rule the run applied rides on every payload, so a reader of the score sees it.
+    payload.metrics.official_pair_combine = Some(combine);
     // The token rule the run applied rides on every payload, so a reader of the score sees it.
     payload.metrics.timed_token_tolerance_per_thousand = tolerance;
     payload.metrics.timed_token_near_tie_relative_gap = near_tie_gap;
@@ -999,6 +1016,7 @@ where
         mut cool_gate,
         gate_log,
         pairs,
+        combine,
         floors,
         weights,
         token_tolerance_per_thousand,
@@ -1177,28 +1195,15 @@ where
                 return payload;
             }
         };
-        let (control_seed_window, control_decode_window) = window_per_token(&control);
-        let (candidate_seed_window, candidate_decode_window) = window_per_token(&timing);
         // Tokens equal to the golden's oracle have no mismatch, and no replay runs for them. The
         // counts of any other pair stay unset until [`judge_candidate_tokens`] replays it.
         let exact = timing.emitted_tokens == oracle_tokens(benchmark, timing.decode_steps);
         let exact_count = exact.then_some(0);
         records.push(PairedLegRecord {
-            pair: pair as i64,
-            prompt_sha256: golden.sha256.clone(),
-            control_prefill_seconds_per_token: control.prefill_seconds_per_token,
-            control_decode_seconds_per_token: control.decode_seconds_per_token,
-            candidate_prefill_seconds_per_token: timing.prefill_seconds_per_token,
-            candidate_decode_seconds_per_token: timing.decode_seconds_per_token,
-            control_seed_prefill_window_seconds_per_token: control_seed_window,
-            control_decode_window_seconds_per_token: control_decode_window,
-            candidate_seed_prefill_window_seconds_per_token: candidate_seed_window,
-            candidate_decode_window_seconds_per_token: candidate_decode_window,
             token_mismatch_count: exact_count,
-            token_mismatch_first_step: None,
             token_mismatch_near_tie_count: near_tie_relative_gap.and(exact_count),
             token_mismatch_second_choice_count: exact_count,
-            token_mismatch_second_choice_max_relative_gap: None,
+            ..paired_leg_record(pair, &golden.sha256, &control, &timing)
         });
         candidate_timings.push(timing);
         if pair < pairs {
@@ -1210,19 +1215,24 @@ where
         }
     }
 
-    // THE SCORED PAIR (David ruling 2026-09-17, the Laguna rule): pairs are NEVER averaged. Each
-    // pair is scored on its own control leg, and the run scores ONE measured pair — the one whose
-    // composite is the lower median over the pairs. Every other pair stays in `paired_legs` as
-    // measured. With ONE pair this is that pair.
+    // THE SEALED PAIR. Under `lower_median` (David ruling 2026-09-17, the Laguna rule) the run
+    // scores ONE measured pair, the one whose composite is the lower median over the pairs, and
+    // only that pair is gated. Under `mean` (David 2026-10-06) every pair is scored, so every pair
+    // is gated against its own control leg first; a failing pair refuses the run and the refusal
+    // carries that pair's figures. Every pair stays in `paired_legs` as measured.
     let scored = scored_pair_index(&records, weights);
-    let scored_record = records[scored].clone();
-    let scored_goldens = goldens[scored % goldens.len()];
-    let candidate = &candidate_timings[scored];
-    let control_prefill = scored_record.control_prefill_seconds_per_token;
-    let control_decode = scored_record.control_decode_seconds_per_token;
-    // The scored run's inputs: the scored pair's control leg as the denominator, the track
-    // fixture's floors as the gate. One value, so the floors this run enforces are the floors it
-    // seals.
+    let failing = match combine {
+        PairCombine::LowerMedian => None,
+        PairCombine::Mean => first_failing_pair(&records, bands, floors, weights),
+    };
+    let sealed = failing.as_ref().map_or(scored, |(pair, _)| *pair);
+    let sealed_record = records[sealed].clone();
+    let sealed_goldens = goldens[sealed % goldens.len()];
+    let candidate = &candidate_timings[sealed];
+    let control_prefill = sealed_record.control_prefill_seconds_per_token;
+    let control_decode = sealed_record.control_decode_seconds_per_token;
+    // The sealed pair's inputs: its control leg as the denominator, the track fixture's floors as
+    // the gate. One value, so the floors this run enforces are the floors it seals.
     let paired_scoring = ScoringInputs {
         baseline_prefill_spt: control_prefill,
         baseline_decode_spt: control_decode,
@@ -1230,24 +1240,36 @@ where
         weights,
     };
 
-    let mut held = held_session;
-    let mut payload = finish_official(
-        scored_goldens.candidate,
-        paired_scoring,
-        bands,
-        digests,
-        commit,
-        candidate,
-        move || {
-            held.take().ok_or_else(|| {
-                RunnerError::Protocol(
-                    "the window correctness phase was requested but the resident session was \
-                     already consumed"
-                        .to_string(),
-                )
-            })
-        },
-    );
+    let mut payload = if let Some((_, reason)) = failing {
+        drop(held_session);
+        official_failed_timed_band(
+            sealed_goldens.candidate,
+            digests,
+            commit,
+            reason,
+            candidate,
+            paired_scoring,
+        )
+    } else {
+        let mut held = held_session;
+        finish_official(
+            sealed_goldens.candidate,
+            paired_scoring,
+            bands,
+            digests,
+            commit,
+            candidate,
+            move || {
+                held.take().ok_or_else(|| {
+                    RunnerError::Protocol(
+                        "the window correctness phase was requested but the resident session \
+                         was already consumed"
+                            .to_string(),
+                    )
+                })
+            },
+        )
+    };
     drop(held_candidate_leg);
 
     // THE TIMED TOKEN TOLERANCE (David 2026-09-28). The candidate's residency is gone, so the
@@ -1296,9 +1318,12 @@ where
     let mut seal = seal;
     seal.band_passed = true;
     seal.leg = Some((control_prefill, control_decode));
-    seal_paired_baseline(&mut payload.metrics, &seal, &scored_goldens.control.sha256);
-    seal_window_split(&mut payload.metrics, &scored_record);
-    seal_token_counts(&mut payload.metrics, &records[scored]);
+    seal_paired_baseline(&mut payload.metrics, &seal, &sealed_goldens.control.sha256);
+    seal_seed_prefill_windows(&mut payload.metrics, &sealed_record);
+    seal_token_counts(&mut payload.metrics, &records[sealed]);
+    if payload.passed && combine == PairCombine::Mean {
+        seal_pair_means(&mut payload, &records, weights);
+    }
     // The payload builders sealed `per_prompt` for the scored pair's golden only, and only when
     // they kept the timing. Replace it with one record per distinct golden.
     if !payload.metrics.per_prompt.is_empty() {
@@ -1311,8 +1336,8 @@ where
 
 /// One `per_prompt` record per distinct candidate golden, in command-line order. Each record
 /// carries the drafting facts of one pair that measured its prompt. When a prompt has several
-/// pairs, the record is the pair that the run's own rule picks among them: the lower median of
-/// their composites ([`scored_pair_index`]). With one golden that pair is the scored pair, so the
+/// pairs, the record is the lower median of their composites ([`scored_pair_index`]), under
+/// either pair rule. With one golden that pair is the scored pair, so the
 /// record is the one the payload builders sealed.
 fn paired_per_prompt(
     goldens: &[PairedGoldens<'_>],
@@ -1349,37 +1374,55 @@ fn paired_per_prompt(
 /// One pair's two legs, as measured, sealed for the audit trail (`metrics.paired_legs`).
 pub use crate::score::PairedLegRecord;
 
-/// One leg's free-run window SPLIT per token — `(seed prefill / seed length, decode / N)` — or
-/// `(None, None)` when the leg timed a teacher-forced window that has no split. REPORT-ONLY.
-fn window_per_token(timing: &TimingResult) -> (Option<f64>, Option<f64>) {
-    let Some(w) = timing.phase_window else {
-        return (None, None);
-    };
-    let per = |seconds: f64, tokens: usize| {
-        (tokens > 0 && seconds.is_finite() && seconds > 0.0).then(|| seconds / tokens as f64)
-    };
-    (
-        per(w.seed_prefill_elapsed_seconds, timing.prefill_prompt_tokens),
-        per(w.decode_elapsed_seconds, timing.decode_steps),
-    )
+/// One pair's timing record from its two measured legs, with no token counts yet. Every decode
+/// figure is the leg's decode window (`TimingResult::decode_seconds_per_token`); the seed prefill
+/// goes to the seed-named keys only.
+fn paired_leg_record(
+    pair: usize,
+    prompt_sha256: &str,
+    control: &TimingResult,
+    candidate: &TimingResult,
+) -> PairedLegRecord {
+    PairedLegRecord {
+        pair: pair as i64,
+        prompt_sha256: prompt_sha256.to_string(),
+        control_prefill_seconds_per_token: control.prefill_seconds_per_token,
+        control_decode_seconds_per_token: control.decode_seconds_per_token,
+        candidate_prefill_seconds_per_token: candidate.prefill_seconds_per_token,
+        candidate_decode_seconds_per_token: candidate.decode_seconds_per_token,
+        control_seed_prefill_window_seconds_per_token: seed_prefill_window_per_token(control),
+        control_decode_window_seconds_per_token: Some(control.decode_seconds_per_token),
+        candidate_seed_prefill_window_seconds_per_token: seed_prefill_window_per_token(candidate),
+        candidate_decode_window_seconds_per_token: Some(candidate.decode_seconds_per_token),
+        token_mismatch_count: None,
+        token_mismatch_first_step: None,
+        token_mismatch_near_tie_count: None,
+        token_mismatch_second_choice_count: None,
+        token_mismatch_second_choice_max_relative_gap: None,
+    }
 }
 
-/// Seal the SCORED pair's window split onto the flat metrics
-/// (`ScoreMetrics::*_leg_*_window_seconds_per_token`). These are the same row's figures as the
-/// enforced ones, never a mean over pairs. A split is absent when that pair timed a teacher-forced
-/// window.
-fn seal_window_split(metrics: &mut ScoreMetrics, record: &PairedLegRecord) {
-    metrics.baseline_leg_decode_window_seconds_per_token =
-        record.control_decode_window_seconds_per_token;
-    metrics.candidate_leg_decode_window_seconds_per_token =
-        record.candidate_decode_window_seconds_per_token;
+/// One leg's SEED PREFILL window per seed token, or `None` when the leg timed a teacher-forced
+/// window that has no seed prefill in its clock. REPORT-ONLY, sealed under seed-named keys only:
+/// it never feeds a decode figure.
+fn seed_prefill_window_per_token(timing: &TimingResult) -> Option<f64> {
+    let w = timing.phase_window?;
+    let (seconds, tokens) = (w.seed_prefill_elapsed_seconds, w.prefill_token_total);
+    (tokens > 0 && seconds.is_finite() && seconds > 0.0).then(|| seconds / tokens as f64)
+}
+
+/// Seal the SCORED pair's seed prefill windows onto the flat metrics
+/// (`ScoreMetrics::*_leg_seed_prefill_window_seconds_per_token`). These are the same row's figures,
+/// never a mean over pairs. Absent when that pair timed a teacher-forced window.
+fn seal_seed_prefill_windows(metrics: &mut ScoreMetrics, record: &PairedLegRecord) {
     metrics.baseline_leg_seed_prefill_window_seconds_per_token =
         record.control_seed_prefill_window_seconds_per_token;
     metrics.candidate_leg_seed_prefill_window_seconds_per_token =
         record.candidate_seed_prefill_window_seconds_per_token;
 }
 
-/// The index of the pair the run scores (David ruling 2026-09-17, the Laguna rule): the LOWER
+/// The index of the pair the run scores under `lower_median` (David ruling 2026-09-17, the Laguna
+/// rule), and of the pair whose golden the correctness set runs on under either rule: the LOWER
 /// MEDIAN of the per-pair composites — the order statistic at index `(n - 1) / 2` of the pairs
 /// sorted by composite, which on an even count is the lower of the two central pairs, never their
 /// mean. Each pair's composite is the track's weighted score of its candidate leg over its OWN
@@ -1389,18 +1432,100 @@ fn seal_window_split(metrics: &mut ScoreMetrics, record: &PairedLegRecord) {
 /// lifted to the whole pair so that every enforced figure the run seals comes from one measured
 /// pair.
 fn scored_pair_index(records: &[PairedLegRecord], weights: ScoringWeights) -> usize {
-    let composite = |r: &PairedLegRecord| {
-        bench_core::score::score_weighted(
+    let mut order: Vec<usize> = (0..records.len()).collect();
+    order.sort_by(|&a, &b| {
+        pair_composite(&records[a], weights).total_cmp(&pair_composite(&records[b], weights))
+    });
+    order[(records.len() - 1) / 2]
+}
+
+/// One pair's composite: the track's weighted score of its candidate leg over its OWN control leg.
+fn pair_composite(record: &PairedLegRecord, weights: ScoringWeights) -> f64 {
+    bench_core::score::score_weighted(
+        record.candidate_decode_seconds_per_token,
+        record.candidate_prefill_seconds_per_token,
+        record.control_decode_seconds_per_token,
+        record.control_prefill_seconds_per_token,
+        weights,
+    )
+}
+
+/// THE MEAN RULE'S GATE (`official_pair_combine: "mean"`): every pair is scored, so every pair
+/// must pass the same gate the lower-median rule applies to its one pair — a finite composite,
+/// the speedup floors and the acceptance bands, each against the pair's own control leg. Returns
+/// the index of the first pair that fails, in measurement order, and its reason.
+fn first_failing_pair(
+    records: &[PairedLegRecord],
+    bands: AcceptanceBands,
+    floors: SpeedupFloors,
+    weights: ScoringWeights,
+) -> Option<(usize, String)> {
+    records.iter().enumerate().find_map(|(i, r)| {
+        evaluate_timed_run(
             r.candidate_decode_seconds_per_token,
             r.candidate_prefill_seconds_per_token,
             r.control_decode_seconds_per_token,
             r.control_prefill_seconds_per_token,
+            bands,
+            floors,
             weights,
         )
+        .first_failure_reason()
+        .map(|reason| (i, format!("pair {} of {}: {reason}", i + 1, records.len())))
+    })
+}
+
+/// THE MEAN RULE'S SEAL (`official_pair_combine: "mean"`, David 2026-10-06): the score is the
+/// arithmetic mean of the per-pair composites, and every run-level timing figure is the
+/// arithmetic mean of the same figure over the pairs — the two speedups (the mean of the per-pair
+/// gains), the candidate and control seconds per token under all of their names (the decode
+/// window keys included), and the seed prefill windows (absent unless every pair carried one). No figure is derived from another mean: the mean
+/// speedup is not the ratio of the mean seconds, and the score is not the composite of the mean
+/// speedups. Each pair's figures in `paired_legs` reproduce its own composite, and the score is
+/// the mean of those.
+fn seal_pair_means(
+    payload: &mut ScorePayload,
+    records: &[PairedLegRecord],
+    weights: ScoringWeights,
+) {
+    let n = records.len() as f64;
+    let mean = |f: &dyn Fn(&PairedLegRecord) -> f64| records.iter().map(f).sum::<f64>() / n;
+    let mean_of_splits = |f: &dyn Fn(&PairedLegRecord) -> Option<f64>| {
+        records
+            .iter()
+            .map(f)
+            .sum::<Option<f64>>()
+            .map(|sum| sum / n)
     };
-    let mut order: Vec<usize> = (0..records.len()).collect();
-    order.sort_by(|&a, &b| composite(&records[a]).total_cmp(&composite(&records[b])));
-    order[(records.len() - 1) / 2]
+    let speedup = bench_core::score::speedup;
+    payload.score = Some(mean(&|r| pair_composite(r, weights)));
+    let m = &mut payload.metrics;
+    m.decode_speedup = mean(&|r| {
+        speedup(
+            r.control_decode_seconds_per_token,
+            r.candidate_decode_seconds_per_token,
+        )
+    });
+    m.prefill_speedup = mean(&|r| {
+        speedup(
+            r.control_prefill_seconds_per_token,
+            r.candidate_prefill_seconds_per_token,
+        )
+    });
+    m.decode_seconds_per_token = mean(&|r| r.candidate_decode_seconds_per_token);
+    m.prefill_seconds_per_token = mean(&|r| r.candidate_prefill_seconds_per_token);
+    m.baseline_decode_seconds_per_token = mean(&|r| r.control_decode_seconds_per_token);
+    m.baseline_prefill_seconds_per_token = mean(&|r| r.control_prefill_seconds_per_token);
+    m.candidate_leg_decode_seconds_per_token = Some(m.decode_seconds_per_token);
+    m.candidate_leg_prefill_seconds_per_token = Some(m.prefill_seconds_per_token);
+    m.baseline_leg_decode_seconds_per_token = Some(m.baseline_decode_seconds_per_token);
+    m.baseline_leg_prefill_seconds_per_token = Some(m.baseline_prefill_seconds_per_token);
+    m.candidate_leg_decode_window_seconds_per_token = Some(m.decode_seconds_per_token);
+    m.baseline_leg_decode_window_seconds_per_token = Some(m.baseline_decode_seconds_per_token);
+    m.candidate_leg_seed_prefill_window_seconds_per_token =
+        mean_of_splits(&|r| r.candidate_seed_prefill_window_seconds_per_token);
+    m.baseline_leg_seed_prefill_window_seconds_per_token =
+        mean_of_splits(&|r| r.control_seed_prefill_window_seconds_per_token);
 }
 
 /// The EXACT-MATCH name of the refusal "a pair's candidate tokens differ from the reference
@@ -4205,7 +4330,7 @@ mod tests {
 
     /// The PASSING official payload seals exactly ONE `per_prompt` record — one timed prompt was
     /// measured, so one entry — carrying the golden's own sha256, the free-run audit's effective
-    /// mean draft length, and the ENFORCED whole-window decode seconds-per-token.
+    /// mean draft length, and the decode-window seconds-per-token.
     #[test]
     fn official_seals_one_per_prompt_record_for_the_timed_prompt() {
         let golden = official_golden(None);
@@ -4232,7 +4357,7 @@ mod tests {
         );
         assert_eq!(
             pp.mtp_seconds_per_token_mean, payload.metrics.decode_seconds_per_token,
-            "the ENFORCED whole-window figure, never a second decode-only number"
+            "the scored decode-window figure"
         );
     }
 
@@ -4947,6 +5072,7 @@ mod tests {
             cool_gate,
             gate_log: std::rc::Rc::new(crate::quiescegate::GateLog::new()),
             pairs: 1,
+            combine: PairCombine::LowerMedian,
             // The tests drive the ruled floors; the per-project arms set their own.
             floors: SpeedupFloors::DEFAULT,
             weights: ScoringWeights::DEFAULT,
@@ -5334,9 +5460,9 @@ mod tests {
             candidate_prefill_seconds_per_token: 1.0,
             candidate_decode_seconds_per_token: 1.0 / decode_gain,
             control_seed_prefill_window_seconds_per_token: None,
-            control_decode_window_seconds_per_token: None,
+            control_decode_window_seconds_per_token: Some(1.0),
             candidate_seed_prefill_window_seconds_per_token: None,
-            candidate_decode_window_seconds_per_token: None,
+            candidate_decode_window_seconds_per_token: Some(1.0 / decode_gain),
             token_mismatch_count: Some(0),
             token_mismatch_first_step: None,
             token_mismatch_near_tie_count: None,
@@ -5379,6 +5505,328 @@ mod tests {
             scored_pair_index(&tied, w),
             0,
             "ties keep measurement order"
+        );
+    }
+
+    /// The paired design's band shape with both lower bounds off and a 5 % up bound.
+    const PAIRED_TEST_BANDS: AcceptanceBands = AcceptanceBands {
+        prefill_up_tolerance: 0.05,
+        prefill_down_tolerance: 0.05,
+        decode_up_tolerance: 0.02,
+        decode_down_tolerance: 0.05,
+        decode_down_enabled: false,
+        prefill_down_enabled: false,
+    };
+
+    /// THE MEAN RULE GATES EVERY PAIR: the first pair, in measurement order, that misses a floor
+    /// or a band refuses the run, and the reason names it. With every pair in, nothing refuses.
+    #[test]
+    fn the_mean_rule_gates_every_pair_against_its_own_control_leg() {
+        let w = ScoringWeights::DEFAULT;
+        let fine = [
+            pair_with_composite(1, 1.30),
+            pair_with_composite(2, 1.10),
+            pair_with_composite(3, 1.20),
+        ];
+        assert_eq!(
+            first_failing_pair(&fine, PAIRED_TEST_BANDS, SpeedupFloors::DEFAULT, w),
+            None
+        );
+        // Pair 2 decodes at 0.90 of its control leg: under the 0.95 floor. Pair 3 is over the
+        // decode up band too, but pair 2 comes first.
+        let slow = [
+            pair_with_composite(1, 1.30),
+            pair_with_composite(2, 0.90),
+            pair_with_composite(3, 0.80),
+        ];
+        let (pair, reason) =
+            first_failing_pair(&slow, PAIRED_TEST_BANDS, SpeedupFloors::DEFAULT, w).unwrap();
+        assert_eq!(pair, 1);
+        assert!(reason.starts_with("pair 2 of 3: "), "{reason}");
+        assert!(reason.contains("decode_speedup=0.900000"), "{reason}");
+        // The prefill axis is gated per pair too: pair 1's prefill is 10 % over its control leg.
+        let mut prefill_slow = fine.clone();
+        prefill_slow[0].candidate_prefill_seconds_per_token = 1.10;
+        let (pair, reason) =
+            first_failing_pair(&prefill_slow, PAIRED_TEST_BANDS, SpeedupFloors::DEFAULT, w)
+                .unwrap();
+        assert_eq!(pair, 0);
+        assert!(reason.starts_with("pair 1 of 3: "), "{reason}");
+    }
+
+    /// THE MEAN RULE'S SEAL: the score is the mean of the per-pair composites, the two speedups
+    /// are the means of the per-pair gains, and each seconds-per-token figure is the mean of the
+    /// per-pair figure. The window split is the mean when every pair carried one, else absent.
+    /// DECODE MEANS THE DECODE WINDOW ON THE PAIRED PATH (David 2026-10-07). Three pairs with
+    /// the SAME prefill and decode windows and three different seed prefills seal byte-identical
+    /// decode gains, composites, floor and band verdicts, and run-level figures under both pair
+    /// rules. Only the seed-named keys move. The windows are those of run 37608623516 (control
+    /// decode 151.7 tok/s, candidate 221.5 tok/s), where charging the seed to decode read a
+    /// 1.46x decode gain as 1.089.
+    #[test]
+    fn paired_decode_gain_and_composite_are_byte_identical_whatever_the_seed_prefill_takes() {
+        let w = ScoringWeights::DEFAULT;
+        let n = BENCHMARK_DECODE_STEPS as f64;
+        let control_window = n / 151.7;
+        let candidate_window = n / 221.5;
+        let seal = |control_seed: f64, candidate_seed: f64| {
+            let records: Vec<PairedLegRecord> = (1..=3)
+                .map(|pair| {
+                    let control =
+                        crate::testgolden::leg_timing(0.000_35, control_seed, control_window);
+                    let candidate =
+                        crate::testgolden::leg_timing(0.000_30, candidate_seed, candidate_window);
+                    paired_leg_record(pair, "prompt", &control, &candidate)
+                })
+                .collect();
+            let composites: Vec<u64> = records
+                .iter()
+                .map(|r| pair_composite(r, w).to_bits())
+                .collect();
+            let gate = first_failing_pair(&records, PAIRED_TEST_BANDS, SpeedupFloors::DEFAULT, w);
+            let scored = scored_pair_index(&records, w);
+            let mut payload = ScorePayload {
+                score: Some(0.0),
+                passed: true,
+                metrics: ScoreMetrics::default(),
+            };
+            seal_pair_means(&mut payload, &records, w);
+            payload.metrics.paired_legs = records;
+            (
+                composites,
+                gate,
+                scored,
+                serde_json::to_value(&payload).unwrap(),
+            )
+        };
+        let (composites, gate, scored, sealed) = seal(0.221, 0.400);
+        let m = &sealed["metrics"];
+        let gain = m["decode_speedup"].as_f64().unwrap();
+        assert!((gain - 221.5 / 151.7).abs() < 1e-12, "decode gain {gain}");
+        assert_eq!(
+            m["candidate_leg_decode_window_seconds_per_token"],
+            m["decode_seconds_per_token"]
+        );
+        assert_eq!(gate, None);
+        for (control_seed, candidate_seed) in [(0.400, 0.221), (5.0, 0.001), (0.001, 9.0)] {
+            let (c, g, s, other) = seal(control_seed, candidate_seed);
+            assert_eq!(
+                c, composites,
+                "a pair composite moved with the seed prefill"
+            );
+            assert_eq!(g, gate);
+            assert_eq!(s, scored);
+            assert_ne!(other, sealed, "precondition: the seed keys did change");
+            assert_eq!(
+                crate::testgolden::without_seed_keys(other),
+                crate::testgolden::without_seed_keys(sealed.clone()),
+                "a sealed figure other than a seed-named key moved with the seed prefill"
+            );
+        }
+    }
+
+    #[test]
+    fn the_mean_rule_seals_the_means_of_the_per_pair_figures() {
+        let w = ScoringWeights::DEFAULT;
+        let mut records = vec![
+            pair_with_composite(1, 1.30),
+            pair_with_composite(2, 1.10),
+            pair_with_composite(3, 1.20),
+        ];
+        // Give the pairs different control legs and prefill gains, so a ratio of means, a mean
+        // of ratios and a composite of means all differ.
+        records[1].control_prefill_seconds_per_token = 2.0;
+        records[1].control_decode_seconds_per_token = 2.0;
+        records[1].control_decode_window_seconds_per_token = Some(2.0);
+        records[1].candidate_decode_seconds_per_token = 2.0 / 1.10;
+        records[1].candidate_decode_window_seconds_per_token = Some(2.0 / 1.10);
+        records[2].candidate_prefill_seconds_per_token = 0.5;
+        for (r, seed) in records.iter_mut().zip([0.25, 0.5, 0.75]) {
+            r.candidate_seed_prefill_window_seconds_per_token = Some(seed);
+        }
+        records[2].control_seed_prefill_window_seconds_per_token = Some(1.0);
+        let composites: Vec<f64> = records.iter().map(|r| pair_composite(r, w)).collect();
+        assert!((composites[0] - 1.30f64.powf(0.75)).abs() < 1e-12);
+        assert!((composites[2] - 2.0f64.powf(0.25) * 1.20f64.powf(0.75)).abs() < 1e-12);
+
+        let mut payload = ScorePayload {
+            score: Some(0.0),
+            passed: true,
+            metrics: ScoreMetrics::default(),
+        };
+        seal_pair_means(&mut payload, &records, w);
+        let close = |a: f64, b: f64| (a - b).abs() < 1e-12;
+        let mean3 = |v: [f64; 3]| (v[0] + v[1] + v[2]) / 3.0;
+        assert!(close(
+            payload.score.unwrap(),
+            mean3([composites[0], composites[1], composites[2]])
+        ));
+        let m = &payload.metrics;
+        assert!(close(m.decode_speedup, mean3([1.30, 1.10, 1.20])));
+        assert!(close(m.prefill_speedup, mean3([1.0, 2.0, 2.0])));
+        assert!(close(
+            m.decode_seconds_per_token,
+            mean3([1.0 / 1.30, 2.0 / 1.10, 1.0 / 1.20])
+        ));
+        assert!(close(m.prefill_seconds_per_token, mean3([1.0, 1.0, 0.5])));
+        assert!(close(
+            m.baseline_decode_seconds_per_token,
+            mean3([1.0, 2.0, 1.0])
+        ));
+        assert!(close(
+            m.baseline_prefill_seconds_per_token,
+            mean3([1.0, 2.0, 1.0])
+        ));
+        assert_eq!(
+            m.candidate_leg_decode_seconds_per_token,
+            Some(m.decode_seconds_per_token)
+        );
+        assert_eq!(
+            m.baseline_leg_prefill_seconds_per_token,
+            Some(m.baseline_prefill_seconds_per_token)
+        );
+        assert_eq!(
+            m.candidate_leg_decode_window_seconds_per_token,
+            Some(m.decode_seconds_per_token),
+            "the decode window key is the decode figure"
+        );
+        assert_eq!(
+            m.baseline_leg_decode_window_seconds_per_token,
+            Some(m.baseline_decode_seconds_per_token)
+        );
+        assert!(close(
+            m.candidate_leg_seed_prefill_window_seconds_per_token
+                .unwrap(),
+            0.5
+        ));
+        assert_eq!(
+            m.baseline_leg_seed_prefill_window_seconds_per_token, None,
+            "two pairs carried no seed window"
+        );
+        // The mean score is not the composite of the mean gains, and the mean decode gain is not
+        // the ratio of the mean seconds.
+        let composite_of_means = m.prefill_speedup.powf(0.25) * m.decode_speedup.powf(0.75);
+        assert!((payload.score.unwrap() - composite_of_means).abs() > 1e-6);
+        assert!(
+            (m.decode_speedup - m.baseline_decode_seconds_per_token / m.decode_seconds_per_token)
+                .abs()
+                > 1e-6
+        );
+    }
+
+    /// A paired window that lets the mock engine pass every gate: no up bound worth the name and
+    /// floors of 0, so the run reaches the correctness set and seals a score.
+    fn open_paired_window(
+        pairs: usize,
+        combine: PairCombine,
+    ) -> PairedWindow<impl FnMut(&str) -> bench_runner::Result<()>> {
+        PairedWindow {
+            bands: AcceptanceBands {
+                prefill_up_tolerance: 1e9,
+                decode_up_tolerance: 1e9,
+                ..PAIRED_TEST_BANDS
+            },
+            pairs,
+            combine,
+            floors: SpeedupFloors {
+                decode: 0.0,
+                prefill: 0.0,
+            },
+            ..paired_window_for_test(|_phase: &str| Ok(()))
+        }
+    }
+
+    fn run_three_pairs(
+        window: PairedWindow<impl FnMut(&str) -> bench_runner::Result<()>>,
+    ) -> ScorePayload {
+        let golden = official_golden(None);
+        let calibration = wide_calibration();
+        official_core_paired(
+            &[PairedGoldens {
+                candidate: &golden,
+                control: &golden,
+                prompt: "botany",
+            }],
+            &calibration,
+            paired_seal_for_test(&calibration),
+            RunDigests::for_test(&DirDigest::empty()),
+            "deadbeef",
+            PairedLegs {
+                open_baseline_leg: |_| Ok(()),
+                open_candidate_leg: |_| Ok(()),
+                spawn_baseline: || Session::connect(conformant_engine()).map(|(s, _)| s),
+                spawn_timed: || Session::connect(conformant_engine()).map(|(s, _)| s),
+            },
+            window,
+        )
+    }
+
+    /// BOTH RULES, END TO END, over three measured pairs. `lower_median` scores the lower-median
+    /// pair's composite and seals that pair's figures; `mean` scores the mean of the three
+    /// composites and seals the means. Each payload names its rule.
+    #[test]
+    fn a_passing_paired_run_scores_by_the_fixture_pair_rule() {
+        let w = ScoringWeights::DEFAULT;
+        let close = |a: f64, b: f64| (a - b).abs() <= 1e-12 * a.abs().max(b.abs()).max(1.0);
+
+        let median = run_three_pairs(open_paired_window(3, PairCombine::LowerMedian));
+        assert!(median.passed, "{}", median.metrics.error);
+        let m = &median.metrics;
+        assert_eq!(m.official_pair_combine, Some(PairCombine::LowerMedian));
+        assert_eq!(m.paired_legs.len(), 3);
+        let scored = &m.paired_legs[scored_pair_index(&m.paired_legs, w)];
+        assert!(close(median.score.unwrap(), pair_composite(scored, w)));
+        assert!(close(
+            m.decode_seconds_per_token,
+            scored.candidate_decode_seconds_per_token
+        ));
+
+        let mean = run_three_pairs(open_paired_window(3, PairCombine::Mean));
+        assert!(mean.passed, "{}", mean.metrics.error);
+        let m = &mean.metrics;
+        assert_eq!(m.official_pair_combine, Some(PairCombine::Mean));
+        assert_eq!(m.paired_legs.len(), 3);
+        let composites: f64 = m.paired_legs.iter().map(|r| pair_composite(r, w)).sum();
+        assert!(close(mean.score.unwrap(), composites / 3.0));
+        let decode_gains: f64 = m
+            .paired_legs
+            .iter()
+            .map(|r| r.control_decode_seconds_per_token / r.candidate_decode_seconds_per_token)
+            .sum();
+        assert!(close(m.decode_speedup, decode_gains / 3.0));
+        let candidate_decode: f64 = m
+            .paired_legs
+            .iter()
+            .map(|r| r.candidate_decode_seconds_per_token)
+            .sum();
+        assert!(close(m.decode_seconds_per_token, candidate_decode / 3.0));
+    }
+
+    /// A MEAN RUN WITH A PAIR UNDER THE FLOOR SEALS NO SCORE, and the refusal names the pair.
+    /// Floors no pair can clear put pair 1 first.
+    #[test]
+    fn a_mean_run_refuses_on_the_first_pair_under_a_floor() {
+        let mut window = open_paired_window(3, PairCombine::Mean);
+        window.floors = SpeedupFloors {
+            decode: 1e9,
+            prefill: 0.0,
+        };
+        let payload = run_three_pairs(window);
+        assert!(!payload.passed);
+        assert_eq!(payload.score, None);
+        assert!(
+            payload.metrics.error.starts_with("pair 1 of 3: "),
+            "{}",
+            payload.metrics.error
+        );
+        assert_eq!(
+            payload.metrics.official_pair_combine,
+            Some(PairCombine::Mean)
+        );
+        assert_eq!(payload.metrics.paired_legs.len(), 3);
+        assert_eq!(
+            payload.metrics.baseline_leg_decode_seconds_per_token,
+            Some(payload.metrics.paired_legs[0].control_decode_seconds_per_token)
         );
     }
 

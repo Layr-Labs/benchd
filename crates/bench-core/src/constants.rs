@@ -589,12 +589,11 @@ pub const BENCHMARK_DECODE_STEPS: usize = 128;
 /// `MLXFastConstants.localIterateBenchmarkDecodeSteps` — the checked decode window the
 /// participant edit loop (`--local-iterate`) uses.
 ///
-/// This is `benchmarkDecodeSteps` on the reference tree, NOT a shorter window: the reference
-/// states the reason inline — "Local iterate charges the same seed prefill as the
-/// official decode window" ([`BENCHMARK_DECODE_SEED_TOKENS`], 1024 since the 2026-08-24
-/// seed-length ruling; 512 at the time of the quoted reference), "so it must use the same
-/// denominator to produce a comparable decode seconds-per-token estimate"
-/// (`mlxfast-qwen-38-27b-mtp-engine/Sources/MLXFastCore/Constants.swift@6279c7a:197-201`).
+/// This is `benchmarkDecodeSteps` on the reference tree, NOT a shorter window, so local iterate
+/// divides the same decode window by the same N as the official run and its decode
+/// seconds-per-token compares with the official one. (The reference tree gave a reason that no
+/// longer holds: it charged the seed prefill to decode. Decode is now the decode window only,
+/// [`crate::score::decode_window_seconds_per_token`].)
 ///
 /// It was ported as `16` from the retired Laguna/DFlash fork
 /// (`mlxfast-challenge-dev/Sources/MLXFastCore/Constants.swift:71`), which is the tree the

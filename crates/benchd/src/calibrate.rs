@@ -402,8 +402,7 @@ fn execute(args: &[String]) -> Result<Option<()>, String> {
     let mut measured_legs: Vec<(Vec<f64>, Vec<f64>)> = Vec::with_capacity(goldens.len());
     let mut pass_number = 0;
     for ((golden_path, prompt), golden) in args.goldens.iter().zip(&goldens) {
-        let mut prefill_legs: Vec<f64> = Vec::with_capacity(args.passes as usize);
-        let mut decode_legs: Vec<f64> = Vec::with_capacity(args.passes as usize);
+        let mut legs: Vec<bench_runner::TimingResult> = Vec::with_capacity(args.passes as usize);
         for pass in 1..=args.passes {
             pass_number += 1;
             // NAME THE GATE POINTS this pass is about to make.
@@ -447,13 +446,12 @@ fn execute(args: &[String]) -> Result<Option<()>, String> {
                 .map_err(|e| format!("prompt {prompt:?} pass {pass}/{}: {e}", args.passes))?;
             eprintln!(
                 "benchd calibrate-baseline: prompt {prompt:?} pass {pass}/{} measured prefill {} \
-                 s/tok, decode {} s/tok",
+                 s/tok, decode window {} s/tok",
                 args.passes, leg.prefill_seconds_per_token, leg.decode_seconds_per_token
             );
-            prefill_legs.push(leg.prefill_seconds_per_token);
-            decode_legs.push(leg.decode_seconds_per_token);
+            legs.push(leg);
         }
-        measured_legs.push((prefill_legs, decode_legs));
+        measured_legs.push(baseline::control_leg_seconds(&legs));
     }
 
     let captured_at = crate::iterate::iso8601_now();
@@ -491,7 +489,7 @@ fn execute(args: &[String]) -> Result<Option<()>, String> {
     for entry in &calibration.prompts {
         eprintln!(
             "benchd calibrate-baseline: prompt {:?}: {} passes, prefill mean {} s/tok (CV \
-             {:.4}%), decode mean {} s/tok (CV {:.4}%)",
+             {:.4}%), decode window mean {} s/tok (CV {:.4}%)",
             entry.prompt,
             entry.passes,
             entry.prefill_seconds_per_token_mean,

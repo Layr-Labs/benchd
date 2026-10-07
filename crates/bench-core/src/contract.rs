@@ -43,6 +43,21 @@ pub struct PromptPoolEntry {
     pub noop_decode_speedup: Option<f64>,
 }
 
+/// How the paired official run combines its `official_pairs` pairs into the score it seals
+/// (`official_pair_combine` in the track fixture). Each pair has its own composite: the track's
+/// weighted score of its candidate leg over its OWN control leg.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PairCombine {
+    /// The run scores ONE pair: the lower median of the per-pair composites (David 2026-09-17,
+    /// the Laguna rule). The default.
+    #[default]
+    LowerMedian,
+    /// The run scores the arithmetic mean of the per-pair composites (David 2026-10-06: "take the
+    /// mean of 3 prompts instead of taking the median"). Every pair is gated.
+    Mean,
+}
+
 /// The parsed `--contract` track fixture — the ONE typed view of one. Only the fields benchd
 /// consumes are modelled; serde ignores the rest.
 #[derive(Debug, Clone, Deserialize)]
@@ -94,6 +109,10 @@ pub struct Contract {
     /// default — so a box cannot silently run fewer pairs than the track declares.
     #[serde(default)]
     pub official_pairs: Option<u32>,
+    /// HOW THE PAIRED RUN COMBINES ITS PAIRS into one score ([`PairCombine`]). Absent is
+    /// `lower_median`, the rule every track used before this field existed.
+    #[serde(default)]
+    pub official_pair_combine: PairCombine,
     /// THE TIMED TOKEN TOLERANCE of the paired path, in tokens per thousand (David 2026-09-28,
     /// the blanket 10 % rule of 2026-08-25 moved to the single-stream paired path).
     ///
@@ -296,6 +315,7 @@ impl Contract {
         official_scoring_enabled: None,
         allowed_modes: None,
         official_pairs: None,
+        official_pair_combine: PairCombine::LowerMedian,
         timed_token_tolerance_per_thousand: None,
         timed_token_near_tie_relative_gap: None,
         decode_speedup_floor: None,
@@ -1429,6 +1449,28 @@ mod tests {
 #[cfg(test)]
 mod official_pairs_tests {
     use super::*;
+
+    /// Absent is the lower median, `mean` selects the mean, and any other word refuses at parse.
+    #[test]
+    fn the_pair_combine_rule_defaults_to_the_lower_median() {
+        let absent = Contract::parse(br#"{"official_pairs": 3}"#).unwrap();
+        assert_eq!(absent.official_pair_combine, PairCombine::LowerMedian);
+        let median =
+            Contract::parse(br#"{"official_pairs": 3, "official_pair_combine": "lower_median"}"#)
+                .unwrap();
+        assert_eq!(median.official_pair_combine, PairCombine::LowerMedian);
+        let mean =
+            Contract::parse(br#"{"official_pairs": 3, "official_pair_combine": "mean"}"#).unwrap();
+        assert_eq!(mean.official_pair_combine, PairCombine::Mean);
+        assert!(
+            Contract::parse(br#"{"official_pairs": 3, "official_pair_combine": "median"}"#)
+                .is_err()
+        );
+        assert_eq!(
+            Contract::NONE_DECLARED.official_pair_combine,
+            PairCombine::LowerMedian
+        );
+    }
 
     #[test]
     fn the_pair_count_comes_from_the_fixture_alone() {

@@ -64,7 +64,7 @@ pub struct TimingParams {
     /// next step's input, exactly as Swift `measureWorkerDecode` feeds the oracle (not
     /// the engine's own return) forward.
     pub expected_decode_tokens: Vec<i64>,
-    /// Number of `decode_step` calls charged to `decode_seconds_per_token`.
+    /// N — the number of decode tokens `decode_seconds_per_token` divides the decode window by.
     pub decode_steps: usize,
     /// Prefill warmup runs (Swift `benchmarkPrefillWarmupRuns`; 0 by default).
     pub prefill_warmup_runs: usize,
@@ -192,7 +192,8 @@ impl TimingParams {
 pub struct TimingResult {
     /// `prefill_seconds_per_token` = mean timed prefill elapsed / prompt token count.
     pub prefill_seconds_per_token: f64,
-    /// `decode_seconds_per_token` = decode-phase elapsed / `decode_steps`.
+    /// `decode_seconds_per_token` = the DECODE WINDOW / `decode_steps`
+    /// ([`bench_core::score::decode_window_seconds_per_token`]). The seed prefill is not in it.
     pub decode_seconds_per_token: f64,
     /// The `decode_step` count charged (what the seconds-per-token divides by).
     pub decode_steps: usize,
@@ -200,14 +201,13 @@ pub struct TimingResult {
     pub prefill_prompt_tokens: usize,
     /// Mean of the timed prefill round-trip elapsed seconds (raw).
     pub prefill_elapsed_seconds: f64,
-    /// Decode-phase elapsed seconds (decode_begin + steps), raw.
+    /// The DECODE WINDOW, raw seconds: from the close of the seed prefill to the return of the
+    /// decode run. The seed prefill is not in it.
     pub decode_elapsed_seconds: f64,
-    /// benchd's own SPLIT of the free-run decode window at the `free_decode_begin` /
-    /// `free_decode_run` boundary: the seed prefill half and the N-token decode half
-    /// (`docs/scored-regime-and-prefill-window.md`). REPORT-ONLY here: `decode_seconds_per_token`
-    /// keeps dividing the whole window. Carried so a sealed artifact can name the decode-only
-    /// per-token time beside the whole-window one instead of leaving readers to infer it.
-    /// `None` on the teacher-forced v1 decode path, which has no seed forward inside its window.
+    /// benchd's own SPLIT of the free-run timed window at the `free_decode_begin` /
+    /// `free_decode_run` boundary: the seed prefill and the decode window. The seed prefill is
+    /// sealed REPORT-ONLY under its own seed-named key and never feeds a decode figure. `None` on
+    /// the teacher-forced v1 decode path, which times no seed prefill.
     pub phase_window: Option<PhaseWindow>,
     /// Worker-reported peak RAM (GB), max over both phases' `phase_diagnostics`.
     /// Audit-only; never part of the score.
@@ -331,19 +331,20 @@ pub fn run_timed_benchmark<T: LineTransport>(
 pub struct FreeRunTimingResult {
     /// `prefill_seconds_per_token` = mean timed prefill elapsed / prompt token count (v1).
     pub prefill_seconds_per_token: f64,
-    /// `decode_seconds_per_token` = free-run decode-phase elapsed / N verified tokens.
+    /// `decode_seconds_per_token` = the free-run DECODE WINDOW / N verified tokens
+    /// ([`bench_core::score::decode_window_seconds_per_token`]).
     pub decode_seconds_per_token: f64,
-    /// N — the number of externally verified committed tokens the clock covered.
+    /// N — the number of externally verified committed tokens the decode window covered.
     pub verified_tokens: usize,
     /// Prompt token count the prefill seconds-per-token divides by.
     pub prefill_prompt_tokens: usize,
     /// Mean of the timed prefill round-trip elapsed seconds (raw).
     pub prefill_elapsed_seconds: f64,
-    /// Free-run decode-phase elapsed seconds (free_decode_begin + free_decode_run), raw.
+    /// The free-run DECODE WINDOW, raw seconds (`free_decode_run` only; the seed prefill is not in
+    /// it).
     pub decode_elapsed_seconds: f64,
     /// benchd's own SPLIT of the free-run phase's clock at the `free_decode_begin` /
-    /// `free_decode_run` boundary (`docs/scored-regime-and-prefill-window.md`). Report-only unless
-    /// the track's declared regime scores prefill, in which case it is the certified input.
+    /// `free_decode_run` boundary: the seed prefill and the decode window.
     pub phase_window: PhaseWindow,
     /// Worker-reported peak RAM (GB), max over both phases. Audit-only; never scored.
     pub peak_ram_gb: f64,
@@ -362,7 +363,8 @@ pub struct FreeRunTimingResult {
 /// capability on its hello, else benchd REFUSES the mode fail-closed (§2.1) before any work.
 ///
 /// The decode phase drives `free_decode_begin` (seed forward, oracle-verified) then
-/// `free_decode_run(N)`, times the whole begin+run round trip, exact-matches every committed
+/// `free_decode_run(N)`, splits its clock at that boundary and scores the decode window only,
+/// exact-matches every committed
 /// token against `expected_decode_tokens` (§2.7 hard fail on any divergence), and enforces the
 /// §2.6 consistency triple at the phase-close barrier. Any protocol/oracle/barrier failure
 /// propagates and discards the session (fail-closed).
@@ -389,11 +391,11 @@ pub fn run_free_run_timed_benchmark<T: LineTransport>(
 
     Ok(FreeRunTimingResult {
         prefill_seconds_per_token,
-        decode_seconds_per_token: free_run.seconds_per_token,
+        decode_seconds_per_token: free_run.decode_seconds_per_token(),
         verified_tokens: params.decode_steps,
         prefill_prompt_tokens: params.prefill_prompt_tokens.len(),
         prefill_elapsed_seconds,
-        decode_elapsed_seconds: free_run.elapsed_seconds,
+        decode_elapsed_seconds: free_run.phase_window.decode_elapsed_seconds,
         phase_window: free_run.phase_window,
         peak_ram_gb,
         audit: free_run.audit,
@@ -474,21 +476,18 @@ where
     })
 }
 
-/// One v1.1 **free-run** decode phase's parent-measured result: the same shape as [`PhaseTiming`]
-/// plus the §3 AUDIT view and the §5 series tag. The `seconds_per_token` here is
-/// `elapsed / N` over the batched `free_decode_begin` + `free_decode_run(N)` round trip — measured
-/// by benchd's OWN parent clock, exactly as the spec times it (§2.2), and the ONLY scored number.
+/// One v1.1 **free-run** decode phase's parent-measured result plus the §3 AUDIT view and the §5
+/// series tag. The `seconds_per_token` here is the DECODE WINDOW over N
+/// ([`bench_core::score::decode_window_seconds_per_token`]), measured by benchd's OWN parent clock,
+/// and the ONLY scored number. The seed prefill is not in it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct FreeRunPhaseTiming {
-    /// Parent-measured `decode_seconds_per_token` = free-run phase elapsed / N verified tokens.
+    /// Parent-measured `decode_seconds_per_token` = the DECODE WINDOW / N verified tokens.
     pub seconds_per_token: f64,
-    /// Raw free-run decode-phase elapsed seconds (`free_decode_begin` + `free_decode_run`).
-    pub elapsed_seconds: f64,
-    /// benchd's own SPLIT of that same window at the `free_decode_begin` / `free_decode_run`
-    /// boundary (`docs/scored-regime-and-prefill-window.md`): the seed prefill it charges to the
-    /// prefill half, the free-run decode to the decode half, and the whole window measured once.
-    /// The split is measured on EVERY free-run leg; whether anything is ENFORCED on it is the
-    /// declared regime's decision ([`bench_core::prefill_window::certify_prefill_window`]).
+    /// benchd's own SPLIT of the timed window at the `free_decode_begin` / `free_decode_run`
+    /// boundary: the seed prefill and the decode window. The split is measured on EVERY free-run
+    /// leg; whether anything is ENFORCED on the seed half is the declared regime's decision
+    /// ([`bench_core::prefill_window::certify_prefill_window`]).
     pub phase_window: PhaseWindow,
     /// Worker-reported peak RAM (GB) from the phase-close `phase_diagnostics`. Audit-only.
     pub peak_ram_gb: f64,
@@ -501,16 +500,12 @@ pub struct FreeRunPhaseTiming {
     /// The §5 series tag — always [`TIMED_MODE_FREE_RUN_V1_1`], so a caller cannot seal this
     /// number under the teacher-forced series.
     pub timed_mode: &'static str,
-    /// SINGLE-STREAM PREFILL WINDOW (David ruling 2026-08-27, docs/single-stream-prefill-window.md)
-    /// — the same parent-clock split the batched verbs already make, at the same verb boundary:
-    /// this window opens immediately before `free_decode_begin` (the seed prefill) and closes
-    /// immediately after its `seed_token` is validated. `elapsed_seconds` is
-    /// `prefill_elapsed_seconds + decode_elapsed_seconds` BY CONSTRUCTION and `seconds_per_token`
-    /// keeps dividing that whole window, so the enforced figure is unchanged; the two sub-windows
-    /// are the composite's only numeric input (`measure_job::shared_window_composite`).
+    /// The SEED PREFILL window (docs/single-stream-prefill-window.md): opens immediately before
+    /// `free_decode_begin` and closes immediately after its `seed_token` is validated. It is not
+    /// part of the decode figure.
     pub prefill_elapsed_seconds: f64,
-    /// The DECODE sub-window: opens the instant the prefill window closes (no untimed gap),
-    /// closes on `free_decode_run`'s return.
+    /// THE DECODE WINDOW: opens the instant the seed prefill closes (no untimed gap), closes on
+    /// `free_decode_run`'s return. `seconds_per_token` divides this by N.
     pub decode_elapsed_seconds: f64,
     /// The prefill token count: the seed's `decode_seed_tokens.len()`.
     pub prefill_token_total: usize,
@@ -544,7 +539,7 @@ where
 
 /// TIME-ONLY variant of [`run_free_run_decode_phase_fresh`]: the lifecycle (fresh worker, §2.1
 /// capability refusal, cool gate, one timed window) is IDENTICAL and the returned
-/// `seconds_per_token` is computed the SAME WAY (parent wall-clock ÷ committed tokens) — the ONLY
+/// `seconds_per_token` is computed the SAME WAY (decode window ÷ committed tokens) — the ONLY
 /// difference is that a §2.7 committed-token divergence is TOLERATED rather than fatal
 /// ([`VerifyMode::TimeOnly`]).
 ///
@@ -598,8 +593,7 @@ where
     let mut peak_ram_gb = 0.0_f64;
     let m = measure_free_run_decode(&mut session, params, verify, &mut peak_ram_gb)?;
     Ok(FreeRunPhaseTiming {
-        seconds_per_token: m.seconds_per_token,
-        elapsed_seconds: m.elapsed_seconds,
+        seconds_per_token: m.decode_seconds_per_token(),
         phase_window: m.phase_window,
         peak_ram_gb,
         effective_spec: m.effective_spec,
@@ -729,58 +723,33 @@ impl CohortTimingParams {
 /// One v1.2 BATCHED free-run decode phase's parent-measured result — the cohort counterpart of
 /// [`FreeRunPhaseTiming`].
 ///
-/// RED-TEAM REVERT (2026-08-23) — an earlier revision of this struct redefined `seconds_per_token`
-/// to the DECODE window alone (`decode_elapsed_seconds / (B * N)`). That redefinition is REVERTED
-/// here: `seconds_per_token` / `elapsed_seconds` are, AGAIN, the pre-existing WHOLE-WINDOW ENFORCED
-/// metric (clock opens before `free_decode_begin`, closes on `free_decode_run`'s return, divided by
-/// the full `B * N`) — UNCHANGED semantics from before this feature landed. The decode-only
-/// redefinition was caught as UNAUTHORIZED (no ruling asked for it) and FRONT-LOADABLE: excluding
-/// `free_decode_begin` from the enforced denominator lets an adversary shift decode-shaped compute
-/// into the prefill call, where it would go uncounted. The single-stream v1.1 series still charges
-/// its seed forward inside its one enforced window (`prefill_component: "none"`, by design), so a
-/// decode-only cohort metric would ALSO have been inconsistent across series, not just exploitable.
-///
-/// COMPOSITE (Gemma cohort scoring, David ruling 2026-08-23) — the clock is ADDITIONALLY split into
-/// two CONTIGUOUS sub-windows, `prefill_elapsed_seconds` (brackets `free_decode_begin` — the B-seed
-/// prefill: each stream's `decode_seed_tokens` forward, returning `seed_token_by_stream`) and
-/// `decode_elapsed_seconds` (brackets `free_decode_run` — the free-run decode of N tokens per
-/// stream). These two fields are DIAGNOSTICS ONLY — nothing enforced reads them; `seconds_per_token`
-/// keeps dividing the WHOLE window as above. ANTI-CHEAT INVARIANT, still enforced structurally: the
-/// two windows are BOTH charged and CONTIGUOUS — `decode_elapsed_seconds`'s clock opens the INSTANT
-/// `prefill_elapsed_seconds`'s clock closes (see [`measure_batched_free_run_decode`]), so there is
-/// no untimed gap between `free_decode_begin` returning and `free_decode_run` being issued in which
-/// precomputation could hide, and `elapsed_seconds` is their sum BY CONSTRUCTION (never an
-/// independently re-measured total) — this is what "the sum of the two diagnostic windows equals
-/// the enforced whole window" means structurally, not just numerically. These two phase
-/// sub-windows are ALSO the composite score's only numeric input (the SHARED-WINDOW ruling —
-/// `measure_job::shared_window_composite` sums them across the accepted pairs and takes one ratio
-/// per component). That is a SECOND published quantity over this SAME parent clock; it changes
-/// nothing about `seconds_per_token`, which stays the whole-window enforced figure defined above.
+/// The clock is split into two CONTIGUOUS windows: `prefill_elapsed_seconds` (brackets
+/// `free_decode_begin`, the B-seed prefill: each stream's `decode_seed_tokens` forward, returning
+/// `seed_token_by_stream`) and `decode_elapsed_seconds` (brackets `free_decode_run`, the free-run
+/// decode of N tokens per stream). `decode_elapsed_seconds`'s clock opens the INSTANT
+/// `prefill_elapsed_seconds`'s clock closes (see [`measure_batched_free_run_decode`]), so no
+/// untimed gap lies between them. `seconds_per_token` is the DECODE WINDOW over `B * N`
+/// ([`bench_core::score::decode_window_seconds_per_token`]); the seed prefill is not in it. The
+/// two windows are the cohort composite's only numeric input
+/// (`measure_job::shared_window_composite` sums them across the accepted pairs and takes one
+/// ratio per component).
 #[derive(Debug, Clone, PartialEq)]
 pub struct BatchedFreeRunPhaseTiming {
-    /// ENFORCED — parent-measured COHORT seconds-per-committed-token = `elapsed_seconds / (B * N)`.
-    /// The WHOLE window (clock opens before `free_decode_begin`, closes on `free_decode_run`'s
-    /// return) — never a union of per-stream windows, never the decode sub-window alone — divided
-    /// by the full `B * N`, never `Σ(N − 1)`. UNCHANGED from this struct's pre-composite semantics.
+    /// Parent-measured COHORT decode seconds-per-committed-token = the DECODE WINDOW over the full
+    /// `B * N` ([`bench_core::score::decode_window_seconds_per_token`]) — never a union of
+    /// per-stream windows, never `Σ(N − 1)`.
     pub seconds_per_token: f64,
-    /// ENFORCED — raw batched free-run phase elapsed seconds, the WHOLE window:
-    /// `prefill_elapsed_seconds + decode_elapsed_seconds`, by construction (never independently
-    /// re-measured) — this sum IS what `seconds_per_token` divides by `B * N`.
-    pub elapsed_seconds: f64,
-    /// DIAGNOSTIC ONLY (nothing enforced reads this) — the PREFILL sub-window: parent clock opened
-    /// immediately before `free_decode_begin_batched`, closed immediately after validating its
-    /// response (the seed oracle checks are charged to this window — see
-    /// [`measure_batched_free_run_decode`]).
+    /// The SEED PREFILL window: parent clock opened immediately before
+    /// `free_decode_begin_batched`, closed immediately after validating its response (the seed
+    /// oracle checks are charged to this window — see [`measure_batched_free_run_decode`]).
     pub prefill_elapsed_seconds: f64,
-    /// DIAGNOSTIC ONLY — the DECODE sub-window: parent clock opened the instant the prefill window
-    /// closed (no untimed gap), closed on `free_decode_run_batched`'s return.
+    /// THE DECODE WINDOW: parent clock opened the instant the seed prefill closed (no untimed gap),
+    /// closed on `free_decode_run_batched`'s return.
     pub decode_elapsed_seconds: f64,
-    /// DIAGNOSTIC ONLY — the PREFILL token total: the B streams' `decode_seed_tokens` lengths,
-    /// summed ("the 8 seeds' prompt tokens", David's ruling). NOT currently a scoring input — see
-    /// the per-stream-vs-shared-window note above.
+    /// The seed PREFILL token total: the B streams' `decode_seed_tokens` lengths, summed ("the 8
+    /// seeds' prompt tokens", David's ruling).
     pub prefill_token_total: usize,
-    /// DIAGNOSTIC ONLY — the DECODE token total: `B * N` committed tokens (the same divisor
-    /// `seconds_per_token` uses, sealed here again for transparency on the sub-window split).
+    /// The DECODE token total: `B * N` committed tokens (the divisor `seconds_per_token` uses).
     pub decode_token_total: usize,
     /// Worker-reported peak RAM (GB) from the phase-close `phase_diagnostics`. Audit-only.
     pub peak_ram_gb: f64,
@@ -802,8 +771,8 @@ pub struct BatchedFreeRunPhaseTiming {
     /// ([`WorkerResponse::prefill_ns_by_stream`](bench_protocol::WorkerResponse::prefill_ns_by_stream)),
     /// carried VERBATIM (no sums, ratios, or seconds conversions). `None` when the response
     /// carried no vector. UNTRUSTED for scoring (engine-reported-time-untrusted / parent-clock
-    /// doctrine): nothing enforced reads this — `seconds_per_token` / `elapsed_seconds` above
-    /// remain parent-clock only. Consumed by the per-stream attestation seal (PR-B) via
+    /// doctrine): nothing enforced reads this — `seconds_per_token` above remains parent-clock
+    /// only. Consumed by the per-stream attestation seal (PR-B) via
     /// `bench_core::per_stream_attestation`.
     pub prefill_ns_by_stream: Option<Vec<u64>>,
     /// REPORT-ONLY (gap G1) — the engine-reported per-slot monotonic nanoseconds from the batched
@@ -878,14 +847,11 @@ where
     cool_gate("decode")?;
     let mut peak_ram_gb = 0.0_f64;
     let m = measure_batched_free_run_decode(&mut session, params, &mut peak_ram_gb)?;
-    // RED-TEAM REVERT — BY CONSTRUCTION, never independently re-measured — see the anti-cheat
-    // invariant note on the struct. `elapsed_seconds` is the WHOLE window (ENFORCED); the two
-    // sub-windows below are diagnostics only.
-    let elapsed_seconds = m.prefill_elapsed_seconds + m.decode_elapsed_seconds;
     Ok(BatchedFreeRunPhaseTiming {
-        // ENFORCED — the whole window over B * N, restored to pre-composite semantics.
-        seconds_per_token: elapsed_seconds / m.decode_token_total as f64,
-        elapsed_seconds,
+        seconds_per_token: bench_core::score::decode_window_seconds_per_token(
+            m.decode_elapsed_seconds,
+            m.decode_token_total,
+        ),
         prefill_elapsed_seconds: m.prefill_elapsed_seconds,
         decode_elapsed_seconds: m.decode_elapsed_seconds,
         prefill_token_total: m.prefill_token_total,
@@ -895,11 +861,9 @@ where
         audit: m.audit,
         timed_mode: timed_mode_batched_free_run(params.batch_size),
         batch_size: params.batch_size,
-        // REPORT-ONLY per-stream carry (gaps G1/G3) — inert cargo in this PR: the engine-reported
-        // per-slot ns vectors, the verbatim K_slot counts, and the advertisement flag ride along
-        // for the attestation seal (PR-B). Nothing above this comment changed: the ENFORCED
-        // whole-window `seconds_per_token` / `elapsed_seconds` assembly is byte-identical and
-        // reads none of these fields.
+        // REPORT-ONLY per-stream carry (gaps G1/G3): the engine-reported per-slot ns vectors, the
+        // verbatim K_slot counts, and the advertisement flag ride along for the attestation seal.
+        // `seconds_per_token` above reads none of these fields.
         prefill_ns_by_stream: m.prefill_ns_by_stream,
         decode_ns_by_stream: m.decode_ns_by_stream,
         tokens_len_by_stream: m.tokens_len_by_stream,
@@ -960,17 +924,14 @@ where
     }
     cool_gate("decode")?;
     let m = measure_free_run_decode(session, params, verify, &mut peak_ram_gb)?;
-    // The whole free-run window, read once end to end, over N.
-    let decode_elapsed_seconds = m.elapsed_seconds;
-    let decode_seconds_per_token = decode_elapsed_seconds / params.decode_steps as f64;
 
     Ok(TimingResult {
         prefill_seconds_per_token,
-        decode_seconds_per_token,
+        decode_seconds_per_token: m.decode_seconds_per_token(),
         decode_steps: params.decode_steps,
         prefill_prompt_tokens: params.prefill_prompt_tokens.len(),
         prefill_elapsed_seconds,
-        decode_elapsed_seconds,
+        decode_elapsed_seconds: m.phase_window.decode_elapsed_seconds,
         phase_window: Some(m.phase_window),
         peak_ram_gb,
         effective_spec: m.effective_spec,
@@ -1052,11 +1013,10 @@ fn measure_prefill<T: LineTransport>(
     Ok((seconds_per_token, mean_elapsed))
 }
 
-/// Decode phase: the clock starts BEFORE `decode_begin` so speculative/seed setup is
-/// charged to the score (Constants comment: charging setup prevents precomputing
-/// future decode tokens in an unscored seed-prefill phase). Sequence:
-/// start Instant → `decode_begin(seed)` → `decode_steps` × `decode_step(token)`
-/// TEACHER-FORCING the golden oracle token as each next input → stop Instant. The
+/// Teacher-forced decode phase. Sequence: `decode_begin(seed)` (the seed prefill, outside the
+/// decode clock) → start Instant → `decode_steps` × `decode_step(token)` TEACHER-FORCING the
+/// golden oracle token as each next input → stop Instant. The clock covers the decode steps only:
+/// decode is the decode window ([`bench_core::score::decode_window_seconds_per_token`]). The
 /// barrier then verifies `completed_work == 1 + decode_steps`.
 ///
 /// Two oracle checks mirror Swift `measureWorkerDecode` (`compareDecodeSeedToken` and the
@@ -1078,17 +1038,11 @@ fn measure_decode<T: LineTransport>(
 ) -> Result<(f64, f64, Option<SpecConfig>)> {
     session.begin_phase();
 
-    // The scored wall clock starts HERE — before the `decode_begin_spec` call below. Cycle-5
-    // finding 6: any check inside `decode_begin_spec` (the spec-mode runnability refusal, the spec
-    // echo) therefore runs with this clock ALREADY RUNNING. Such a check is "before the timed seed
-    // forward" — which is what makes a refusal harmless, since the session is discarded and never
-    // scored — but it is NOT "pre-clock", and describing it that way misstates this ordering.
-    let start = Instant::now();
-    // H3 (cycle-3) — arm the RunTimeout deadline over the timed decode round-trips (§2.2/§4): a hung
+    // H3 (cycle-3) — arm the RunTimeout deadline over the decode round-trips (§2.2/§4): a hung
     // engine raises `RunTimeout` and the session is discarded, instead of wedging here forever. The
     // deadline is disarmed after the timed window so the untimed close-phase barrier is unbounded.
     if let Some(budget) = params.run_timeout {
-        session.arm_run_deadline(start + budget, budget.as_secs_f64());
+        session.arm_run_deadline(Instant::now() + budget, budget.as_secs_f64());
     }
     // Spec-never-ignored: `decode_begin_spec` discards the session fail-closed if the engine's echoed
     // `effective_spec` diverges from `params.spec` (§6). The echoed spec is what benchd seals.
@@ -1105,6 +1059,8 @@ fn measure_decode<T: LineTransport>(
             actual: seed_token,
         });
     }
+    // THE DECODE WINDOW opens here, after the seed prefill and its oracle check.
+    let start = Instant::now();
     for decoded_step in 0..params.decode_steps {
         // Teacher-force the ORACLE token forward: seed for step 0, then the previous
         // expected decode token (Swift `inputToken = decodedStep == 0 ? expectedSeedToken
@@ -1141,20 +1097,21 @@ fn measure_decode<T: LineTransport>(
         }
     }
 
-    let seconds_per_token = elapsed / params.decode_steps as f64;
+    let seconds_per_token =
+        bench_core::score::decode_window_seconds_per_token(elapsed, params.decode_steps);
     Ok((seconds_per_token, elapsed, effective_spec))
 }
 
-/// v1.1 free-run decode phase (PROTOCOL-v1.1.md §2.2). The clock starts BEFORE
-/// `free_decode_begin` (seed setup is charged, §2.5), which the driver oracle-checks against
-/// `expected_decode_seed_token`. Then `free_decode_run(N)` free-runs the engine's own MTP loop
+/// v1.1 free-run decode phase (PROTOCOL-v1.1.md §2.2). The seed-prefill clock starts BEFORE
+/// `free_decode_begin`, which the driver oracle-checks against `expected_decode_seed_token`. The
+/// DECODE WINDOW opens the instant that check is done. Then `free_decode_run(N)` free-runs the engine's own MTP loop
 /// and returns all N committed tokens in one response; the clock stops on its return, and every
 /// committed token is exact-matched against `expected_decode_tokens[i]` (§2.7 hard fail). The
 /// phase-close barrier (OUTSIDE the timed window) then enforces the §2.6 consistency triple.
 ///
 /// The engine free-runs its OWN committed tokens forward — unlike v1's `measure_decode`, no
 /// oracle token is teacher-forced back during the run; benchd only verifies the committed
-/// stream. Returns `(decode_seconds_per_token, elapsed, audit)`.
+/// stream. Returns the split window, the audit and the emitted tokens.
 ///
 /// `verify` gates the §2.7 per-token exact-match ABORT AND the seed-forward exact-match abort
 /// (the two oracle checks — nothing else in the timed window or the barrier depends on it):
@@ -1213,25 +1170,18 @@ fn measure_free_run_decode<T: LineTransport>(
             actual: seed_token,
         });
     }
-    // The SPLIT (`docs/scored-regime-and-prefill-window.md`): ONE reading of benchd's own clock
-    // serves as both the close of the prefill window and the open of the decode window, so the two
-    // are contiguous with no untimed gap between them. It sits after the seed-oracle check because
-    // §2.5 charges the seed setup — and the check that holds the engine to it — to the prefill
-    // window. No new message and no engine-reported duration: the boundary benchd splits on is the
-    // message boundary it already drives.
-    // DECODE window: opens the instant the prefill window closed (no untimed gap in which
-    // precomputation could hide), closes on `free_decode_run`'s return.
+    // The SPLIT: ONE reading of benchd's own clock serves as both the close of the seed prefill
+    // and the open of the decode window, so the two are contiguous with no untimed gap between
+    // them. It sits after the seed-oracle check, which is charged to the seed prefill. No new
+    // message and no engine-reported duration: the boundary benchd splits on is the message
+    // boundary it already drives.
+    // DECODE WINDOW: opens the instant the seed prefill closed, closes on `free_decode_run`'s
+    // return. Decode seconds per token divides this, and only this, by N.
     let decode_start = Instant::now();
     let prefill_elapsed = decode_start.duration_since(prefill_start).as_secs_f64();
 
     let run = session.free_decode_run(n)?;
-    // TWO clock readings bound the WHOLE window and split it: `decode_start` (the split, above)
-    // and this one. The whole window is their span, so it is exactly the sum of the two
-    // contiguous halves — there is no untimed gap for the sum to lose and no third reading for it
-    // to disagree with. `seconds_per_token` divides that same whole window, so the split cannot
-    // move a scored number.
     let decode_elapsed = decode_start.elapsed().as_secs_f64();
-    let elapsed = prefill_elapsed + decode_elapsed;
     // H3 (cycle-3) — timed window closed; the close-phase barrier / verification below is UNTIMED.
     session.disarm_run_deadline();
 
@@ -1260,7 +1210,7 @@ fn measure_free_run_decode<T: LineTransport>(
     // `verify` gates ONLY the abort: under `VerifyMode::TimeOnly` (the `measure-noop` noop-RATE
     // path) the loop still WALKS every token, but a divergence does not abort — the stock engine
     // legitimately diverges from the teacher-forced tape under free-run, and a rate measurement
-    // must tolerate that. Everything outside this `if` (the timed `elapsed` captured above, the
+    // must tolerate that. Everything outside this `if` (the timed windows captured above, the
     // §2.4 count invariant, the audit assembly and the §2.6 barrier below) is unchanged and
     // identical across both modes.
     for (step, &expected) in params
@@ -1322,14 +1272,10 @@ fn measure_free_run_decode<T: LineTransport>(
         }
     }
 
-    let seconds_per_token = elapsed / n_usize as f64;
     Ok(FreeRunDecodeMeasurement {
-        seconds_per_token,
-        elapsed_seconds: elapsed,
         phase_window: PhaseWindow {
             seed_prefill_elapsed_seconds: prefill_elapsed,
             decode_elapsed_seconds: decode_elapsed,
-            whole_window_elapsed_seconds: elapsed,
             prefill_token_total: params.decode_seed_tokens.len(),
             decode_token_total: n_usize,
         },
@@ -1339,20 +1285,11 @@ fn measure_free_run_decode<T: LineTransport>(
     })
 }
 
-/// One v1.1 free-run decode phase as [`measure_free_run_decode`] measured it: the scored
-/// whole-window numbers, the clock SPLIT at the `free_decode_begin` / `free_decode_run` boundary
-/// into the two CONTIGUOUS sub-windows (docs/single-stream-prefill-window.md §2), and the engine
-/// echoes. A struct rather than a tuple because the split makes six returns, and a caller must
-/// not be able to mistake one duration for another.
-///
-/// The whole window is bounded by TWO clock readings — the split and the close — so
-/// `elapsed_seconds` IS the sum of the two contiguous halves, with no untimed gap between them
-/// and no third reading to disagree with. The split therefore cannot move a scored number. The
-/// halves live in [`PhaseWindow`].
+/// One v1.1 free-run decode phase as [`measure_free_run_decode`] measured it: the clock SPLIT at
+/// the `free_decode_begin` / `free_decode_run` boundary into the seed prefill and the decode
+/// window (docs/single-stream-prefill-window.md §2), and the engine echoes.
 #[derive(Debug)]
 struct FreeRunDecodeMeasurement {
-    seconds_per_token: f64,
-    elapsed_seconds: f64,
     phase_window: PhaseWindow,
     audit: FreeRunAudit,
     effective_spec: Option<SpecConfig>,
@@ -1360,26 +1297,27 @@ struct FreeRunDecodeMeasurement {
     emitted_tokens: Vec<i64>,
 }
 
+impl FreeRunDecodeMeasurement {
+    /// The decode seconds per token: the decode window over N. The one definition.
+    fn decode_seconds_per_token(&self) -> f64 {
+        bench_core::score::decode_window_seconds_per_token(
+            self.phase_window.decode_elapsed_seconds,
+            self.phase_window.decode_token_total,
+        )
+    }
+}
+
 /// v1.2 BATCHED free-run decode phase — [`measure_free_run_decode`] generalized to the cohort.
 ///
-/// COMPOSITE (Gemma cohort scoring, David ruling 2026-08-23) — the clock is ADDITIONALLY split
-/// into TWO CONTIGUOUS DIAGNOSTIC sub-windows on top of the one ENFORCED whole window:
+/// The clock is split into TWO CONTIGUOUS windows:
 ///
-/// 1. PREFILL window — opens BEFORE the batched `free_decode_begin` (seed setup is charged;
-///    charging setup prevents precomputing decode tokens in an unscored phase), closes AFTER the
-///    seed-token oracle checks below. Charging the oracle checks to this window (rather than
-///    leaving them in an untimed gap between the two windows) is the ANTI-CHEAT INVARIANT: every
-///    instruction between `free_decode_begin` returning and `free_decode_run` being issued is
-///    charged to ONE of the two windows, never to neither.
-/// 2. DECODE window — opens THE INSTANT the prefill window closes (the next statement after
+/// 1. SEED PREFILL window — opens BEFORE the batched `free_decode_begin`, closes AFTER the
+///    seed-token oracle checks below. Every instruction between `free_decode_begin` returning and
+///    `free_decode_run` being issued is charged to ONE of the two windows, never to neither.
+/// 2. DECODE WINDOW — opens THE INSTANT the seed prefill closes (the next statement after
 ///    `prefill_elapsed_seconds` is read is `Instant::now()` for the decode window — no
-///    intervening work), closes on `free_decode_run`'s return.
-///
-/// RED-TEAM REVERT — this function does NOT compute a decode-only `seconds_per_token` (an earlier
-/// revision did; that was the unauthorized, front-loadable redefinition of the ENFORCED metric,
-/// reverted). The caller computes the ENFORCED whole-window `seconds_per_token` itself, from
-/// `prefill_elapsed_seconds + decode_elapsed_seconds`; the two sub-windows this function returns
-/// are sealed as diagnostics only.
+///    intervening work), closes on `free_decode_run`'s return. The caller divides this, and only
+///    this, by `B * N` ([`bench_core::score::decode_window_seconds_per_token`]).
 ///
 /// Every slot's seed token is exact-matched against that slot's golden (hard fail on any divergence).
 /// (b) admission — the `B * N` committed tokens are NO LONGER exact-matched inline against the static
@@ -1389,15 +1327,10 @@ struct FreeRunDecodeMeasurement {
 /// cohort consistency quadruple.
 ///
 /// The raw measurement [`measure_batched_free_run_decode`] returns, BEFORE the caller folds in
-/// `peak_ram_gb` / `timed_mode` / `batch_size` (and computes the ENFORCED `seconds_per_token` from
-/// the whole window) to assemble the public [`BatchedFreeRunPhaseTiming`]. A named struct rather
-/// than a long tuple (clippy::type_complexity) — the fields ARE (most of)
-/// [`BatchedFreeRunPhaseTiming`]'s fields, so see that struct's doc for what each one means and the
-/// anti-cheat invariant they jointly prove. No `seconds_per_token` here — the caller computes the
-/// ENFORCED whole-window figure itself from `prefill_elapsed_seconds + decode_elapsed_seconds`,
-/// never a decode-only figure this struct would otherwise tempt someone to read directly (RED-TEAM
-/// REVERT: that redefinition is exactly the front-loadable bug this shape now makes harder to
-/// reintroduce by accident).
+/// `peak_ram_gb` / `timed_mode` / `batch_size` and computes `seconds_per_token` from the decode
+/// window to assemble the public [`BatchedFreeRunPhaseTiming`]. A named struct rather than a long
+/// tuple (clippy::type_complexity) — the fields ARE (most of) [`BatchedFreeRunPhaseTiming`]'s
+/// fields, so see that struct's doc for what each one means.
 struct BatchedFreeRunDecodeMeasurement {
     prefill_elapsed_seconds: f64,
     decode_elapsed_seconds: f64,
@@ -1615,12 +1548,8 @@ fn measure_batched_free_run_decode<T: LineTransport>(
         }
     }
 
-    // D1 — RED-TEAM REVERT: the caller (`run_batched_free_run_decode_phase_fresh`) computes the
-    // ENFORCED cohort seconds-per-committed-token from the WHOLE window
-    // (`prefill_elapsed_seconds + decode_elapsed_seconds`) divided by the full B x N rectangle —
-    // this function no longer computes (or names) a decode-only spt at all, so there is nothing
-    // here that could accidentally become the enforced figure again. `decode_token_total` is
-    // still B * N (the divisor the caller uses); sealed here purely as the diagnostic token count.
+    // The caller (`run_batched_free_run_decode_phase_fresh`) divides the decode window by
+    // `decode_token_total` = B * N.
     let decode_token_total = b_usize * n_usize;
     Ok(BatchedFreeRunDecodeMeasurement {
         prefill_elapsed_seconds: prefill_elapsed,
@@ -2134,9 +2063,8 @@ mod tests {
     }
 
     /// SINGLE-STREAM PREFILL WINDOW (docs/single-stream-prefill-window.md §2): the phase result
-    /// carries the two contiguous sub-windows, the whole window is their sum BY CONSTRUCTION, the
-    /// enforced `seconds_per_token` divides that whole window, and the token totals name the seed
-    /// length and N.
+    /// carries the seed prefill and the decode window, `seconds_per_token` divides the decode
+    /// window only, and the token totals name the seed length and N.
     #[test]
     fn free_run_phase_splits_the_parent_clock_at_the_verb_boundary() {
         let mut spawn = || Session::connect(free_run_engine(8)).map(|(s, _)| s);
@@ -2144,11 +2072,7 @@ mod tests {
         let t = run_free_run_decode_phase_fresh(&mut spawn, &mut gate, &params(8)).unwrap();
         assert!(t.prefill_elapsed_seconds.is_finite() && t.prefill_elapsed_seconds >= 0.0);
         assert!(t.decode_elapsed_seconds.is_finite() && t.decode_elapsed_seconds >= 0.0);
-        assert_eq!(
-            t.elapsed_seconds,
-            t.prefill_elapsed_seconds + t.decode_elapsed_seconds
-        );
-        assert_eq!(t.seconds_per_token, t.elapsed_seconds / 8.0);
+        assert_eq!(t.seconds_per_token, t.decode_elapsed_seconds / 8.0);
         assert_eq!(t.prefill_token_total, params(8).decode_seed_tokens.len());
         assert_eq!(t.decode_token_total, 8);
         assert_eq!(t.timed_mode, "free_run_v1_1");
@@ -2564,11 +2488,56 @@ mod tests {
         );
     }
 
+    /// DECODE MEANS THE DECODE WINDOW (David 2026-10-07), on the real clock: a seed prefill that
+    /// takes 300 ms lands in the seed window and nowhere in the decode figure, on the fresh-phase
+    /// path measure-job drives and on the resident path official, calibrate-baseline and iterate
+    /// drive.
     #[test]
-    fn free_run_phase_split_is_contiguous_and_sums_to_the_whole_window() {
-        // The clock SPLIT (`docs/scored-regime-and-prefill-window.md`): benchd brackets the seed
-        // prefill with `free_decode_begin` and the free-run decode with `free_decode_run`, on its
-        // own clock, at the message boundary it already drives.
+    fn slow_seed_prefill_is_never_charged_to_decode_seconds_per_token() {
+        let seed_delay = std::time::Duration::from_millis(300);
+        let slow_seed = || free_run_engine(8).sleep_on("free_decode_begin", seed_delay);
+
+        let mut spawn = || Session::connect(slow_seed()).map(|(s, _)| s);
+        let mut gate = |_: &str| Ok(());
+        let fresh = run_free_run_decode_phase_fresh(&mut spawn, &mut gate, &params(8)).unwrap();
+        assert!(fresh.phase_window.seed_prefill_elapsed_seconds >= 0.3);
+        assert_eq!(
+            fresh.seconds_per_token,
+            fresh.phase_window.decode_elapsed_seconds / 8.0
+        );
+        assert!(
+            fresh.seconds_per_token * 8.0 < 0.1,
+            "decode {} s/tok carries the 300 ms seed prefill",
+            fresh.seconds_per_token
+        );
+
+        let (mut session, _) = Session::connect(slow_seed()).unwrap();
+        let resident = run_timed_benchmark_persistent_on_session(
+            &mut session,
+            &mut |_: &str| Ok(()),
+            &params(8),
+            VerifyMode::Verify,
+        )
+        .unwrap();
+        let w = resident.phase_window.unwrap();
+        assert!(w.seed_prefill_elapsed_seconds >= 0.3);
+        assert_eq!(resident.decode_elapsed_seconds, w.decode_elapsed_seconds);
+        assert_eq!(
+            resident.decode_seconds_per_token,
+            w.decode_elapsed_seconds / 8.0
+        );
+        assert!(
+            resident.decode_seconds_per_token * 8.0 < 0.1,
+            "decode {} s/tok carries the 300 ms seed prefill",
+            resident.decode_seconds_per_token
+        );
+    }
+
+    #[test]
+    fn free_run_phase_split_measures_both_windows_and_decode_divides_only_the_decode_window() {
+        // The clock SPLIT: benchd brackets the seed prefill with `free_decode_begin` and the
+        // free-run decode with `free_decode_run`, on its own clock, at the message boundary it
+        // already drives.
         let mut spawn = || -> Result<Session<MockEngine>> {
             let (session, _hello) =
                 Session::connect(free_run_engine(8).free_run_acceptance_lengths(vec![3, 3, 2]))?;
@@ -2581,27 +2550,13 @@ mod tests {
         // Both halves are real, measurable intervals.
         assert!(w.seed_prefill_elapsed_seconds.is_finite() && w.seed_prefill_elapsed_seconds > 0.0);
         assert!(w.decode_elapsed_seconds.is_finite() && w.decode_elapsed_seconds > 0.0);
-        // The whole window is the SAME number the scored seconds-per-token divides — measured once,
-        // end to end, not rebuilt from the halves.
-        assert_eq!(w.whole_window_elapsed_seconds, timing.elapsed_seconds);
         assert_eq!(
             timing.seconds_per_token,
-            timing.elapsed_seconds / 8.0,
-            "the split must not change what seconds_per_token divides"
-        );
-        // Contiguous: no untimed gap, no overlap. The halves account for the whole window to well
-        // inside the certification tolerance.
-        let split_total = w.seed_prefill_elapsed_seconds + w.decode_elapsed_seconds;
-        let gap =
-            (split_total - w.whole_window_elapsed_seconds).abs() / w.whole_window_elapsed_seconds;
-        assert!(
-            gap <= bench_core::prefill_window::PREFILL_WINDOW_TOLERANCE,
-            "prefill {} + decode {} = {split_total} vs whole {} (relative gap {gap})",
-            w.seed_prefill_elapsed_seconds,
-            w.decode_elapsed_seconds,
-            w.whole_window_elapsed_seconds
+            w.decode_elapsed_seconds / 8.0,
+            "decode seconds per token divides the decode window, never the seed prefill"
         );
         // The token totals are benchd's OWN configured counts: the seed length and N.
+        assert_eq!(w.prefill_token_total, params(8).decode_seed_tokens.len()); // The token totals are benchd's OWN configured counts: the seed length and N.
         assert_eq!(w.prefill_token_total, params(8).decode_seed_tokens.len());
         assert_eq!(w.decode_token_total, 8);
 
@@ -2846,23 +2801,13 @@ mod tests {
         assert_eq!(timing.timed_mode, "batched_free_run_v1_2_b8");
         assert_eq!(timing.batch_size, 8);
         assert!(timing.seconds_per_token.is_finite() && timing.seconds_per_token >= 0.0);
-        // RED-TEAM REVERT — spt is the ENFORCED WHOLE-window figure / (B * N) = 32, exactly as
-        // before the composite phase split (the split only ADDS diagnostic sub-windows).
-        assert!(
-            (timing.seconds_per_token - timing.elapsed_seconds / 32.0).abs() <= f64::EPSILON,
-            "cohort spt must be elapsed_seconds / (B * N), the WHOLE window, not the decode \
-             sub-window alone"
+        // spt is the DECODE WINDOW / (B * N) = 32. The seed prefill is not in it.
+        assert_eq!(
+            timing.seconds_per_token,
+            timing.decode_elapsed_seconds / 32.0,
+            "cohort spt must be the decode window over B * N"
         );
         assert_eq!(timing.decode_token_total, 32, "B * N = 8 * 4");
-        // ANTI-CHEAT — the two windows are contiguous and BY CONSTRUCTION sum to the total: no
-        // untimed gap, no independently re-measured total.
-        assert!(
-            (timing.elapsed_seconds
-                - (timing.prefill_elapsed_seconds + timing.decode_elapsed_seconds))
-                .abs()
-                <= f64::EPSILON,
-            "elapsed_seconds must equal prefill_elapsed_seconds + decode_elapsed_seconds exactly"
-        );
         assert!(
             timing.prefill_elapsed_seconds >= 0.0 && timing.prefill_elapsed_seconds.is_finite()
         );
@@ -2933,8 +2878,6 @@ mod tests {
              {untimed_gap}s — far more than the sub-millisecond overhead an in-process mock call \
              should cost; this would indicate hidden untimed work outside the two windows"
         );
-        // The struct's own invariant: `elapsed_seconds` is the SUM, never independently measured.
-        assert_eq!(timing.elapsed_seconds, inner_total);
     }
 
     #[test]
@@ -3028,9 +2971,8 @@ mod tests {
     #[test]
     fn per_stream_vectors_are_inert_cargo_enforced_metric_untouched() {
         // #182 doctrine (enforced-surface trace) — the carried engine-reported ns are ABSURD
-        // (hours per slot): if they ever fed the enforced assembly, `seconds_per_token` /
-        // `elapsed_seconds` would explode. They must not — the enforced figures stay the
-        // parent-clock whole window, identical in form to every pre-carry run.
+        // (hours per slot): if they ever fed the enforced assembly, `seconds_per_token` would
+        // explode. It must not — it stays the parent-clock decode window over B * N.
         let hour_ns = 3_600_000_000_000u64;
         let mut spawn = move || -> Result<Session<MockEngine>> {
             Session::connect(
@@ -3043,23 +2985,19 @@ mod tests {
         let timing =
             run_batched_free_run_decode_phase_fresh(&mut spawn, &mut gate, &cohort_params(8, 4))
                 .unwrap();
-        // The enforced relations, unchanged: whole window / (B * N), sum-by-construction.
-        assert!(
-            (timing.seconds_per_token - timing.elapsed_seconds / 32.0).abs() <= f64::EPSILON,
-            "spt must remain the parent-clock WHOLE window over B * N"
-        );
         assert_eq!(
-            timing.elapsed_seconds,
-            timing.prefill_elapsed_seconds + timing.decode_elapsed_seconds,
-            "elapsed_seconds must remain the by-construction sum of the two parent windows"
+            timing.seconds_per_token,
+            timing.decode_elapsed_seconds / 32.0,
+            "spt must remain the parent-clock decode window over B * N"
         );
         // And the parent clock is what it is — an in-process mock run takes well under a minute,
         // while the engine CLAIMED 3 hours per slot. Engine-reported time never entered.
         assert!(
-            timing.elapsed_seconds < 60.0,
-            "enforced elapsed_seconds ({}) must be the parent clock, not the engine's claimed \
+            timing.decode_elapsed_seconds + timing.prefill_elapsed_seconds < 60.0,
+            "the parent windows ({} s, {} s) must be the parent clock, not the engine's claimed \
              hours",
-            timing.elapsed_seconds
+            timing.prefill_elapsed_seconds,
+            timing.decode_elapsed_seconds
         );
         assert_eq!(timing.decode_ns_by_stream, Some(vec![2 * hour_ns; 8]));
     }
@@ -3381,10 +3319,10 @@ mod tests {
             "identical audit base at B=1"
         );
         assert_eq!(timing.audit.cohort_committed_total(), 8, "B*N == N at B=1");
-        assert!(
-            (timing.seconds_per_token - timing.elapsed_seconds / 8.0).abs() <= f64::EPSILON,
-            "B=1 cohort spt divides by the same N (the WHOLE window, ENFORCED, unchanged by the \
-             diagnostic phase split)"
+        assert_eq!(
+            timing.seconds_per_token,
+            timing.decode_elapsed_seconds / 8.0,
+            "B=1 cohort spt divides the decode window by the same N"
         );
         assert_eq!(timing.decode_token_total, 8, "B * N = 1 * 8");
         // The series tags DIFFER by design (b1 vs v1_1): behavior is identical, but the numbers

@@ -70,9 +70,23 @@ Qwen 3.8 125B-A6B tracks. It is **paired and per box**: one run measures the
 `official_pairs` pairs the track fixture declares, on one box in one job, and each
 pair is a serial-control leg on the organizer-staged reference tree followed by
 the candidate leg. The score is the live ratio, `prefill_gain ^ 0.25 *
-decode_gain ^ 0.75`, at batch size 1 on one stream. These tracks read no stored
+decode_gain ^ 0.75`, at batch size 1 on one stream. The fixture's
+`official_pair_combine` sets how the pairs make one score: the lower-median pair
+(the default) or the mean of the per-pair composites (`mean`). These tracks read no stored
 baseline pair. The `measure-job` → `overlay-timing` seam is the flow the earlier
 tracks score through, and the 125B tracks never enter it.
+
+**What decode means.** Decode seconds per token is the decode window: the time of
+the decode run divided by the N tokens it committed. The seed prefill of the
+prompt is not part of it. Prefill is its own phase, timed on its own. `decode_gain`
+is the control leg's decode window per token divided by the candidate leg's. One
+function computes it (`bench_core::score::decode_window_seconds_per_token`), and
+every path uses it: the paired official path under every pair rule, the
+single-leg official path, `measure-job`, `calibrate-baseline` and local
+`iterate`. The seed prefill is sealed report-only under its own key,
+`*_seed_prefill_window_seconds_per_token`. A calibration file older than version 3
+recorded the whole window as decode, and benchd refuses it by name
+(`BASELINE-CALIBRATION-WHOLE-WINDOW-DECODE`): recalibrate the box.
 
 Every scored value comes from the `--contract` track fixture. benchd holds no
 per-track table. A value the fixture does not declare is a refusal, by name, before

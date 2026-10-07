@@ -30,12 +30,17 @@ measures the pairs the track fixture declares in `official_pairs` — 2 on both
 platforms — on this box, in the same job. Every pair is a SERIAL-CONTROL leg on
 the organizer-staged reference tree and then a CANDIDATE leg on the submission
 tree, both on the same prompt. When the run is given N goldens, pair k measures
-golden (k - 1) mod N. Each pair scores on its own control leg, and the run scores the pair whose
-composite is the lower median over the pairs. Pairs are never averaged. No
-denominator is pinned anywhere.
+golden (k - 1) mod N. Each pair scores on its own control leg. By default the run scores the pair
+whose composite is the lower median over the pairs. A fixture that declares
+`official_pair_combine: "mean"` scores the mean of the per-pair composites
+instead. No denominator is pinned anywhere.
 
 What the box needs is its own HEALTH BAND for that control leg, one for each
-prompt. Write it once per box with:
+prompt. The band is on the prefill phase and on decode, and decode is the decode
+window: decode-run time / N, with no seed prefill in it. A calibration file older
+than version 3 recorded the whole window and is refused by name
+(`BASELINE-CALIBRATION-WHOLE-WINDOW-DECODE`); recalibrate. Write it once per box
+with:
 
 ```sh
 benchd calibrate-baseline \

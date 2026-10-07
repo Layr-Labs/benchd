@@ -140,9 +140,11 @@ prompt:
    (`MLXFAST_BASELINE_WORKSPACE`), with no speculation;
 2. the CANDIDATE leg on the submission tree, at its declared draft depth.
 
-The two engines are strictly sequential and each leg loads the model once. benchd
-sums each role's per-token times over the pairs, and the floors and the bands
-apply to that aggregate. Every control leg is band-checked on its own. A fixture
+The two engines are strictly sequential and each leg loads the model once. Each
+pair has its own composite. The fixture's `official_pair_combine` picks the
+score: the lower-median pair (the default) or the mean of the per-pair
+composites (`mean`). The floors and the bands gate each scored pair. Every
+control leg is band-checked on its own. A fixture
 that declares no `official_pairs` refuses the ranked run; benchd never guesses
 the count.
 

@@ -72,9 +72,9 @@ The two Qwen 3.8 125B-A6B tracks declare NO regime. They declare
 the declared scoring weights, `score_prefill_weight: 0.25` and `score_decode_weight: 0.75`.
 
 The track scores the single-stream paired point, decode only. The published figure is the even-n
-median of the per-prompt raw decode ratios. There is no separately scored prefill phase: the seed
-prefill runs INSIDE the one timed decode window, which is why the run seals
-`prefill_component: "none"`.
+median of the per-prompt raw decode ratios. No prefill is scored, which is why the run seals
+`prefill_component: "none"`. Decode is the decode window over N; the seed prefill is timed in its
+own window and is not part of decode.
 
 Decode-only is therefore `0.0` and `1.0`. With those two exponents the prefill factor is `1.0` and
 the decode factor is the decode gain, so the composite is `1.0 * decode_gain`.
@@ -138,8 +138,9 @@ Rules:
   window. There is no untimed gap between them.
 * The seed oracle check is charged to the prefill window. The run oracle check is outside both
   windows.
-* The WHOLE window is measured once, end to end. It is not rebuilt as the sum of the two halves.
-  `seconds_per_token` divides that whole window, exactly as before. The split cannot move it.
+* Decode seconds per token divides the decode window only, by N
+  (`bench_core::score::decode_window_seconds_per_token`, David 2026-10-07). The seed prefill window
+  is never part of a decode figure.
 
 ### When certification is armed
 
@@ -154,7 +155,6 @@ exact-match sentinel:
 |---|---|
 | no window was observed on the leg | `PREFILL-WINDOW-NOT-OBSERVED` |
 | a part of the window is not finite and positive, or a token total is zero | `PREFILL-WINDOW-NOT-OBSERVED` |
-| the two halves do not account for the whole window, beyond `PREFILL_WINDOW_TOLERANCE` | `PREFILL-WINDOW-DISAGREES` |
 | an independently reported prefill duration disagrees with benchd's own, beyond the same tolerance | `PREFILL-WINDOW-DISAGREES` |
 
 A leg refused this way records the reject class `prefill-window-uncertified`.
@@ -168,8 +168,8 @@ free-run verb, so it opens no prefill window at all. Under an armed regime that 
 pair on the track, including the calibration path. A track that arms prefill is a track that runs
 the free-run series only. Decide that before you change the exponent, not after the first run.
 
-`PREFILL_WINDOW_TOLERANCE` is a pinned relative tolerance. It covers the arithmetic of a split and
-ordinary clock jitter between two readings. It is NOT a performance band.
+`PREFILL_WINDOW_TOLERANCE` is a pinned relative tolerance. It covers ordinary clock jitter between
+two readings. It is NOT a performance band.
 
 The reported-duration check has no source today, because no message carries a duration. Every
 current call site supplies `None`. The parameter is the seam a reported duration would arrive
@@ -185,7 +185,7 @@ An armed pass records TWO things, and they are not the same thing:
 | `cross_check` | `"not-observed"` — no second measurement of this window existed; or `"agreed"` — one existed and agreed inside the tolerance |
 
 Today `cross_check` is ALWAYS `"not-observed"`, because no message carries a duration. So an armed
-pass means SELF-CONSISTENT — the two halves account for the whole window benchd measured — and NOT
+pass means SELF-CONSISTENT — both halves are measurable on benchd's own clock — and NOT
 corroborated. The state is sealed as a name, not inferred from a `false`, because "we compared and
 it matched" and "there was nothing to compare" are different claims.
 
@@ -239,18 +239,19 @@ end, from the mock engine through the runner's clock split to the sealed pair re
 
 ## 3. NORMATIVE: no table-declared track may raise its prefill exponent yet
 
-Certification binds the SUM of the two halves. It does not bind WHERE THE WORK SITS inside them.
+Certification does not bind WHERE THE WORK SITS inside the two halves.
 
 The split is a message boundary, not a work boundary. An engine that already knows the seed token —
 and the golden's seed token is a fixed, repeated value — can reply to `free_decode_begin`
 immediately and do the seed prefill inside `free_decode_run` instead. Every certification check
-still passes: both halves are finite and positive, and they still sum to the whole window benchd
-measured, because the work only MOVED between them. The whole window does not change, and
-`seconds_per_token` does not change.
+still passes: both halves are finite and positive. The seed half shrinks toward the round-trip cost
+of one message, so a seed-prefill gain grows without bound while the decode window absorbs the moved
+work. A composite that weights the seed prefill at all therefore rewards deferral, and
+certification cannot see it.
 
-What changes is the ratio. The prefill half shrinks toward the round-trip cost of one message, so
-`prefill_gain` grows without bound while `decode_gain` absorbs the moved work. A composite that
-weights prefill at all therefore rewards deferral, and certification cannot see it.
+The opposite move is not scored either: decode is the decode window only, so decode work an engine
+does inside `free_decode_begin` leaves the decode figure. The oracle checks every committed token;
+no timing check binds the placement.
 
 **Therefore: no track that scores through this seam may declare a nonzero
 `prefill_gain_exponent` until a WORK-PLACEMENT INVARIANT exists.** Either of these closes it;

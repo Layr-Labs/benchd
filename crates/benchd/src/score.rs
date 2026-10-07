@@ -338,16 +338,16 @@ pub struct ScoreMetrics {
     /// [`ScoreMetrics::decode_seconds_per_token`].
     #[serde(skip_serializing_if = "Option::is_none")]
     pub candidate_leg_decode_seconds_per_token: Option<f64>,
-    /// ADDITIVE, REPORT-ONLY — the per-role MEANS over `paired_legs` of the free-run window
-    /// SPLIT's decode half per token (`PairedLegRecord::*_decode_window_seconds_per_token`):
-    /// the decode-only rate, without the seed forward the enforced `decode_seconds_per_token`
-    /// charges to its window. THE BOARD READS THESE for its decode tok/s readout when present.
-    /// Absent when no pair carried a split (teacher-forced windows, or no candidate timing).
+    /// The DECODE WINDOW seconds per token of each role: the same value as
+    /// `*_leg_decode_seconds_per_token` (decode is the decode window,
+    /// `bench_core::score::decode_window_seconds_per_token`). THE BOARD READS THESE for its decode
+    /// tok/s readout. Absent when that role produced no timing.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub baseline_leg_decode_window_seconds_per_token: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub candidate_leg_decode_window_seconds_per_token: Option<f64>,
-    /// ADDITIVE, REPORT-ONLY — the same means for the seed-prefill half per seed token.
+    /// REPORT-ONLY — the SEED PREFILL window per seed token of each role. Never part of any decode
+    /// figure.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub baseline_leg_seed_prefill_window_seconds_per_token: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -362,6 +362,11 @@ pub struct ScoreMetrics {
     /// counts against the tolerance.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub timed_token_near_tie_relative_gap: Option<f64>,
+    /// ADDITIVE — the rule the paired run combined its pairs with (`official_pair_combine` in the
+    /// track fixture, `lower_median` when the fixture declares none). Sealed on every paired
+    /// payload; absent on every other path.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub official_pair_combine: Option<bench_core::contract::PairCombine>,
     /// ADDITIVE — the SCORED pair's [`PairedLegRecord::token_mismatch_count`]. Absent on a path
     /// with no paired legs.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -383,8 +388,10 @@ pub struct ScoreMetrics {
     pub token_mismatch_second_choice_max_relative_gap: Option<f64>,
     /// PAIRED PATH audit trail (David 2026-09-09, `official_pairs` in the track fixture): every
     /// pair this run measured, in order, both legs' per-token times as measured. The enforced
-    /// `baseline_leg_*` / `candidate_leg_*` fields above are ONE of these rows — the pair whose
-    /// composite is the lower median over the pairs (David 2026-09-17: pairs are never averaged).
+    /// `baseline_leg_*` / `candidate_leg_*` fields above follow [`Self::official_pair_combine`]:
+    /// under `lower_median` they are ONE of these rows, the pair whose composite is the lower
+    /// median over the pairs (David 2026-09-17); under `mean` each is the arithmetic mean of the
+    /// same figure over these rows (David 2026-10-06).
     /// OMITTED when empty so the single-leg and local payloads keep their key set.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub paired_legs: Vec<PairedLegRecord>,
@@ -416,11 +423,10 @@ pub struct PairedLegRecord {
     pub control_decode_seconds_per_token: f64,
     pub candidate_prefill_seconds_per_token: f64,
     pub candidate_decode_seconds_per_token: f64,
-    /// ADDITIVE, REPORT-ONLY — the same legs' free-run window SPLIT
-    /// (`docs/scored-regime-and-prefill-window.md`), per token: the seed-prefill half over the
-    /// seed length and the decode half over N. `*_decode_seconds_per_token` above divides the
-    /// WHOLE window (seed forward included) and is what scores; these name the decode-only rate
-    /// a reader would otherwise have to back out. Absent on a teacher-forced (v1) window.
+    /// The same legs' window SPLIT, per token. `*_decode_window_seconds_per_token` is the decode
+    /// window over N, the same value as `*_decode_seconds_per_token` above, which is what scores.
+    /// `*_seed_prefill_window_seconds_per_token` is the seed prefill over the seed length,
+    /// REPORT-ONLY, never part of any decode figure, and absent on a teacher-forced (v1) window.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub control_seed_prefill_window_seconds_per_token: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -480,11 +486,9 @@ pub struct ScorePerPrompt {
     /// it ([`bench_core::free_run::FreeRunAudit::effective_mean_draft_len`]). `0` is a REAL measured
     /// value, never a placeholder. AUDIT-ONLY — never a scoring input.
     pub effective_mean_draft_len: f64,
-    /// This prompt's ENFORCED whole-window decode seconds-per-token — the SAME number
+    /// This prompt's decode-window seconds-per-token — the SAME number
     /// [`ScoreMetrics::decode_seconds_per_token`] carries. On a single timed prompt the two are
-    /// equal by construction. It is deliberately NOT a decode-only figure: see the RED-TEAM REVERT
-    /// notes in `bench-runner/src/timing.rs`, which exist because an earlier revision redefined this
-    /// quantity to exclude the seed forward.
+    /// equal by construction.
     pub mtp_seconds_per_token_mean: f64,
     /// ADDITIVE — this prompt's verify-round count R. Absent on a leg with no free-run audit, so an
     /// entry that has none seals the historical three keys exactly.
@@ -643,6 +647,7 @@ impl ScoreMetrics {
             // and one ratio that states a fact about the replay.
             timed_token_tolerance_per_thousand: self.timed_token_tolerance_per_thousand,
             timed_token_near_tie_relative_gap: self.timed_token_near_tie_relative_gap,
+            official_pair_combine: self.official_pair_combine,
             token_mismatch_count: self.token_mismatch_count,
             token_mismatch_first_step: self.token_mismatch_first_step,
             token_mismatch_near_tie_count: self.token_mismatch_near_tie_count,
@@ -891,6 +896,7 @@ mod tests {
         "engine_protocol_version",
         "head_provenance_sha256",
         "local_phases",
+        "official_pair_combine",
         "per_prompt",
         "resident_load_epoch",
         "resident_pid",
@@ -967,6 +973,7 @@ mod tests {
             resident_load_epoch: Some(1_756_944_000),
             timed_token_tolerance_per_thousand: Some(100),
             timed_token_near_tie_relative_gap: Some(0.05),
+            official_pair_combine: Some(bench_core::contract::PairCombine::Mean),
             token_mismatch_count: Some(3),
             token_mismatch_first_step: Some(17),
             token_mismatch_near_tie_count: Some(2),
@@ -1456,6 +1463,7 @@ mod sealed_key_pin_tests {
                 candidate_leg_seed_prefill_window_seconds_per_token: None,
                 timed_token_tolerance_per_thousand: Some(149),
                 timed_token_near_tie_relative_gap: Some(0.25),
+                official_pair_combine: Some(bench_core::contract::PairCombine::Mean),
                 token_mismatch_count: Some(151),
                 token_mismatch_first_step: Some(153),
                 token_mismatch_near_tie_count: Some(161),
@@ -1582,6 +1590,7 @@ mod sealed_key_pin_tests {
     },
     "max_abs_diff": 50.0,
     "num_layers": 30,
+    "official_pair_combine": "mean",
     "paired_legs": [
       {
         "candidate_decode_seconds_per_token": 5.5,

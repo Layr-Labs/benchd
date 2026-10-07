@@ -25,6 +25,11 @@ track fixture declares no `official_baseline_prefill_seconds_per_token` /
 Do not use it on a track whose fixture declares the pair. A captured track refuses this mode by
 name.
 
+The decode half of the pair is the decode window per token (decode-run time / N, David
+2026-10-07). A pair captured with a benchd before that date recorded the whole window (seed
+prefill plus decode) as decode. benchd cannot tell the two apart from the number, so recapture
+such a pair before a run scores against it.
+
 ## 2. Why the mode exists
 
 The local checked-timing legs resolve the track's official baseline before they start the
@@ -117,7 +122,7 @@ The record is a JSON object. It holds values only.
 | `golden_sha256` | the sha256 of the golden bytes |
 | `benchd_sha256` | the sha256 of the benchd binary that did the timing |
 | `run_count` | the number of passes in the record |
-| `runs` | each pass's prefill and decode seconds-per-token |
+| `runs` | each pass's prefill and decode seconds-per-token (decode = the decode window over N, no seed prefill) |
 | `prefill_cv_percent`, `decode_cv_percent` | the per-axis CV of the passes |
 
 The seven identity fields must agree across the passes. A pass with a different value in any one

@@ -156,6 +156,9 @@ pub struct MockEngine {
     /// response line and no EOF). Models a hung/looping engine; with a RunTimeout deadline armed,
     /// `read_line_deadline` returns `TimedOut` so benchd raises `RunTimeout` instead of wedging.
     stall_on: Option<String>,
+    /// Sleep this long before answering a request of this kind: a slow seed prefill
+    /// (`free_decode_begin`) or a slow decode run, on the real clock.
+    sleep_on: Option<(String, std::time::Duration)>,
 
     // --- runtime state ---
     outbox: VecDeque<String>,
@@ -515,6 +518,13 @@ impl MockEngine {
         self
     }
 
+    /// Answer requests of `kind` only after sleeping `delay`, so a test can make one side of the
+    /// timed window slow on the real clock.
+    pub fn sleep_on(mut self, kind: &str, delay: std::time::Duration) -> Self {
+        self.sleep_on = Some((kind.to_string(), delay));
+        self
+    }
+
     /// Offset the reported `completed_work` counter by `delta` (under/over-report).
     pub fn completed_work_delta(mut self, delta: i64) -> Self {
         self.completed_work_delta = delta;
@@ -830,6 +840,11 @@ impl LineTransport for MockEngine {
             }
         };
         let kind = req.kind.clone();
+        if let Some((slow, delay)) = &self.sleep_on {
+            if *slow == kind {
+                std::thread::sleep(*delay);
+            }
+        }
 
         // Advance the mock's own completed-work counter on the same timed-step kinds
         // the runner counts, and reset it when the phase closes. The timed set comes

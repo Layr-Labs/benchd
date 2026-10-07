@@ -52,11 +52,14 @@ token must be the reference engine's second choice, with a relative gap between 
 first and second choice of at most G. Any other different token fails the run, whatever the count.
 The cost of the near-tie rule: it forgives a change of winner between two tokens that the reference engine scores almost the same, and nothing else. Each leg boots its own engine and loads the model once. Each
 pair has its own composite, `(ref_prefill / cand_prefill)^0.25 * (ref_decode / cand_decode)^0.75`,
-from its own control leg. benchd never averages the pairs: the run scores the pair whose composite
-is the lower median over the pairs (the middle pair on an odd count, the lower of the two central
-pairs on an even count), and seals every pair as measured in `metrics.paired_legs`.
+from its own control leg. The fixture's `official_pair_combine` sets how the pairs make one score.
+Absent or `lower_median`: the run scores the pair whose composite is the lower median over the
+pairs (the middle pair on an odd count, the lower of the two central pairs on an even count).
+`mean`: the score is the arithmetic mean of the per-pair composites, and the gains and the seconds
+per token in `score.json` are the means of the per-pair figures. benchd seals the rule in
+`metrics.official_pair_combine`, and seals every pair as measured in `metrics.paired_legs`.
 
-Two gates then apply to that ratio. The decode speedup must be at or above
+Two gates then apply to each scored pair: the lower-median pair, or every pair under `mean`. The decode speedup must be at or above
 `decode_speedup_floor`, and the prefill speedup must be at or above
 `prefill_speedup_floor`. Each axis has its own floor, and each floor fails the run on its own.
 benchd seals the two floors it used in `metrics.decode_speedup_floor` and

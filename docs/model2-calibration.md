@@ -123,8 +123,8 @@ pooled serial denominator has not drifted from a calibrated reference at the SAM
   `evaluate_serial_band` computes `ratio = pooled_serial_mean / calibration_mean` and checks
   `ratio ∈ [band_low, band_high]` (`:1112`–`:1113`), with the window check HARD:
   `decode_tokens` must be present AND equal `--tokens` (`:1046`–`:1075`) — seconds/token is
-  not comparable across token counts because the seed prefill is charged inside the decode
-  window. The verdict is `:972` `SerialBandVerdict` (`Pass` / `WarnOutOfBand` / `Die6`), sealed
+  not comparable across token counts. (When this was written the seed prefill was charged
+  inside the decode window. Since 2026-10-07 decode is the decode window only.) The verdict is `:972` `SerialBandVerdict` (`Pass` / `WarnOutOfBand` / `Die6`), sealed
   into provenance as `:985` `SerialBandOutcome`. `crates/benchd/src/measure_job.rs:1154`
   `enforce_serial_band` turns a `Die6` into an `Err` (the die/reject).
 - **Die / reject semantics** —

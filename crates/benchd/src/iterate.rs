@@ -1187,7 +1187,12 @@ pub(crate) fn apply_timing_metrics(
     // was decided against can never disagree (David 2026-09-09).
     metrics.passed_decode_speedup_floor = decode_speedup >= scoring.floors.decode;
     metrics.passed_prefill_speedup_floor = prefill_speedup >= scoring.floors.prefill;
-    let timed = timing.prefill_elapsed_seconds + timing.decode_elapsed_seconds;
+    // Every timed second: the prefill phase, the seed prefill, and the decode window. A wall-clock
+    // total, not a decode figure.
+    let seed = timing
+        .phase_window
+        .map_or(0.0, |w| w.seed_prefill_elapsed_seconds);
+    let timed = timing.prefill_elapsed_seconds + seed + timing.decode_elapsed_seconds;
     metrics.timed_benchmark_seconds = finite_nonneg(timed);
     metrics.benchmark_wall_seconds = finite_nonneg(timed);
 }
@@ -1803,8 +1808,8 @@ pub(crate) fn base_metrics(
 ///
 /// NOTHING ENFORCED CHANGES. Every value here is AUDIT-ONLY: none feeds a seconds-per-token, a
 /// speedup, a floor, a band or the score. `mtp_seconds_per_token_mean` is READ BACK from
-/// `metrics.decode_seconds_per_token` (the enforced whole-window figure `apply_timing_metrics` just
-/// wrote), so the two cannot drift and no second, decode-only quantity is introduced.
+/// `metrics.decode_seconds_per_token` (the decode-window figure `apply_timing_metrics` just wrote),
+/// so the two cannot drift.
 ///
 /// A result with NO free-run audit (the teacher-forced v1 decode path, which no scored run takes)
 /// seals NOTHING.
@@ -2852,17 +2857,60 @@ mod tests {
         );
     }
 
+    /// DECODE MEANS THE DECODE WINDOW ON LOCAL ITERATE (David 2026-10-07). The same prefill and
+    /// decode windows with different seed prefills give a byte-identical local payload: decode
+    /// seconds per token, decode gain, floor verdicts and score. Only the wall-clock totals, which
+    /// count every timed second, move.
+    #[test]
+    fn local_iterate_decode_gain_and_score_are_byte_identical_whatever_the_seed_prefill_takes() {
+        let golden = benchmark_golden();
+        let weights = DirDigest::empty();
+        let n = bench_core::constants::BENCHMARK_DECODE_STEPS as f64;
+        let score = |seed: f64| {
+            let timing = crate::testgolden::leg_timing(
+                TEST_BASELINE.prefill_seconds_per_token,
+                seed,
+                TEST_BASELINE.decode_seconds_per_token * n / 1.4,
+            );
+            let payload = local_iterate_score(
+                Mode::LocalIterate,
+                &timing,
+                ScoringInputs::local(
+                    TEST_BASELINE.prefill_seconds_per_token,
+                    TEST_BASELINE.decode_seconds_per_token,
+                ),
+                &golden,
+                RunDigests::for_test(&weights),
+                &test_window(),
+            );
+            let mut v = serde_json::to_value(&payload).unwrap();
+            let m = v["metrics"].as_object_mut().unwrap();
+            for wall_clock in ["timed_benchmark_seconds", "benchmark_wall_seconds"] {
+                assert!(m.remove(wall_clock).is_some(), "{wall_clock}");
+            }
+            v
+        };
+        let base = score(0.2);
+        assert!((base["metrics"]["decode_speedup"].as_f64().unwrap() - 1.4).abs() < 1e-9);
+        for seed in [0.001, 3.0, 40.0] {
+            assert_eq!(
+                score(seed),
+                base,
+                "a local figure moved with a {seed} s seed prefill"
+            );
+        }
+    }
+
     /// LOCAL-ITERATE NOW POPULATES `per_prompt`. It was sealed only on the official path, so every
     /// local score carried an empty array and the board had nothing to read from a local run — even
     /// though local-iterate times a prompt exactly as official does. The record carries the timed
-    /// golden's own sha256, the audit's realized draft length, and the ENFORCED whole-window decode
-    /// figure (never a second decode-only quantity).
+    /// golden's own sha256, the audit's realized draft length, and the decode-window figure.
     #[test]
     fn local_iterate_seals_the_per_prompt_record_for_the_prompt_it_timed() {
         let golden = benchmark_golden();
         let (mut session, _) = Session::connect(
             window_engine(&golden, vec![2i64; li_expected()])
-                // 2 committed tokens per round over the whole window.
+                // 2 committed tokens per round over the decode window.
                 .free_run_acceptance_lengths(vec![2; li_steps() / 2]),
         )
         .unwrap();

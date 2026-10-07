@@ -139,9 +139,12 @@ flock /tmp/mtplx-gpu-exclusive.lock -c '
     --out "$REFERENCE_WORKSPACE/baseline-calibration.json"'
 ```
 
-The file is a health band for the control leg, never a denominator. The verb
-refuses by name (`CALIBRATION-CV-EXCEEDED`) when the box is too noisy for a mean
-to describe it. The full procedure is in
+The file is a health band for the control leg, never a denominator. Its decode
+mean is the decode window per token (decode-run time / N, no seed prefill). The
+verb refuses by name (`CALIBRATION-CV-EXCEEDED`) when the box is too noisy for a
+mean to describe it. benchd refuses a file older than version 3 by name
+(`BASELINE-CALIBRATION-WHOLE-WINDOW-DECODE`): it recorded the whole window as
+decode. Recalibrate. The full procedure is in
 [`qwen38-125b-a6b-baseline-capture.md`](qwen38-125b-a6b-baseline-capture.md).
 
 ## 8. The measurement topology

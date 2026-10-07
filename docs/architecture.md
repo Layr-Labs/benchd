@@ -121,7 +121,7 @@ no clock. Its modules and what each owns:
 |---|---|
 | `contract` | The one schema for the track fixture, its parse-time certification, and the resolver for each scored group. Section 6 lists the fields. |
 | `golden` | The golden document schema, its digest, and the `target` block with the reference-model pin. |
-| `score` | The composite: the speedup floors, the acceptance bands, the weights, and `ScoreMetrics`. |
+| `score` | The composite: the speedup floors, the acceptance bands, the weights, and `ScoreMetrics`. It holds the one definition of decode, `decode_window_seconds_per_token`: decode-run time divided by N. The seed prefill is not part of decode. |
 | `conformance` | The correctness gate: teacher-forced token checks against a golden. |
 | `tape`, `free_run` | Recorded free-run tapes and the per-round audit of a free-running decode. |
 | `runner_manifest` | The canonical digest of a Runner manifest and the `hello`-against-manifest check. |
@@ -138,7 +138,7 @@ code that talks to an engine, and it holds the clock.
 |---|---|
 | `transport` | The NDJSON line transport: one write and one buffer for each request, the child's stdio, the child-env allowlist, and linear retention of the worker's stderr tail. |
 | `session` | The protocol client: the `hello` handshake, nonce and id checks, session discard on error, and the phase-close barrier that asserts `completed_work` and an allocator drained to zero. |
-| `timing` | Parent-side wall-clock timing. `Instant` brackets each engine call inside the prefill window, the decode window and the free-run windows. One worker serves one timed window: warm-up prefill, warm-up decode, timed prefill and timed decode run over one session, and the drain is asserted at each close. There is no other lifecycle. |
+| `timing` | Parent-side wall-clock timing. `Instant` brackets each engine call inside the prefill window, the decode window and the free-run windows. The free-run clock splits at the `free_decode_begin` / `free_decode_run` boundary into the seed prefill and the decode window, and every decode seconds-per-token it returns is the decode window over N. One worker serves one timed window: warm-up prefill, warm-up decode, timed prefill and timed decode run over one session, and the drain is asserted at each close. There is no other lifecycle. |
 | `sandbox` | The macOS Seatbelt profile for a spawned engine: no network, no fork or exec, no writes except `/dev/null`, no reads of the private golden, and one exception for an outbound connection to the resident socket named by `BENCH_WORKER_RESIDENT_SOCKET`. |
 | `scrub` | Redaction of engine-controlled text before it reaches a sealed artifact. |
 | `wire_crosscheck` | Re-parses a sha256-pinned captured wire under benchd's closed structs. |
@@ -258,6 +258,7 @@ fields, the paired-run fields and the two speedup floors are each declared on th
 | identity | `allowed_modes` | The speculative modes a submission may declare. An empty list is a refusal. |
 | identity | `timed_prompt_pool` | The timed prompts, their pins and their per-prompt references. |
 | paired run | `official_pairs` | The number of pairs one ranked run measures. |
+| paired run | `official_pair_combine` | How the pairs make one score: `lower_median` (absent) or `mean` of the per-pair composites. |
 | paired run | `scores_against_live_control_leg` | Whether the track measures its own denominator. |
 | paired run | `paired_flow_retired` | Whether the `measure-job` seam is closed for this track. |
 | paired run | `timed_token_tolerance_per_thousand` | The timed token tolerance, 0 to 1000. Absent: one different timed token fails the run. |

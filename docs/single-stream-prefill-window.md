@@ -32,11 +32,13 @@ each leg it opens two contiguous windows on its own clock
 Rules:
 
 - There is no untimed gap between the two windows.
-- `elapsed_seconds` = `prefill_elapsed_seconds + decode_elapsed_seconds`, by
-  construction. benchd never measures the whole window a second time.
-- `seconds_per_token` = `elapsed_seconds / N`. This is unchanged. It stays
-  the enforced whole-window figure for the serial band, the run timeout and
-  the paired decode-only median.
+- Decode seconds per token = `decode_elapsed_seconds / N`
+  (`bench_core::score::decode_window_seconds_per_token`, David 2026-10-07). The
+  seed prefill is not part of decode. This one figure feeds the decode gain, the
+  floors, the serial band, the calibration mean and the paired decode-only
+  median.
+- The seed prefill window is sealed report-only, per leg, under
+  `*_seed_prefill_window_seconds_per_token`. Nothing scored reads it.
 - The seed oracle check is charged to the prefill window. The run oracle check
   is outside both windows.
 - The RunTimeout deadline is armed when the prefill window opens and covers
@@ -59,10 +61,12 @@ Rules:
    them on this series.
 5. Units on the wire stay as they are. benchd's clock is in seconds (f64).
 
-If the engine moves prefill work into `free_decode_run`, the prefill window
-gets smaller and the decode window gets larger by the same amount. The whole
-window does not change. The composite then moves against the engine, because
-the decode exponent (0.75) is larger than the prefill exponent (0.25).
+If the engine moves prefill work into `free_decode_run`, the decode window gets
+larger and decode gets slower. If the engine moves decode work into
+`free_decode_begin`, that work leaves the decode window and is not scored. The
+oracle still checks every committed token, but no timing check binds where the
+work sits. Obligations 1 and 2 above are the rule; benchd does not enforce them
+by timing.
 
 ## 4. What benchd seals
 
@@ -73,8 +77,8 @@ The ranked path of these tracks is `benchd iterate --mode official`, and it seal
 (`prefill_speedup`, `decode_speedup`) and the composite as the run's `score`.
 `metrics.paired_legs` carries one row for each measured pair.
 
-benchd measures the pairs the fixture declares in `official_pairs` and scores
-one of them. Each pair has its own composite, from its own control leg:
+benchd measures the pairs the fixture declares in `official_pairs`. Each pair
+has its own composite, from its own control leg:
 
 ```
 prefill_gain = control prefill s/tok / candidate prefill s/tok
@@ -82,10 +86,23 @@ decode_gain  = control decode s/tok  / candidate decode s/tok
 composite    = prefill_gain ^ 0.25 * decode_gain ^ 0.75
 ```
 
-The run scores the pair whose composite is the lower median over the pairs:
-the middle pair on an odd count, the lower of the two central pairs on an even
-count. Pairs are never averaged. Every enforced figure in `score.json` is that
-one pair's, and the other pairs stay in `metrics.paired_legs` as measured.
+The fixture's `official_pair_combine` sets how the pairs make one score.
+`score.json` names the rule in `metrics.official_pair_combine`.
+
+- `lower_median` (the default, when the field is absent): the run scores the
+  pair whose composite is the lower median over the pairs: the middle pair on
+  an odd count, the lower of the two central pairs on an even count. The floors
+  and the bands gate that pair. Every enforced figure in `score.json` is that
+  one pair's.
+- `mean`: the score is the arithmetic mean of the per-pair composites. The
+  floors and the bands gate every pair, each against its own control leg, and
+  the first pair that fails stops the run. The two gains and the candidate and
+  control seconds per token in `score.json` are each the mean of the same
+  per-pair figure. The score is not the composite of the mean gains, and a mean
+  gain is not the ratio of the mean seconds. Recompute the score from
+  `metrics.paired_legs`.
+
+Under both rules every pair stays in `metrics.paired_legs` as measured.
 
 A run can measure more than one prompt. The command line gives one `--golden`
 for each prompt, N in all. Pair k (1-based) measures golden (k - 1) mod N, in
@@ -93,14 +110,15 @@ command-line order, so `official_pairs` must be a multiple of N. The control
 leg and the candidate leg of one pair measure the same prompt. Each row of
 `metrics.paired_legs` carries `prompt_sha256`, the golden that pair measured.
 `metrics.per_prompt` has one record for each golden, in command-line order.
-`golden_hash`, `baseline_golden_sha256` and the run-level drafting facts are
-the scored pair's.
+`golden_hash`, `baseline_golden_sha256`, the token counts and the run-level
+drafting facts are the lower-median pair's under both rules. benchd runs the
+full correctness set on that pair's golden.
 
-The window split of section 2 is what makes the two gains separable. Without it
-there is one whole-window number and no prefill half to score.
+The window split of section 2 is what keeps the seed prefill out of decode.
 
 ## 5. What does not change
 
 - `free_decode_begin` / `free_decode_run` request and response fields.
 - The captured engine-wire fixture (`ENGINE_WIRE_V1_SHA256`). No re-pin.
-- The whole window and its `seconds_per_token`. The split cannot move them.
+- The prefill phase and its `prefill_seconds_per_token`. The seed prefill is not
+  part of it either.

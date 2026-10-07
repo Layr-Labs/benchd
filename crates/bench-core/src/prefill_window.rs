@@ -11,10 +11,9 @@
 //! module implements: certification is ARMED by the track's declared regime
 //! ([`crate::constants::ScoredRegime::prefill_is_scored`]) and by nothing else.
 //!
-//! * ARMED (`prefill_gain_exponent != 0.0`) — the window MUST be observed and measurable, its two
-//!   halves MUST account for the whole window, and any independently reported prefill duration
-//!   MUST agree with benchd's own within [`PREFILL_WINDOW_TOLERANCE`]. Each breach refuses BY
-//!   NAME, quoting an exact-match sentinel.
+//! * ARMED (`prefill_gain_exponent != 0.0`) — the window MUST be observed and measurable, and any
+//!   independently reported prefill duration MUST agree with benchd's own within
+//!   [`PREFILL_WINDOW_TOLERANCE`]. Each breach refuses BY NAME, quoting an exact-match sentinel.
 //! * NOT ARMED (`prefill_gain_exponent == 0.0`) — the window is REPORT-ONLY. It is carried into the
 //!   record when it exists and nothing is enforced on it. No refusal in this module can fire.
 //!
@@ -25,11 +24,9 @@ use crate::constants::ScoredRegime;
 
 /// The pinned RELATIVE tolerance the certification holds two measurements of the same duration to.
 ///
-/// It covers the arithmetic a split introduces (two `f64` sub-intervals summed against one whole
-/// interval measured separately) and ordinary clock jitter between two readings — it is NOT a
-/// performance band. A disagreement wider than this is an accounting fault: the halves describe a
-/// different window than the whole, or the reported duration describes a different window than the
-/// one benchd timed.
+/// It covers ordinary clock jitter between two readings of one interval — it is NOT a performance
+/// band. A disagreement wider than this is an accounting fault: the reported duration describes a
+/// different window than the one benchd timed.
 pub const PREFILL_WINDOW_TOLERANCE: f64 = 0.05;
 
 /// EXACT-MATCH name of the refusal "an armed track produced no usable prefill window".
@@ -51,8 +48,11 @@ pub const PREFILL_WINDOW_CROSS_CHECK_NOT_OBSERVED: &str = "not-observed";
 /// [`PREFILL_WINDOW_DISAGREES`] — so there is no third sealed state.)
 pub const PREFILL_WINDOW_CROSS_CHECK_AGREED: &str = "agreed";
 
-/// The split of ONE free-run timed window, all four numbers from benchd's own clock and its own
-/// configured token counts. Nothing here is engine-reported.
+/// The split of ONE free-run timed window: the seed prefill and the decode window, both from
+/// benchd's own clock, with their token counts. Nothing here is engine-reported.
+///
+/// The decode seconds per token is `decode_elapsed_seconds / decode_token_total`
+/// ([`crate::score::decode_window_seconds_per_token`]). The seed prefill is never added to it.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PhaseWindow {
     /// The SEED-PREFILL half of the free-run window. Opens immediately before `free_decode_begin`
@@ -64,11 +64,9 @@ pub struct PhaseWindow {
     /// timed round trip on its own prompt, outside this window entirely. Two fields spelled the
     /// same on one result type would be one substitution away from a wrong gain.
     pub seed_prefill_elapsed_seconds: f64,
-    /// Opens the instant the prefill window closes; closes when `free_decode_run(N)` returns.
+    /// THE DECODE WINDOW. Opens the instant the seed prefill closes; closes when
+    /// `free_decode_run(N)` returns. The decode seconds per token divides this, and only this.
     pub decode_elapsed_seconds: f64,
-    /// The whole window, measured ONCE end to end — not the sum of the two halves. This is the
-    /// number `seconds_per_token` divides, and it is unchanged by the split.
-    pub whole_window_elapsed_seconds: f64,
     /// Tokens the prefill window covered (the seed length).
     pub prefill_token_total: usize,
     /// Tokens the decode window covered (N).
@@ -90,7 +88,7 @@ pub enum PrefillWindowCertification {
         window: PhaseWindow,
         /// [`PREFILL_WINDOW_CROSS_CHECK_NOT_OBSERVED`] or [`PREFILL_WINDOW_CROSS_CHECK_AGREED`].
         /// The former means the certification rests on benchd's own split ALONE — self-consistent
-        /// (the halves account for the whole window), not corroborated.
+        /// (both halves measurable), not corroborated.
         cross_check: &'static str,
     },
 }
@@ -169,41 +167,19 @@ pub fn certify_prefill_window(
     let measurable = |v: f64| v.is_finite() && v > 0.0;
     if !measurable(window.seed_prefill_elapsed_seconds)
         || !measurable(window.decode_elapsed_seconds)
-        || !measurable(window.whole_window_elapsed_seconds)
         || window.prefill_token_total == 0
         || window.decode_token_total == 0
     {
         return Err(format!(
             "{PREFILL_WINDOW_NOT_OBSERVED}: track_id {track_id:?} scores prefill \
              (prefill_gain_exponent={}), but the window is not measurable \
-             (prefill={} s over {} tokens, decode={} s over {} tokens, whole={} s); every part must \
-             be finite and positive; refusing",
+             (prefill={} s over {} tokens, decode={} s over {} tokens); every part must be \
+             finite and positive; refusing",
             regime.prefill_gain_exponent,
             window.seed_prefill_elapsed_seconds,
             window.prefill_token_total,
             window.decode_elapsed_seconds,
-            window.decode_token_total,
-            window.whole_window_elapsed_seconds
-        ));
-    }
-
-    // The two halves must account for the whole window benchd measured end to end. They are three
-    // separate readings of one interval, so they agree to the tolerance, not exactly — but a split
-    // that leaves an untimed gap (or overlaps) fails here rather than silently shrinking the half
-    // the score divides by.
-    let split_total = window.seed_prefill_elapsed_seconds + window.decode_elapsed_seconds;
-    let split_gap = relative_gap(split_total, window.whole_window_elapsed_seconds);
-    if split_gap > PREFILL_WINDOW_TOLERANCE {
-        return Err(format!(
-            "{PREFILL_WINDOW_DISAGREES}: track_id {track_id:?} — the prefill window ({} s) and the \
-             decode window ({} s) sum to {split_total} s, which differs from the whole timed window \
-             benchd measured ({} s) by {:.6} relative, beyond the pinned tolerance {:.6}; the two \
-             halves do not describe the window that was timed; refusing",
-            window.seed_prefill_elapsed_seconds,
-            window.decode_elapsed_seconds,
-            window.whole_window_elapsed_seconds,
-            split_gap,
-            PREFILL_WINDOW_TOLERANCE
+            window.decode_token_total
         ));
     }
 
@@ -251,7 +227,6 @@ mod tests {
         PhaseWindow {
             seed_prefill_elapsed_seconds: 0.4,
             decode_elapsed_seconds: 4.6,
-            whole_window_elapsed_seconds: 5.0,
             prefill_token_total: 512,
             decode_token_total: 128,
         }
@@ -291,7 +266,6 @@ mod tests {
         let nonsense = PhaseWindow {
             seed_prefill_elapsed_seconds: f64::NAN,
             decode_elapsed_seconds: -1.0,
-            whole_window_elapsed_seconds: 0.0,
             prefill_token_total: 0,
             decode_token_total: 0,
         };
@@ -336,10 +310,6 @@ mod tests {
                 ..good_window()
             },
             PhaseWindow {
-                whole_window_elapsed_seconds: f64::INFINITY,
-                ..good_window()
-            },
-            PhaseWindow {
                 prefill_token_total: 0,
                 ..good_window()
             },
@@ -354,31 +324,6 @@ mod tests {
                 "{broken:?} -> {err}"
             );
         }
-    }
-
-    /// RED-first: an ARMED regime whose two halves do not account for the whole window refuses.
-    /// This is the shape that matters — a prefill half quietly smaller than the work it covers.
-    #[test]
-    fn armed_with_a_split_that_does_not_sum_refuses_by_name() {
-        let leaky = PhaseWindow {
-            seed_prefill_elapsed_seconds: 0.4,
-            decode_elapsed_seconds: 2.0,
-            whole_window_elapsed_seconds: 5.0,
-            ..good_window()
-        };
-        let err = certify_prefill_window("armed-v1", &armed(), Some(leaky), None).unwrap_err();
-        assert!(err.contains(PREFILL_WINDOW_DISAGREES), "{err}");
-        assert!(err.contains("armed-v1"), "{err}");
-
-        // Inside the tolerance the same shape passes: the halves are separate readings of one
-        // interval, not an exact decomposition.
-        let jittery = PhaseWindow {
-            seed_prefill_elapsed_seconds: 0.4,
-            decode_elapsed_seconds: 4.7,
-            whole_window_elapsed_seconds: 5.0,
-            ..good_window()
-        };
-        assert!(certify_prefill_window("armed-v1", &armed(), Some(jittery), None).is_ok());
     }
 
     /// RED-first: an ARMED regime whose independently reported prefill contradicts benchd's own

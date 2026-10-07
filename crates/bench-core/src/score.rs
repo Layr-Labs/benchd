@@ -10,6 +10,25 @@ use crate::constants::{
     SCORE_PREFILL_SPEEDUP_FLOOR, SCORE_PREFILL_WEIGHT,
 };
 
+/// THE DEFINITION OF DECODE (David 2026-10-07): decode seconds per token is the DECODE WINDOW —
+/// the time of the decode run divided by the N tokens it committed. The seed prefill of the prompt
+/// is NOT part of it. Prefill is its own phase, timed on its own.
+///
+/// Every decode seconds-per-token figure benchd computes, seals, scores, gates, bands or
+/// calibrates comes from this one function: the paired official path under every combine rule,
+/// the single-leg official path, measure-job (single-stream and cohort), calibrate-baseline and
+/// local iterate. There is no other decode figure.
+///
+/// `decode_run_elapsed_seconds` is the parent clock from the instant the seed prefill closed
+/// (`free_decode_begin` returned and its seed token was checked) to the return of the decode run.
+/// `decode_tokens` is N (B x N on a cohort).
+pub fn decode_window_seconds_per_token(
+    decode_run_elapsed_seconds: f64,
+    decode_tokens: usize,
+) -> f64 {
+    decode_run_elapsed_seconds / decode_tokens as f64
+}
+
 /// `BenchmarkScore.speedup`: baseline/candidate, or 0 if either is non-finite or <= 0.
 pub fn speedup(baseline_spt: f64, candidate_spt: f64) -> f64 {
     if !baseline_spt.is_finite()

@@ -623,8 +623,10 @@ REQUIRED:
                                  be a multiple of N (else OFFICIAL-PAIRS-NOT-A-MULTIPLE-OF-GOLDENS),
                                  and the calibration file must hold an entry for each golden's
                                  prompt (else BASELINE-CALIBRATION-PROMPT-MISMATCH). The run scores
-                                 the lower-median pair over all pairs. Every other path refuses a
-                                 second --golden (MULTIPLE-GOLDENS-WITHOUT-PAIRED-PATH).
+                                 the lower-median pair over all pairs, or the mean of the per-pair
+                                 composites when the fixture declares official_pair_combine: mean.
+                                 Every other path refuses a second --golden
+                                 (MULTIPLE-GOLDENS-WITHOUT-PAIRED-PATH).
 
 OPTIONS:
     --baseline-prefill-spt <F>   STORED-PAIR TRACKS ONLY, on --mode official. Prefill baseline
@@ -4916,11 +4918,16 @@ fn execute_iterate(args: &IterateArgs) -> Result<bool, String> {
         eprintln!(
             "benchd iterate: paired official run on box {box_name:?}, {pairs} pair(s) over {} \
              golden(s) — in each pair leg 1 is the serial-control leg on the reference tree {}, \
-             leg 2 the candidate, both on the pair's golden; the score is the live ratio of the \
-             two legs of the lower-median pair (calibration {} is the band on every leg 1, never a \
-             denominator)",
+             leg 2 the candidate, both on the pair's golden; the score is {} (calibration {} is \
+             the band on every leg 1, never a denominator)",
             goldens.len(),
             workspace.display(),
+            match declared_contract.official_pair_combine {
+                contract::PairCombine::LowerMedian =>
+                    "the live ratio of the two legs of the lower-median pair",
+                contract::PairCombine::Mean =>
+                    "the mean of the per-pair live ratios (official_pair_combine: mean)",
+            },
             calibration.path.display(),
         );
         let mut payload = official::official_core_paired(
@@ -4957,6 +4964,8 @@ fn execute_iterate(args: &IterateArgs) -> Result<bool, String> {
                 cool_gate: cool_gate_fn,
                 gate_log: std::rc::Rc::clone(&gate_log),
                 pairs,
+                // The fixture is the only source. Absent keeps the lower-median rule.
+                combine: declared_contract.official_pair_combine,
                 floors,
                 weights,
                 // The fixture is the only source. Absent keeps the exact rule.

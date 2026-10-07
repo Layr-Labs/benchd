@@ -3559,15 +3559,11 @@ pub struct LegInvocation {
     /// COMPOSITE (Gemma cohort scoring) — this leg's PREFILL/DECODE phase-split window, from
     /// [`bench_runner::BatchedFreeRunPhaseTiming`]'s phase fields. SCORED INPUT under the
     /// SHARED-WINDOW ruling: these two parent-clocked elapsed times are what
-    /// [`shared_window_composite`] sums into the composite's two gains. They are still NOT the
-    /// ENFORCED `seconds_per_token`, which stays the whole-window figure computed by
-    /// `bench_runner` itself (see that struct's doc for the red-team revert that pinned it there);
-    /// the composite is a SECOND published quantity over the same parent clock, never a
-    /// re-derivation of the enforced one. REQUIRED on the v1.2 batched cohort regime (a missing
-    /// value fails the leg closed in [`validate_leg_report`], the same posture as `cohort_audit`)
-    /// and `None` on every other regime — the v1.1 single-stream path has no second window to seal
-    /// (its seed forward stays folded inside the one timed window, `prefill_component: "none"`,
-    /// untouched by this ruling).
+    /// [`shared_window_composite`] sums into the composite's two gains. The leg's
+    /// `seconds_per_token` is the decode window over `B * N`, computed by `bench_runner`.
+    /// REQUIRED on the v1.2 batched cohort regime (a missing value fails the leg closed in
+    /// [`validate_leg_report`], the same posture as `cohort_audit`) and `None` on every other
+    /// regime — the v1.1 single-stream path carries its split on `phase_window`.
     pub cohort_phase_windows: Option<CohortPhaseWindows>,
     /// REPORT-ONLY (per-stream arm-fill lane, gap G2) — the per-stream timing CARRY the batched
     /// runner lifted off the wire ([`bench_runner::BatchedFreeRunPhaseTiming`]'s per-stream
@@ -3595,10 +3591,8 @@ pub struct LegInvocation {
 ///
 /// PARENT CLOCK, and SCORED under the SHARED-WINDOW ruling: both figures are benchd's own
 /// `Instant::now()` brackets around the batched verbs, and they are the composite's ONLY numeric
-/// input ([`shared_window_composite`]). The ENFORCED `seconds_per_token` is a separate quantity —
-/// the WHOLE window (`prefill_elapsed_seconds + decode_elapsed_seconds`), computed by
-/// `bench_runner` itself and never reconstructed from these split-out halves — and this ruling
-/// does not touch it. Carried on [`LegInvocation`] / [`LegMeasurement`] /
+/// input ([`shared_window_composite`]). The leg's `seconds_per_token` is
+/// `decode_elapsed_seconds / decode_token_total`, computed by `bench_runner`. Carried on [`LegInvocation`] / [`LegMeasurement`] /
 /// [`PairCohortPhaseWindows`] verbatim.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize)]
 pub struct CohortPhaseWindows {
@@ -3762,8 +3756,7 @@ pub struct PairPhaseWindows {
     /// disagreement never seals — it refuses.)
     ///
     /// `certified: true, cross_check: "not-observed"` is the honest description of an armed pass
-    /// today: the halves account for the whole window benchd measured, and nothing else confirmed
-    /// it. That is SELF-CONSISTENT, not corroborated, and the record says so instead of letting a
+    /// today: both halves are measurable on benchd's own clock, and nothing else confirmed it. That is SELF-CONSISTENT, not corroborated, and the record says so instead of letting a
     /// single `certified` flag imply more than was checked.
     pub cross_check: &'static str,
 }
@@ -3774,7 +3767,7 @@ pub struct PairPhaseWindows {
 pub struct PairRecord {
     pub parity_ok: bool,
     /// R15 — the serial-control leg's scored seconds-per-token = its report's
-    /// `parent_measured_seconds_per_token` (the parent's wall-clock ÷ token total; worker
+    /// `parent_measured_seconds_per_token` (the parent's decode window ÷ token total; worker
     /// self-timing is never scored).
     pub serial_seconds_per_token: f64,
     /// R15 — the candidate (MTP) leg's scored `parent_measured_seconds_per_token`.
@@ -6169,7 +6162,7 @@ pub struct PerCohort {
     pub parity_ok: bool,
     pub accepted_pair_count: usize,
     /// Mean over accepted pairs of the serial-control leg's COHORT seconds-per-committed-token
-    /// (`window_elapsed / (B * N)`, D1).
+    /// (`decode_window / (B * N)`).
     pub serial_seconds_per_token_mean: f64,
     /// Mean over accepted pairs of the candidate leg's cohort seconds-per-committed-token.
     pub candidate_seconds_per_token_mean: f64,
@@ -6199,8 +6192,8 @@ pub struct PerCohort {
     /// DIAGNOSTIC — `B * N` committed decode tokens. Same constancy note as `prefill_token_total`.
     pub decode_token_total: usize,
     /// DIAGNOSTIC — mean over accepted pairs of the serial-control leg's PREFILL window elapsed
-    /// seconds (mirrors `serial_seconds_per_token_mean` for the decode side, which IS the
-    /// ENFORCED whole-window figure — this is its prefill-only sub-window, not itself enforced).
+    /// seconds (the seed prefill; never part of `serial_seconds_per_token_mean`, which is the
+    /// decode window per token).
     ///
     /// A MEAN, and therefore NOT the composite's input: the composite's `prefill_gain` is a ratio
     /// of SUMS over the same per-pair windows (`pairs[].cohort_phase_windows`). With every pair
@@ -6211,8 +6204,7 @@ pub struct PerCohort {
     /// seconds.
     pub candidate_prefill_window_seconds_mean: f64,
     /// DIAGNOSTIC — mean over accepted pairs of the serial-control leg's DECODE window elapsed
-    /// seconds (NOT `serial_seconds_per_token_mean`'s ENFORCED whole window — this is the decode
-    /// sub-window alone).
+    /// seconds (the window `serial_seconds_per_token_mean` divides by `B * N`).
     pub serial_decode_window_seconds_mean: f64,
     /// DIAGNOSTIC — mean over accepted pairs of the candidate leg's DECODE window elapsed seconds.
     pub candidate_decode_window_seconds_mean: f64,
@@ -7879,14 +7871,12 @@ mod tests {
         })
     }
 
-    /// B2 — the clock SPLIT a conformant free-run leg produces: a seed-prefill half, a decode half,
-    /// and the whole window measured once. Shaped like a real reading (the halves account for the
-    /// whole), so a closure-seam leg presents what `run_free_run_decode_phase_fresh` presents.
+    /// B2 — the clock SPLIT a conformant free-run leg produces: a seed-prefill half and a decode
+    /// half, so a closure-seam leg presents what `run_free_run_decode_phase_fresh` presents.
     fn free_run_phase_window() -> bench_core::prefill_window::PhaseWindow {
         bench_core::prefill_window::PhaseWindow {
             seed_prefill_elapsed_seconds: 0.25,
             decode_elapsed_seconds: 4.75,
-            whole_window_elapsed_seconds: 5.0,
             prefill_token_total: BENCHMARK_DECODE_SEED_TOKENS,
             decode_token_total: BENCHMARK_DECODE_STEPS,
         }

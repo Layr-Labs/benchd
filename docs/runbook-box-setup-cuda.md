@@ -341,7 +341,9 @@ the lock.
 The verb runs the ranked path's own control leg four times. It refuses by
 name (`CALIBRATION-CV-EXCEEDED`) when the box is too noisy for a mean to
 describe it. The file is a health band for the control leg, never a
-denominator. The full procedure, the refusal names and the file format are
+denominator. Its decode mean is the decode window per token (decode-run time /
+N, no seed prefill). benchd refuses a file older than version 3 by name
+(`BASELINE-CALIBRATION-WHOLE-WINDOW-DECODE`); recalibrate. The full procedure, the refusal names and the file format are
 in
 [`qwen38-125b-a6b-baseline-capture.md`](qwen38-125b-a6b-baseline-capture.md).
 

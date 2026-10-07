@@ -22,6 +22,55 @@ use bench_core::constants::{
     CORRECTNESS_PROMPT_TOKENS, CORRECTNESS_STEPS, REQUIRED_GOLDEN_MODEL_TYPE,
 };
 
+/// One measured leg's timing, built from its raw windows the way the runner builds it: decode is
+/// the decode window over N ([`bench_core::score::decode_window_seconds_per_token`]), and the seed
+/// prefill is carried in the phase window only. The regression tests that hold decode to the
+/// decode window vary `seed_prefill_seconds` and nothing else.
+pub fn leg_timing(
+    prefill_seconds_per_token: f64,
+    seed_prefill_seconds: f64,
+    decode_window_seconds: f64,
+) -> bench_runner::TimingResult {
+    bench_runner::TimingResult {
+        prefill_seconds_per_token,
+        decode_seconds_per_token: bench_core::score::decode_window_seconds_per_token(
+            decode_window_seconds,
+            BENCHMARK_DECODE_STEPS,
+        ),
+        decode_steps: BENCHMARK_DECODE_STEPS,
+        prefill_prompt_tokens: BENCHMARK_PREFILL_PROMPT_TOKENS,
+        prefill_elapsed_seconds: prefill_seconds_per_token * BENCHMARK_PREFILL_PROMPT_TOKENS as f64,
+        decode_elapsed_seconds: decode_window_seconds,
+        phase_window: Some(bench_core::prefill_window::PhaseWindow {
+            seed_prefill_elapsed_seconds: seed_prefill_seconds,
+            decode_elapsed_seconds: decode_window_seconds,
+            prefill_token_total: BENCHMARK_DECODE_SEED_TOKENS,
+            decode_token_total: BENCHMARK_DECODE_STEPS,
+        }),
+        peak_ram_gb: 20.0,
+        effective_spec: None,
+        free_run_audit: None,
+        emitted_tokens: Vec::new(),
+    }
+}
+
+/// `value` with every seed-named key removed, at every depth. What is left is every figure the
+/// seed prefill must not move.
+pub fn without_seed_keys(mut value: serde_json::Value) -> serde_json::Value {
+    fn strip(v: &mut serde_json::Value) {
+        match v {
+            serde_json::Value::Object(map) => {
+                map.retain(|k, _| !k.contains("seed_prefill"));
+                map.values_mut().for_each(strip);
+            }
+            serde_json::Value::Array(items) => items.iter_mut().for_each(strip),
+            _ => {}
+        }
+    }
+    strip(&mut value);
+    value
+}
+
 /// A stand-in CAPTURED official baseline for tests of the scoring arithmetic and record shape.
 /// The values are arbitrary (the live pair is `constants::OFFICIAL_BASELINE`, pending for this
 /// track); the band shape is the one every track has used — symmetric prefill health gate,
