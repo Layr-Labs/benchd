@@ -49,15 +49,16 @@ can reach it.
 
 ## 2. What this page calibrates
 
-The calibration file is a HEALTH BAND for leg 1 only. It says what a control leg
-costs on this box when the box is well. A ranked run compares its measured
-control leg against that band, and refuses the run when the leg is SLOWER than
-the band's ceiling (`mean * band_high` on either axis). This is regression
-detection only: a slow control leg means the box is not well. A control leg
-faster than the calibration passes; the candidate is scored against that same
-live leg, so a fast box hands the candidate nothing. The `*_band_low` values are
-recorded by the calibrator and never read. No number in the file is ever a
-denominator.
+The calibration file holds the means of a HEALTH BAND for leg 1 only. It says
+what a control leg costs on this box when the box is well. A ranked run compares
+its measured control leg against that mean, and refuses the run when the leg is
+SLOWER than the band's ceiling (`mean * high` on either axis). The track fixture
+sets `high`: `1 + prefill_band_up_tolerance` and `1 + decode_band_up_tolerance`.
+A fixture that declares no band shape gets 1.05 (prefill) and 1.02 (decode).
+This is regression detection only: a slow control leg means the box is not well.
+A control leg faster than the calibration passes; the candidate is scored
+against that same live leg, so a fast box hands the candidate nothing. The low
+bound is not checked. No number in the file is ever a denominator.
 
 Each ranked box carries its own file. A file captured on another box is refused
 by name.
@@ -159,9 +160,12 @@ is refused. `decode_seconds_per_token_mean` is the mean decode window per token:
 decode-run time / N, with no seed prefill in it. Versions 1 and 2 recorded the
 whole window (seed prefill plus decode) as decode, so benchd refuses them by name
 (`BASELINE-CALIBRATION-WHOLE-WINDOW-DECODE`). Recalibrate the box to write version 3.
-benchd reads the band from
-the file; the values above are the defaults the calibrator writes. The CV fields
-are fractions: `0.004` is 0.4 %.
+The `*_band_low` and `*_band_high` fields record the band of the track fixture
+that `calibrate-baseline` was given (`low = 1 - down tolerance`, `high = 1 + up
+tolerance`; the values above are the band of a fixture that declares none). The
+ranked run does not read these fields. It takes the band from the track fixture
+it runs under, so a file written under an earlier band stays valid, and its
+means are read as before. The CV fields are fractions: `0.004` is 0.4 %.
 
 The re-rooting that finds the reference tree's engine and weights refuses a
 candidate path that walks out of the workspace root with `..`, and refuses a

@@ -2933,7 +2933,7 @@ fn execute_measure_job(args: &MeasureJobArgs) -> Result<MeasureJobVerdict, Measu
     let run_timeout_result = {
         let band_ceiling_spt = match calibration.as_ref() {
             Some(cal) if cal.serial_mean.is_finite() && cal.serial_mean > 0.0 => {
-                cal.serial_mean * cal.band_high
+                baseline::band_ceiling(cal.serial_mean, cal.band_high)
             }
             _ => bench_core::constants::RUN_TIMEOUT_DEFAULT_BAND_CEILING_SECONDS_PER_TOKEN,
         };
@@ -3177,7 +3177,7 @@ fn execute_measure_job(args: &MeasureJobArgs) -> Result<MeasureJobVerdict, Measu
         };
         let band_ceiling_spt = match calibration.as_ref() {
             Some(cal) if cal.serial_mean.is_finite() && cal.serial_mean > 0.0 => {
-                cal.serial_mean * cal.band_high
+                baseline::band_ceiling(cal.serial_mean, cal.band_high)
             }
             _ => bench_core::constants::RUN_TIMEOUT_DEFAULT_BAND_CEILING_SECONDS_PER_TOKEN,
         };

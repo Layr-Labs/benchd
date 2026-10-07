@@ -121,7 +121,9 @@ pooled serial denominator has not drifted from a calibrated reference at the SAM
   (`serial_mean`, `band_low`, `band_high`, `decode_tokens`, honest `source`).
 - **Band-enforcement path** — after measuring, `crates/benchd/src/measure_job.rs:1016`
   `evaluate_serial_band` computes `ratio = pooled_serial_mean / calibration_mean` and checks
-  `ratio ∈ [band_low, band_high]` (`:1112`–`:1113`), with the window check HARD:
+  `ratio ∈ [band_low, band_high]` (`:1112`–`:1113`; since 2026-10-07 this is
+  `baseline::within_band`, `mean * low <= pooled <= mean * high`, the arithmetic the paired
+  health band also uses), with the window check HARD:
   `decode_tokens` must be present AND equal `--tokens` (`:1046`–`:1075`) — seconds/token is
   not comparable across token counts. (When this was written the seed prefill was charged
   inside the decode window. Since 2026-10-07 decode is the decode window only.) The verdict is `:972` `SerialBandVerdict` (`Pass` / `WarnOutOfBand` / `Die6`), sealed

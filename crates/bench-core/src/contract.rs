@@ -936,7 +936,7 @@ fn declared_baseline_pair(contract: &Contract) -> Option<(f64, f64)> {
 
 /// The band shape the fixture DECLARES, or `None` when it declares none of it. A PARTIAL shape
 /// never reaches here — [`certify_acceptance_bands`] refuses it at the parse.
-fn declared_bands(contract: &Contract) -> Option<AcceptanceBands> {
+pub fn declared_bands(contract: &Contract) -> Option<AcceptanceBands> {
     Some(AcceptanceBands {
         prefill_up_tolerance: contract.prefill_band_up_tolerance?,
         prefill_down_tolerance: contract.prefill_band_down_tolerance?,

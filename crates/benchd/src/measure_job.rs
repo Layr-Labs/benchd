@@ -3200,8 +3200,15 @@ pub fn evaluate_serial_band(
         );
     }
 
+    // THE ONE BAND ARITHMETIC (`baseline::within_band`): the health band of the paired path uses
+    // the same `mean * low <= measured <= mean * high` test. The ratio is sealed for the reader.
     let ratio = pooled_serial_mean / cal.serial_mean;
-    let in_band = ratio >= cal.band_low && ratio <= cal.band_high;
+    let in_band = crate::baseline::within_band(
+        pooled_serial_mean,
+        cal.serial_mean,
+        Some(cal.band_low),
+        cal.band_high,
+    );
     if in_band {
         make(
             SerialBandVerdict::Pass,

@@ -49,8 +49,8 @@ REQUIRED:
     --golden <PATH>              Repeatable. A LIVE golden of the track: one prompt a ranked run
                                  measures. Give each golden a ranked run on this box measures.
     --contract <FILE>            The track fixture. It declares the model shape the golden loads
-                                 under and the measurement window the legs run, so the verb cannot
-                                 run without it.
+                                 under, the measurement window the legs run and the health band
+                                 the file records, so the verb cannot run without it.
     --out <FILE>                 Where to write the calibration file.
 
 OPTIONS:
@@ -476,6 +476,7 @@ fn execute(args: &[String]) -> Result<Option<()>, String> {
             captured_at: &captured_at,
         },
         &prompt_passes,
+        baseline::HealthBand::of_contract(&loaded.contract),
         gate_log.records(),
     )?;
     let sha256 = baseline::write_calibration(&args.out, &calibration)?;

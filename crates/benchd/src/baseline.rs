@@ -16,8 +16,9 @@
 //! * [`BaselineCalibration::check_identity`] — the file names THIS track and THIS box, and holds
 //!   an entry for the prompt;
 //! * [`BaselineCalibration::check_band`] — the control leg's measured seconds-per-token sit inside
-//!   this box's HEALTH BAND for the prompt it measured. The band is a health gate on leg 1 and
-//!   NEVER a denominator: no number in the file reaches the score;
+//!   the HEALTH BAND around this box's mean for the prompt it measured. The mean comes from the
+//!   file; the band comes from the track fixture ([`HealthBand::of_contract`]). The band is a
+//!   health gate on leg 1 and NEVER a denominator: no number in the file reaches the score;
 //! * [`refuse_golden_with_stored_pair`] / [`refuse_stored_baseline_override`] — a golden carrying
 //!   `benchmark.baseline_*_seconds_per_token`, and the `MLXFAST_PAIRED_BASELINE_*` env /
 //!   `--baseline-*` flags, are refused on this path because each is a stored denominator.
@@ -27,7 +28,8 @@
 //! ([`bench_core::constants::CALIBRATION_CV_EXCEEDED`]) when the box is too noisy for the mean to
 //! describe it.
 
-use bench_core::constants::{CALIBRATION_CV_EXCEEDED, CALIBRATION_MAX_CV_PERCENT};
+use bench_core::constants::{AcceptanceBands, CALIBRATION_CV_EXCEEDED, CALIBRATION_MAX_CV_PERCENT};
+use bench_core::contract::Contract;
 use bench_core::golden::GoldenFixture;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -104,8 +106,8 @@ pub const MULTIPLE_GOLDENS_WITHOUT_PAIRED_PATH: &str = "MULTIPLE-GOLDENS-WITHOUT
 pub const OFFICIAL_PAIRS_NOT_A_MULTIPLE_OF_GOLDENS: &str =
     "OFFICIAL-PAIRS-NOT-A-MULTIPLE-OF-GOLDENS";
 
-/// The band literals [`calibration_from_passes`] writes. benchd READS the band from the file — a
-/// box that needs a different band re-calibrates, it does not edit a constant here.
+/// The health band of a track whose fixture declares no acceptance band shape
+/// ([`HealthBand::DEFAULT`]). A fixture that declares the shape sets the band itself.
 pub const DEFAULT_PREFILL_BAND_LOW: f64 = 0.95;
 /// See [`DEFAULT_PREFILL_BAND_LOW`].
 pub const DEFAULT_PREFILL_BAND_HIGH: f64 = 1.05;
@@ -113,6 +115,64 @@ pub const DEFAULT_PREFILL_BAND_HIGH: f64 = 1.05;
 pub const DEFAULT_DECODE_BAND_LOW: f64 = 0.98;
 /// See [`DEFAULT_PREFILL_BAND_LOW`].
 pub const DEFAULT_DECODE_BAND_HIGH: f64 = 1.02;
+
+/// THE HEALTH BAND of the serial-control leg, as multipliers of the calibrated mean: a leg is
+/// inside when `mean * low <= measured <= mean * high` ([`within_band`]).
+///
+/// The TRACK FIXTURE is the one source. [`HealthBand::of_contract`] reads its acceptance band
+/// shape (`*_band_up_tolerance` / `*_band_down_tolerance`): `high = 1 + up`, `low = 1 - down`.
+/// `benchd calibrate-baseline` writes these values into the file, and the scored run checks the
+/// leg against the same values from the same fixture. The scored run does NOT read the band
+/// fields of the file: they record the band the file was written under. So a file written before
+/// this rule, or under a fixture whose band changed since, is still read with its means, and the
+/// band the run applies is the one the fixture declares now.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct HealthBand {
+    pub prefill_low: f64,
+    pub prefill_high: f64,
+    pub decode_low: f64,
+    pub decode_high: f64,
+}
+
+impl HealthBand {
+    /// The band of a fixture that declares no acceptance band shape.
+    pub const DEFAULT: HealthBand = HealthBand {
+        prefill_low: DEFAULT_PREFILL_BAND_LOW,
+        prefill_high: DEFAULT_PREFILL_BAND_HIGH,
+        decode_low: DEFAULT_DECODE_BAND_LOW,
+        decode_high: DEFAULT_DECODE_BAND_HIGH,
+    };
+
+    /// The health band of `contract`: its declared band shape, else [`HealthBand::DEFAULT`].
+    /// Calibration and the scored run both call this, so the file and the check agree.
+    pub fn of_contract(contract: &Contract) -> HealthBand {
+        bench_core::contract::declared_bands(contract).map_or(HealthBand::DEFAULT, HealthBand::from)
+    }
+}
+
+impl From<AcceptanceBands> for HealthBand {
+    fn from(bands: AcceptanceBands) -> HealthBand {
+        HealthBand {
+            prefill_low: 1.0 - bands.prefill_down_tolerance,
+            prefill_high: 1.0 + bands.prefill_up_tolerance,
+            decode_low: 1.0 - bands.decode_down_tolerance,
+            decode_high: 1.0 + bands.decode_up_tolerance,
+        }
+    }
+}
+
+/// THE ONE BAND ARITHMETIC: the ceiling of a band around `mean` is `mean * high`. The health band
+/// ([`BaselineCalibration::check_band`]), the measure-job serial band and the RunTimeout ceiling
+/// all use this product.
+pub fn band_ceiling(mean: f64, high: f64) -> f64 {
+    mean * high
+}
+
+/// `measured` is inside the band around `mean`: at most [`band_ceiling`] and, when `low` is
+/// given, at least `mean * low`. `low = None` checks the ceiling only.
+pub fn within_band(measured: f64, mean: f64, low: Option<f64>, high: f64) -> bool {
+    measured <= band_ceiling(mean, high) && low.is_none_or(|low| measured >= mean * low)
+}
 
 /// One box's calibration file: VALUES ONLY, and every value is a HEALTH fact about the box.
 ///
@@ -307,17 +367,19 @@ impl BaselineCalibration {
     }
 
     /// The HEALTH GATE on the serial-control leg of `prompt`: `measured <= mean * high` on both
-    /// axes, against that prompt's entry. It is regression detection only: a control leg SLOWER
-    /// than the band says the box is not well (thermal, contention, a wrong tree) and the run
-    /// seals no score. A leg FASTER than its calibration is a well box and passes; the candidate is
-    /// scored against that same live leg, so a fast box hands the candidate nothing. `*_band_low`
-    /// is recorded by the calibrator and never read here. Nothing here reaches the score — a leg
-    /// inside the band is scored by its own measured value.
+    /// axes, with the mean from that prompt's entry and `high` from `band`, the track fixture's
+    /// [`HealthBand`]. The band fields of the file are not read here (see [`HealthBand`]). It is
+    /// regression detection only: a control leg SLOWER than the band says the box is not well
+    /// (thermal, contention, a wrong tree) and the run seals no score. A leg FASTER than its
+    /// calibration is a well box and passes; the candidate is scored against that same live leg,
+    /// so a fast box hands the candidate nothing. The low bound is not checked. Nothing here
+    /// reaches the score — a leg inside the band is scored by its own measured value.
     pub fn check_band(
         &self,
         prompt: &str,
         prefill_spt: f64,
         decode_spt: f64,
+        band: HealthBand,
     ) -> Result<(), String> {
         let entry = self.entry(prompt)?;
         for (axis, measured, mean, high) in [
@@ -325,13 +387,13 @@ impl BaselineCalibration {
                 "prefill",
                 prefill_spt,
                 entry.prefill_seconds_per_token_mean,
-                entry.prefill_band_high,
+                band.prefill_high,
             ),
             (
                 "decode",
                 decode_spt,
                 entry.decode_seconds_per_token_mean,
-                entry.decode_band_high,
+                band.decode_high,
             ),
         ] {
             if !(measured.is_finite() && measured > 0.0) {
@@ -341,13 +403,13 @@ impl BaselineCalibration {
                      finite positive number"
                 ));
             }
-            let hi = mean * high;
-            if measured > hi {
+            if !within_band(measured, mean, None, high) {
+                let hi = band_ceiling(mean, high);
                 return Err(format!(
                     "{SERIAL_CONTROL_LEG_OUTSIDE_BAND}: serial-control leg outside this box's \
                      band: the {axis} leg measured {measured} seconds per token, and box {:?} is \
                      calibrated at {mean} on prompt {prompt:?} with a ceiling of {hi} ({high} of \
-                     the mean); the box is slower than when it was calibrated; refusing to seal a \
+                     the mean, the track fixture's band); the box is slower than when it was calibrated; refusing to seal a \
                      score",
                     self.box_name
                 ));
@@ -834,15 +896,17 @@ pub fn control_leg_seconds(legs: &[bench_runner::TimingResult]) -> (Vec<f64>, Ve
 ///
 /// The gate is the SAME fixed one the stored-pair capture used: a per-axis SAMPLE coefficient of
 /// variation above [`CALIBRATION_MAX_CV_PERCENT`] refuses by name — a box whose legs spread that
-/// wide has no mean that describes it, so it has no band either.
+/// wide has no mean that describes it, so it has no band either. Each entry records `band`, which
+/// the caller resolves with [`HealthBand::of_contract`] from the same fixture the scored run reads.
 pub fn calibration_from_passes(
     identity: &CalibrationIdentity<'_>,
     prompts: &[PromptPasses<'_>],
+    band: HealthBand,
     gates: Vec<crate::quiescegate::GateRecord>,
 ) -> Result<BaselineCalibration, String> {
     let mut entries = Vec::with_capacity(prompts.len());
     for passes in prompts {
-        entries.push(prompt_calibration_from_passes(passes)?);
+        entries.push(prompt_calibration_from_passes(passes, band)?);
     }
     let calibration = BaselineCalibration {
         version: CALIBRATION_VERSION,
@@ -860,7 +924,10 @@ pub fn calibration_from_passes(
 }
 
 /// One prompt's entry from its measured legs.
-fn prompt_calibration_from_passes(passes: &PromptPasses<'_>) -> Result<PromptCalibration, String> {
+fn prompt_calibration_from_passes(
+    passes: &PromptPasses<'_>,
+    band: HealthBand,
+) -> Result<PromptCalibration, String> {
     let PromptPasses {
         prompt,
         prefill_legs,
@@ -913,10 +980,10 @@ fn prompt_calibration_from_passes(passes: &PromptPasses<'_>) -> Result<PromptCal
         decode_seconds_per_token_mean: means[1],
         prefill_cv: cvs[0],
         decode_cv: cvs[1],
-        prefill_band_low: DEFAULT_PREFILL_BAND_LOW,
-        prefill_band_high: DEFAULT_PREFILL_BAND_HIGH,
-        decode_band_low: DEFAULT_DECODE_BAND_LOW,
-        decode_band_high: DEFAULT_DECODE_BAND_HIGH,
+        prefill_band_low: band.prefill_low,
+        prefill_band_high: band.prefill_high,
+        decode_band_low: band.decode_low,
+        decode_band_high: band.decode_high,
     })
 }
 
@@ -983,6 +1050,158 @@ mod tests {
 
     fn parse(doc: &serde_json::Value) -> Result<BaselineCalibration, String> {
         BaselineCalibration::parse(serde_json::to_vec(doc).unwrap().as_slice())
+    }
+
+    /// A track fixture that declares the band shape: `decode_up` is its decode up tolerance; the
+    /// rest is the CUDA Nemotron shape (prefill up 0.05, both downs 0.05 and disabled).
+    fn fixture_with_decode_up(decode_up: f64) -> Contract {
+        Contract {
+            prefill_band_up_tolerance: Some(0.05),
+            prefill_band_down_tolerance: Some(0.05),
+            decode_band_up_tolerance: Some(decode_up),
+            decode_band_down_tolerance: Some(0.05),
+            decode_band_down_enabled: Some(false),
+            prefill_band_down_enabled: Some(false),
+            ..Contract::NONE_DECLARED
+        }
+    }
+
+    /// A v3 file as `calibrate-baseline` wrote it before the band came from the fixture: the
+    /// default band fields (decode high 1.02), and the decode mean of the refused run.
+    fn file_with_default_band_fields(decode_mean: f64) -> BaselineCalibration {
+        let mut doc = valid_document();
+        doc["prompts"][0]["prompt"] = json!("prompt-a");
+        doc["prompts"][0]["decode_seconds_per_token_mean"] = json!(decode_mean);
+        parse(&doc).unwrap()
+    }
+
+    /// REGRESSION (Yukon submission 10f68e7e, run 37700636595): the CUDA fixture declares a decode
+    /// up tolerance of 0.03, and the control leg of pair 3 measured +2.26% over its calibrated
+    /// mean. The run checked the 1.02 band field of the file, not the fixture, and refused. The
+    /// health band now comes from the fixture: +2.26% is inside 1.03, +3.1% is outside, and the
+    /// band fields of the file (1.02 here) are not read.
+    #[test]
+    fn regression_10f68e7e_the_health_band_is_the_fixture_band_not_the_file_band() {
+        let mean = 0.013117913;
+        let measured = 0.013414810;
+        let over = measured / mean - 1.0;
+        assert!(over > 0.0226 && over < 0.0227, "{over}");
+        let cal = file_with_default_band_fields(mean);
+        assert_eq!(cal.prompts[0].decode_band_high, DEFAULT_DECODE_BAND_HIGH);
+        let p = cal.prompts[0].prefill_seconds_per_token_mean;
+
+        let band = HealthBand::of_contract(&fixture_with_decode_up(0.03));
+        assert_eq!(band.decode_high, 1.0 + 0.03);
+        assert_eq!(band.prefill_high, 1.0 + 0.05);
+        assert!(cal.check_band("prompt-a", p, measured, band).is_ok());
+        let err = cal
+            .check_band("prompt-a", p, mean * 1.031, band)
+            .unwrap_err();
+        assert!(err.contains(SERIAL_CONTROL_LEG_OUTSIDE_BAND), "{err}");
+        assert!(err.contains("decode") && err.contains("1.03"), "{err}");
+
+        // The old behaviour: the 1.02 band (the file's field, and the default) refuses the leg.
+        let err = cal
+            .check_band("prompt-a", p, measured, HealthBand::DEFAULT)
+            .unwrap_err();
+        assert!(err.contains(SERIAL_CONTROL_LEG_OUTSIDE_BAND), "{err}");
+    }
+
+    /// A fixture that declares no band shape gets the default band, and the default band is the
+    /// band the band fields of every earlier file carry.
+    #[test]
+    fn a_fixture_that_declares_no_band_uses_the_default_band() {
+        let band = HealthBand::of_contract(&Contract::NONE_DECLARED);
+        assert_eq!(band, HealthBand::DEFAULT);
+        assert_eq!(
+            (
+                band.prefill_low,
+                band.prefill_high,
+                band.decode_low,
+                band.decode_high
+            ),
+            (0.95, 1.05, 0.98, 1.02)
+        );
+        let cal = file_with_default_band_fields(0.03);
+        let p = cal.prompts[0].prefill_seconds_per_token_mean;
+        assert!(cal.check_band("prompt-a", p, 0.03 * 1.02, band).is_ok());
+        assert!(cal.check_band("prompt-a", p, 0.03 * 1.0201, band).is_err());
+        // The MLX shape (decode up 0.02, prefill up 0.05) is the default band on the ceilings.
+        let mlx = HealthBand::of_contract(&fixture_with_decode_up(0.02));
+        assert_eq!(mlx.decode_high, DEFAULT_DECODE_BAND_HIGH);
+        assert_eq!(mlx.prefill_high, DEFAULT_PREFILL_BAND_HIGH);
+    }
+
+    /// CROSS-PATH: `calibrate-baseline` and the scored run use ONE band. For each fixture shape,
+    /// the band fields the calibration writes equal the band the scored run applies (the run
+    /// resolves it from the fixture's acceptance bands), and a leg at the written ceiling passes
+    /// the run's check while a leg just above it refuses.
+    #[test]
+    fn calibration_and_the_scored_run_use_the_same_band() {
+        let identity = CalibrationIdentity {
+            track_id: "track-a",
+            box_name: "box-a",
+            reference_commit: &"a".repeat(40),
+            benchd_source_commit: &"b".repeat(40),
+            captured_at: "2026-10-07T00:00:00Z",
+        };
+        for fixture in [
+            fixture_with_decode_up(0.03),
+            fixture_with_decode_up(0.02),
+            fixture_with_decode_up(0.0),
+            Contract::NONE_DECLARED,
+        ] {
+            let written = calibration_from_passes(
+                &identity,
+                &[PromptPasses {
+                    prompt: "prompt-a",
+                    prefill_legs: &[0.000_3, 0.000_3],
+                    decode_legs: &[0.013, 0.013],
+                }],
+                HealthBand::of_contract(&fixture),
+                Vec::new(),
+            )
+            .unwrap();
+            let entry = &written.prompts[0];
+            let file_band = HealthBand {
+                prefill_low: entry.prefill_band_low,
+                prefill_high: entry.prefill_band_high,
+                decode_low: entry.decode_band_low,
+                decode_high: entry.decode_band_high,
+            };
+            // The band the scored run applies: the fixture's acceptance bands on the paired path
+            // (which refuses a fixture without them), the default otherwise.
+            let run_band = bench_core::contract::acceptance_bands(&fixture, "track-a")
+                .map_or(HealthBand::DEFAULT, |b| HealthBand::from(b.value));
+            assert_eq!(file_band, run_band);
+            let (p, d) = (
+                entry.prefill_seconds_per_token_mean,
+                entry.decode_seconds_per_token_mean,
+            );
+            let at_ceiling = band_ceiling(d, file_band.decode_high);
+            assert!(written
+                .check_band("prompt-a", p, at_ceiling, run_band)
+                .is_ok());
+            assert!(written
+                .check_band("prompt-a", p, at_ceiling * 1.000_001, run_band)
+                .is_err());
+        }
+    }
+
+    /// THE ONE BAND ARITHMETIC: the ceiling is `mean * high` and both ends are inclusive.
+    #[test]
+    fn the_band_arithmetic_is_one_product() {
+        assert_eq!(band_ceiling(0.02, 1.03), 0.02 * 1.03);
+        assert!(within_band(0.02 * 1.03, 0.02, None, 1.03));
+        assert!(!within_band(0.02 * 1.03 * 1.000_001, 0.02, None, 1.03));
+        assert!(within_band(0.0, 0.02, None, 1.03));
+        assert!(within_band(0.02 * 0.95, 0.02, Some(0.95), 1.05));
+        assert!(!within_band(
+            0.02 * 0.95 * 0.999_999,
+            0.02,
+            Some(0.95),
+            1.05
+        ));
     }
 
     #[test]
@@ -1102,11 +1321,17 @@ mod tests {
         assert!(err.contains(BASELINE_CALIBRATION_PROMPT_MISMATCH), "{err}");
         assert!(err.contains("fern") && err.contains("kelp"), "{err}");
 
-        assert!(cal.check_band("kelp", 0.0006, 0.060).is_ok());
-        let err = cal.check_band("botany", 0.0006, 0.060).unwrap_err();
+        assert!(cal
+            .check_band("kelp", 0.0006, 0.060, HealthBand::DEFAULT)
+            .is_ok());
+        let err = cal
+            .check_band("botany", 0.0006, 0.060, HealthBand::DEFAULT)
+            .unwrap_err();
         assert!(err.contains(SERIAL_CONTROL_LEG_OUTSIDE_BAND), "{err}");
         assert!(err.contains("botany"), "{err}");
-        let err = cal.check_band("fern", 0.0006, 0.030).unwrap_err();
+        let err = cal
+            .check_band("fern", 0.0006, 0.030, HealthBand::DEFAULT)
+            .unwrap_err();
         assert!(err.contains(BASELINE_CALIBRATION_PROMPT_MISMATCH), "{err}");
 
         // Two entries for one prompt would make the lookup ambiguous.
@@ -1256,14 +1481,24 @@ mod tests {
             cal.prompts[0].decode_seconds_per_token_mean,
         );
         // Dead centre and the ceiling of each band are INSIDE.
-        assert!(cal.check_band("botany", p, d).is_ok());
-        assert!(cal.check_band("botany", p * 1.05, d * 1.02).is_ok());
+        assert!(cal.check_band("botany", p, d, HealthBand::DEFAULT).is_ok());
+        assert!(cal
+            .check_band("botany", p * 1.05, d * 1.02, HealthBand::DEFAULT)
+            .is_ok());
         // A FASTER leg is a well box: below `*_band_low`, and far below it, both pass. The
         // low bound is recorded, never read.
-        assert!(cal.check_band("botany", p * 0.95, d * 0.98).is_ok());
-        assert!(cal.check_band("botany", p * 0.9, d).is_ok());
-        assert!(cal.check_band("botany", p, d * 0.9).is_ok());
-        assert!(cal.check_band("botany", p * 0.5, d * 0.5).is_ok());
+        assert!(cal
+            .check_band("botany", p * 0.95, d * 0.98, HealthBand::DEFAULT)
+            .is_ok());
+        assert!(cal
+            .check_band("botany", p * 0.9, d, HealthBand::DEFAULT)
+            .is_ok());
+        assert!(cal
+            .check_band("botany", p, d * 0.9, HealthBand::DEFAULT)
+            .is_ok());
+        assert!(cal
+            .check_band("botany", p * 0.5, d * 0.5, HealthBand::DEFAULT)
+            .is_ok());
 
         // A SLOWER leg, on either axis, refuses by name.
         for (label, prefill, decode) in [
@@ -1271,7 +1506,9 @@ mod tests {
             ("decode high", p, d * 1.1),
             ("decode just over", p, d * 1.0201),
         ] {
-            let err = cal.check_band("botany", prefill, decode).unwrap_err();
+            let err = cal
+                .check_band("botany", prefill, decode, HealthBand::DEFAULT)
+                .unwrap_err();
             assert!(
                 err.contains(SERIAL_CONTROL_LEG_OUTSIDE_BAND)
                     && err.contains("serial-control leg outside this box's band"),
@@ -1280,8 +1517,12 @@ mod tests {
             assert!(err.contains(&cal.box_name), "{label}: {err}");
         }
         // A non-finite or non-positive measurement is outside every band.
-        assert!(cal.check_band("botany", f64::NAN, d).is_err());
-        assert!(cal.check_band("botany", p, 0.0).is_err());
+        assert!(cal
+            .check_band("botany", f64::NAN, d, HealthBand::DEFAULT)
+            .is_err());
+        assert!(cal
+            .check_band("botany", p, 0.0, HealthBand::DEFAULT)
+            .is_err());
     }
 
     #[test]
@@ -1475,6 +1716,7 @@ mod tests {
                 &[0.001, 0.001, 0.001, 0.001],
                 &[0.030, 0.030, 0.030, 0.030],
             )],
+            HealthBand::DEFAULT,
             Vec::new(),
         )
         .unwrap();
@@ -1493,6 +1735,7 @@ mod tests {
                 &[0.001, 0.001, 0.001, 0.001],
                 &[0.030, 0.032, 0.029, 0.031],
             )],
+            HealthBand::DEFAULT,
             Vec::new(),
         )
         .unwrap_err();
@@ -1524,8 +1767,13 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
 
         // One pass has no coefficient of variation at all.
-        let err = calibration_from_passes(&identity, &[passes(&[0.001], &[0.030])], Vec::new())
-            .unwrap_err();
+        let err = calibration_from_passes(
+            &identity,
+            &[passes(&[0.001], &[0.030])],
+            HealthBand::DEFAULT,
+            Vec::new(),
+        )
+        .unwrap_err();
         assert!(err.contains(BASELINE_CALIBRATION_INVALID), "{err}");
     }
 
@@ -1557,6 +1805,7 @@ mod tests {
                     prefill_legs: &prefill_legs,
                     decode_legs: &decode_legs,
                 }],
+                HealthBand::DEFAULT,
                 Vec::new(),
             )
             .unwrap();
@@ -1579,7 +1828,8 @@ mod tests {
             .check_band(
                 "botany",
                 slow_seed.prefill_seconds_per_token,
-                slow_seed.decode_seconds_per_token
+                slow_seed.decode_seconds_per_token,
+                HealthBand::DEFAULT,
             )
             .is_ok());
         // A leg whose decode window itself is 5% slower is refused.
@@ -1589,6 +1839,7 @@ mod tests {
                 "botany",
                 slow_decode.prefill_seconds_per_token,
                 slow_decode.decode_seconds_per_token,
+                HealthBand::DEFAULT,
             )
             .unwrap_err();
         assert!(err.contains(SERIAL_CONTROL_LEG_OUTSIDE_BAND), "{err}");
@@ -1619,6 +1870,7 @@ mod tests {
                     decode_legs: &[0.060, 0.060],
                 },
             ],
+            HealthBand::DEFAULT,
             Vec::new(),
         )
         .unwrap();
@@ -1685,7 +1937,8 @@ mod tests {
             point(2, "prefill", 30),
             point(2, "decode", 45),
         ];
-        let cal = calibration_from_passes(&identity, &prompts, gates.clone()).unwrap();
+        let cal = calibration_from_passes(&identity, &prompts, HealthBand::DEFAULT, gates.clone())
+            .unwrap();
         assert_eq!(cal.gates, gates);
 
         let dir = std::env::temp_dir().join(format!(
@@ -1710,7 +1963,8 @@ mod tests {
 
         // NO gate points (the gates were off): the key is omitted, so the file's key set is the
         // one every calibration file before this change had.
-        let ungated = calibration_from_passes(&identity, &prompts, Vec::new()).unwrap();
+        let ungated =
+            calibration_from_passes(&identity, &prompts, HealthBand::DEFAULT, Vec::new()).unwrap();
         let out = dir.join("ungated.json");
         write_calibration(&out, &ungated).unwrap();
         let sealed: serde_json::Value =

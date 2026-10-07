@@ -1127,6 +1127,7 @@ where
             pair_goldens.prompt,
             control.prefill_seconds_per_token,
             control.decode_seconds_per_token,
+            crate::baseline::HealthBand::from(bands),
         ) {
             let e = if pairs > 1 {
                 format!("pair {pair} of {pairs}: {e}")
@@ -4993,11 +4994,12 @@ mod tests {
 
     // ---- THE RANKED PAIRED PATH (David 2026-09-08) --------------------------------------
 
-    /// A calibration whose band is deliberately WIDE. The mock engine's wall clock is ~0, so its
-    /// measured seconds-per-token is a real but tiny positive number that no realistic band could
-    /// contain; a wide band lets the orchestration under test run to its end instead of stopping
-    /// at the health gate. The NARROW band is exercised on its own, against real numbers, in
-    /// `baseline.rs` (`the_band_check_holds_on_both_axes_and_in_both_directions`).
+    /// A calibration every mock leg is FASTER than. The mock engine's wall clock is ~0, so its
+    /// measured seconds-per-token is a real but tiny positive number; means of one second per
+    /// token put every such leg far below the ceiling of the track's band, so the orchestration
+    /// under test runs to its end instead of stopping at the health gate. The band itself comes
+    /// from the fixture (`PairedWindow::bands`), never from these fields. The band is exercised
+    /// on its own, against real numbers, in `baseline.rs`.
     fn wide_calibration() -> crate::baseline::BaselineCalibration {
         crate::baseline::BaselineCalibration {
             version: crate::baseline::CALIBRATION_VERSION,
@@ -5011,19 +5013,19 @@ mod tests {
         }
     }
 
-    /// One prompt's WIDE band (see [`wide_calibration`]).
+    /// One prompt's entry that every mock leg is faster than (see [`wide_calibration`]).
     fn wide_prompt_calibration(prompt: &str) -> crate::baseline::PromptCalibration {
         crate::baseline::PromptCalibration {
             prompt: prompt.to_string(),
             passes: 4,
-            prefill_seconds_per_token_mean: 1e-6,
-            decode_seconds_per_token_mean: 1e-6,
+            prefill_seconds_per_token_mean: 1.0,
+            decode_seconds_per_token_mean: 1.0,
             prefill_cv: 0.0,
             decode_cv: 0.0,
-            prefill_band_low: 1e-6,
-            prefill_band_high: 1e6,
-            decode_band_low: 1e-6,
-            decode_band_high: 1e6,
+            prefill_band_low: crate::baseline::DEFAULT_PREFILL_BAND_LOW,
+            prefill_band_high: crate::baseline::DEFAULT_PREFILL_BAND_HIGH,
+            decode_band_low: crate::baseline::DEFAULT_DECODE_BAND_LOW,
+            decode_band_high: crate::baseline::DEFAULT_DECODE_BAND_HIGH,
         }
     }
 
@@ -5033,10 +5035,6 @@ mod tests {
         crate::baseline::PromptCalibration {
             prefill_seconds_per_token_mean: 1e-9,
             decode_seconds_per_token_mean: 1e-9,
-            prefill_band_low: crate::baseline::DEFAULT_PREFILL_BAND_LOW,
-            prefill_band_high: crate::baseline::DEFAULT_PREFILL_BAND_HIGH,
-            decode_band_low: crate::baseline::DEFAULT_DECODE_BAND_LOW,
-            decode_band_high: crate::baseline::DEFAULT_DECODE_BAND_HIGH,
             ..wide_prompt_calibration(prompt)
         }
     }
@@ -5999,6 +5997,77 @@ mod tests {
             payload.metrics.baseline_golden_sha256.as_deref(),
             Some(second.sha256.as_str()),
             "the refusal names the control golden of the pair that stopped"
+        );
+    }
+
+    /// THE PAIRED RUN APPLIES THE FIXTURE'S BAND, not the band fields of the calibration file
+    /// (regression of Yukon submission 10f68e7e). The mock legs are far slower than means of a
+    /// nanosecond per token. A fixture band wide enough to hold them passes the health gate while
+    /// the file's fields say 1.02; a file whose fields are that wide refuses under the test
+    /// fixture's band.
+    #[test]
+    fn the_paired_run_applies_the_fixture_band_not_the_file_band() {
+        let golden = official_golden(None);
+        let run = |calibration: &crate::baseline::BaselineCalibration, bands: AcceptanceBands| {
+            let mut window = paired_window_for_test(|_phase: &str| Ok(()));
+            window.bands = bands;
+            official_core_paired(
+                &[PairedGoldens {
+                    candidate: &golden,
+                    control: &golden,
+                    prompt: "prompt-a",
+                }],
+                calibration,
+                paired_seal_for_test(calibration),
+                RunDigests::for_test(&DirDigest::empty()),
+                "deadbeef",
+                PairedLegs {
+                    open_baseline_leg: |_| Ok(()),
+                    open_candidate_leg: |_| Ok(()),
+                    spawn_baseline: || Session::connect(conformant_engine()).map(|(s, _)| s),
+                    spawn_timed: || Session::connect(conformant_engine()).map(|(s, _)| s),
+                },
+                window,
+            )
+        };
+        let wide_fixture = AcceptanceBands {
+            prefill_up_tolerance: 1e12,
+            decode_up_tolerance: 1e12,
+            ..TEST_BASELINE.bands
+        };
+
+        let narrow = || crate::baseline::BaselineCalibration {
+            prompts: vec![narrow_prompt_calibration("prompt-a")],
+            ..wide_calibration()
+        };
+        let file_says_1_02 = narrow();
+        assert_eq!(
+            file_says_1_02.prompts[0].decode_band_high,
+            crate::baseline::DEFAULT_DECODE_BAND_HIGH
+        );
+        let payload = run(&file_says_1_02, wide_fixture);
+        assert!(
+            !payload
+                .metrics
+                .error
+                .contains(crate::baseline::SERIAL_CONTROL_LEG_OUTSIDE_BAND),
+            "{}",
+            payload.metrics.error
+        );
+        assert_eq!(payload.metrics.paired_legs.len(), 1);
+
+        let mut file_says_wide = narrow();
+        file_says_wide.prompts[0].prefill_band_high = 1e12;
+        file_says_wide.prompts[0].decode_band_high = 1e12;
+        let payload = run(&file_says_wide, TEST_BASELINE.bands);
+        assert!(payload.score.is_none());
+        assert!(
+            payload
+                .metrics
+                .error
+                .contains(crate::baseline::SERIAL_CONTROL_LEG_OUTSIDE_BAND),
+            "{}",
+            payload.metrics.error
         );
     }
 
@@ -7156,6 +7225,7 @@ mod tests {
                 prefill_legs: &prefill_legs,
                 decode_legs: &decode_legs,
             }],
+            crate::baseline::HealthBand::DEFAULT,
             Vec::new(),
         )
         .unwrap();
