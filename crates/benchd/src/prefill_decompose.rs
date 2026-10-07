@@ -202,7 +202,7 @@ where
         let mut session = spawn()?;
         let samples = time_prefill_reps(&mut session, n, reps)?;
         let min_ms = samples.iter().cloned().fold(f64::INFINITY, f64::min);
-        let mean_ms = samples.iter().sum::<f64>() / samples.len() as f64;
+        let mean_ms = bench_core::stats::mean(&samples);
         out.push(SizeMeasurement {
             n,
             reps,

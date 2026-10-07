@@ -31,13 +31,28 @@ pub fn leg_timing(
     seed_prefill_seconds: f64,
     decode_window_seconds: f64,
 ) -> bench_runner::TimingResult {
+    leg_timing_over(
+        prefill_seconds_per_token,
+        seed_prefill_seconds,
+        decode_window_seconds,
+        BENCHMARK_DECODE_STEPS,
+    )
+}
+
+/// [`leg_timing`] over a decode window of `decode_steps` tokens (local-submit times 1023).
+pub fn leg_timing_over(
+    prefill_seconds_per_token: f64,
+    seed_prefill_seconds: f64,
+    decode_window_seconds: f64,
+    decode_steps: usize,
+) -> bench_runner::TimingResult {
     bench_runner::TimingResult {
         prefill_seconds_per_token,
         decode_seconds_per_token: bench_core::score::decode_window_seconds_per_token(
             decode_window_seconds,
-            BENCHMARK_DECODE_STEPS,
+            decode_steps,
         ),
-        decode_steps: BENCHMARK_DECODE_STEPS,
+        decode_steps,
         prefill_prompt_tokens: BENCHMARK_PREFILL_PROMPT_TOKENS,
         prefill_elapsed_seconds: prefill_seconds_per_token * BENCHMARK_PREFILL_PROMPT_TOKENS as f64,
         decode_elapsed_seconds: decode_window_seconds,
@@ -45,7 +60,7 @@ pub fn leg_timing(
             seed_prefill_elapsed_seconds: seed_prefill_seconds,
             decode_elapsed_seconds: decode_window_seconds,
             prefill_token_total: BENCHMARK_DECODE_SEED_TOKENS,
-            decode_token_total: BENCHMARK_DECODE_STEPS,
+            decode_token_total: decode_steps,
         }),
         peak_ram_gb: 20.0,
         effective_spec: None,

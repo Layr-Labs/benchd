@@ -147,7 +147,7 @@ pub struct StreamNearTieStats {
     pub min_committed_relative_gap_on_mismatch: Option<f64>,
     /// The MEDIAN `committed_relative_gap` over the MISMATCHED positions, under the house even-n
     /// rule (mean of the two central order statistics on an even count, the middle element on an
-    /// odd one — the same rule as `bench_core::score::paired_decode_only_median`). `None` on zero
+    /// odd one — `bench_core::stats::even_n_median`). `None` on zero
     /// mismatches, same non-fabrication rule as the min.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub median_committed_relative_gap_on_mismatch: Option<f64>,
@@ -233,25 +233,10 @@ impl fmt::Display for NearTieError {
 
 impl std::error::Error for NearTieError {}
 
-/// The house even-n median over an already-materialised f64 slice: mean of the two central order
-/// statistics on an even count, the middle element on an odd one. Mirrors
-/// `bench_core::score::paired_decode_only_median`'s rule (kept local rather than reused so the
-/// score module's function keeps its single scored meaning; the RULE is deliberately the same).
-/// `None` on an empty slice — an empty statistic is omitted, never fabricated.
+/// [`crate::stats::even_n_median`], the one median implementation, with `None` on an empty slice
+/// — an empty statistic is omitted, never fabricated.
 fn even_n_median(values: &[f64]) -> Option<f64> {
-    let n = values.len();
-    if n == 0 {
-        return None;
-    }
-    let mut sorted = values.to_vec();
-    // Total order over a materialised copy; the inputs are engine-reported gaps, and a non-finite
-    // one sorts last rather than panicking `partial_cmp`.
-    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Greater));
-    if n % 2 == 1 {
-        Some(sorted[n / 2])
-    } else {
-        Some((sorted[n / 2 - 1] + sorted[n / 2]) / 2.0)
-    }
+    (!values.is_empty()).then(|| crate::stats::even_n_median(values))
 }
 
 /// Compute the cohort's near-tie measurement over the per-stream position readouts.

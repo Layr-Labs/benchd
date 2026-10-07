@@ -233,7 +233,7 @@ pub fn sample_cv_percent(values: &[f64]) -> Option<f64> {
         return None;
     }
     let n = values.len() as f64;
-    let mean = values.iter().sum::<f64>() / n;
+    let mean = bench_core::stats::mean(values);
     if !(mean.is_finite() && mean > 0.0) {
         return None;
     }
@@ -303,7 +303,7 @@ pub fn mean(values: &[f64]) -> Option<f64> {
     if values.is_empty() {
         return None;
     }
-    let mean = values.iter().sum::<f64>() / values.len() as f64;
+    let mean = bench_core::stats::mean(values);
     mean.is_finite().then_some(mean)
 }
 

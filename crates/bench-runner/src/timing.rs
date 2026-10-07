@@ -177,6 +177,13 @@ impl TimingParams {
         self
     }
 
+    /// Measured prefill passes after the warm-up ones, in the same session and phase. The phase's
+    /// prefill time is their MEDIAN ([`median_seconds`]).
+    pub fn with_prefill_timed_runs(mut self, runs: usize) -> Self {
+        self.prefill_timed_runs = runs;
+        self
+    }
+
     /// H3 (cycle-3) — set the RunTimeout budget for the timed decode window (§2.2/§4). Builder form
     /// so existing call sites keep the untimed default; the measure-job caller arms it with
     /// `N × band-ceiling × margin`.
@@ -190,7 +197,7 @@ impl TimingParams {
 /// the worker-reported peak RAM (audit-only, from `phase_diagnostics`).
 #[derive(Debug, Clone, PartialEq)]
 pub struct TimingResult {
-    /// `prefill_seconds_per_token` = mean timed prefill elapsed / prompt token count.
+    /// `prefill_seconds_per_token` = median timed prefill elapsed / prompt token count.
     pub prefill_seconds_per_token: f64,
     /// `decode_seconds_per_token` = the DECODE WINDOW / `decode_steps`
     /// ([`bench_core::score::decode_window_seconds_per_token`]). The seed prefill is not in it.
@@ -199,7 +206,7 @@ pub struct TimingResult {
     pub decode_steps: usize,
     /// Prompt token count the prefill seconds-per-token divides by.
     pub prefill_prompt_tokens: usize,
-    /// Mean of the timed prefill round-trip elapsed seconds (raw).
+    /// Median of the timed prefill round-trip elapsed seconds (raw).
     pub prefill_elapsed_seconds: f64,
     /// The DECODE WINDOW, raw seconds: from the close of the seed prefill to the return of the
     /// decode run. The seed prefill is not in it.
@@ -329,7 +336,7 @@ pub fn run_timed_benchmark<T: LineTransport>(
 /// carries the non-scored `audit_spec_*` metrics + the verbatim per-round `acceptance_lengths`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct FreeRunTimingResult {
-    /// `prefill_seconds_per_token` = mean timed prefill elapsed / prompt token count (v1).
+    /// `prefill_seconds_per_token` = median timed prefill elapsed / prompt token count (v1).
     pub prefill_seconds_per_token: f64,
     /// `decode_seconds_per_token` = the free-run DECODE WINDOW / N verified tokens
     /// ([`bench_core::score::decode_window_seconds_per_token`]).
@@ -338,7 +345,7 @@ pub struct FreeRunTimingResult {
     pub verified_tokens: usize,
     /// Prompt token count the prefill seconds-per-token divides by.
     pub prefill_prompt_tokens: usize,
-    /// Mean of the timed prefill round-trip elapsed seconds (raw).
+    /// Median of the timed prefill round-trip elapsed seconds (raw).
     pub prefill_elapsed_seconds: f64,
     /// The free-run DECODE WINDOW, raw seconds (`free_decode_run` only; the seed prefill is not in
     /// it).
@@ -1008,9 +1015,22 @@ fn measure_prefill<T: LineTransport>(
         }
     }
 
-    let mean_elapsed = timed_elapsed.iter().sum::<f64>() / timed_elapsed.len() as f64;
-    let seconds_per_token = mean_elapsed / prompt_count as f64;
-    Ok((seconds_per_token, mean_elapsed))
+    let median_elapsed = median_seconds(&timed_elapsed);
+    let seconds_per_token =
+        bench_core::score::prefill_seconds_per_token(median_elapsed, prompt_count);
+    Ok((seconds_per_token, median_elapsed))
+}
+
+/// The MEDIAN of the timed prefill passes (the mean of the middle two for an even count). One pass
+/// is that pass, so every track that times a single prefill is unchanged. A median, not a mean:
+/// one slow pass (a clock that had not ramped yet) must not move the phase's number.
+/// The arithmetic is [`bench_core::stats::even_n_median`], the one median implementation.
+pub(crate) fn median_seconds(samples: &[f64]) -> f64 {
+    assert!(
+        !samples.is_empty(),
+        "a median needs at least one timed pass"
+    );
+    bench_core::stats::even_n_median(samples)
 }
 
 /// Teacher-forced decode phase. Sequence: `decode_begin(seed)` (the seed prefill, outside the
@@ -1570,6 +1590,16 @@ fn measure_batched_free_run_decode<T: LineTransport>(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn prefill_median_is_the_middle_pass_and_ignores_one_slow_pass() {
+        use super::median_seconds;
+        assert_eq!(median_seconds(&[0.5]), 0.5);
+        assert_eq!(median_seconds(&[0.51, 0.50, 0.52]), 0.51);
+        // One slow pass (5% over) does not move the median of five.
+        assert_eq!(median_seconds(&[0.500, 0.502, 0.501, 0.525, 0.499]), 0.501);
+        assert_eq!(median_seconds(&[0.4, 0.6]), 0.5);
+    }
+
     use super::*;
     use crate::mock::MockEngine;
     use crate::transport::ReadOutcome;

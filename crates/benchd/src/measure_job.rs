@@ -133,7 +133,7 @@ pub const SCORED_BATCH_SIZE_B8: u32 = 8;
 ///    sample-mass grounds. The 8/24 ruling is SUPERSEDED, not reinterpreted.
 ///
 /// MEDIAN SUPPORT: the published score stays the shared even-n rule
-/// ([`MEDIAN_RULE_EVEN_N`], `bench_core::score::paired_decode_only_median`), and 4 keeps the
+/// ([`MEDIAN_RULE_EVEN_N`], `bench_core::stats::even_n_median`), and 4 keeps the
 /// support EVEN, so the rule still means "mean of the two central order statistics" — at n = 4
 /// that is the mean of the 2nd and 3rd sorted cohort ratios, a REAL median that discards the
 /// extremes. (At the superseded n = 2 the same rule degenerated to the mean of both samples,
@@ -583,6 +583,16 @@ pub const DECODE_GAIN_EXPONENT: f64 = 0.75;
 pub struct ScoredExponents {
     pub prefill_gain_exponent: f64,
     pub decode_gain_exponent: f64,
+}
+
+impl ScoredExponents {
+    /// The pair as the [`bench_core::score::composite`] weights.
+    pub fn weights(self) -> bench_core::score::ScoringWeights {
+        bench_core::score::ScoringWeights {
+            decode: self.decode_gain_exponent,
+            prefill: self.prefill_gain_exponent,
+        }
+    }
 }
 
 /// The ONE ruled pair — both exponents are RULED constants (David, 2026-08-23), never per-run
@@ -5110,11 +5120,7 @@ where
     let serial_spt = serial.seconds_per_token;
     let mtp_spt = candidate.seconds_per_token;
     // serial / mtp: a faster candidate ⇒ ratio > 1. Finite by construction (both plausible).
-    let raw_ratio = if mtp_spt > 0.0 {
-        serial_spt / mtp_spt
-    } else {
-        0.0
-    };
+    let raw_ratio = bench_core::score::speedup(serial_spt, mtp_spt);
     // The candidate leg's head provenance. Present by construction on a FREE-RUN candidate
     // (validate_leg_report requires it there); EMPTY on a teacher-forced pair, whose gate-off legs
     // cannot report a head at all (#109 W3 finding 5) — the empty string is filtered back out to an
@@ -6372,8 +6378,8 @@ fn shared_window_composite(
         )
     })?;
     // The classic challenge overlay form at the CERTIFIED exponents: prefill^0.25 * decode^0.75.
-    let composite_score = prefill_gain.powf(scored_exponents.prefill_gain_exponent)
-        * decode_gain.powf(scored_exponents.decode_gain_exponent);
+    let composite_score =
+        bench_core::score::composite(prefill_gain, decode_gain, scored_exponents.weights());
     if !composite_score.is_finite() || composite_score <= 0.0 {
         return Err(format!(
             "the composite score (prefill_gain {prefill_gain} ^ {} * decode_gain {decode_gain} ^ \
@@ -6433,7 +6439,7 @@ fn window_sum_gain(
     }
     // Both sums are strictly positive by the loop above; they can still reach `inf` by overflow,
     // and `inf / inf` is `NaN` — so the ratio itself is checked rather than assumed.
-    let gain = serial_sum / candidate_sum;
+    let gain = bench_core::score::speedup(serial_sum, candidate_sum);
     if !gain.is_finite() || gain <= 0.0 {
         return Err(format!(
             "the {component} gain (Σ serial {serial_sum} s / Σ candidate {candidate_sum} s over \
@@ -6500,16 +6506,15 @@ fn lower_median(values: &[f64]) -> f64 {
     if values.is_empty() || values.iter().any(|v| !v.is_finite()) {
         return 0.0;
     }
-    let mut sorted = values.to_vec();
-    sorted.sort_by(|a, b| a.total_cmp(b));
-    sorted[(sorted.len() - 1) / 2]
+    bench_core::stats::lower_median(values)
 }
 
+/// [`bench_core::stats::mean`], with `0.0` for an empty slice (no accepted pair).
 fn mean(values: &[f64]) -> f64 {
     if values.is_empty() {
         return 0.0;
     }
-    values.iter().sum::<f64>() / values.len() as f64
+    bench_core::stats::mean(values)
 }
 
 /// Minimum over the finite members (finding 6 guard); `0.0` for an empty / all-non-finite set.
@@ -6528,7 +6533,7 @@ fn min_finite(values: &[f64]) -> f64 {
 /// record per golden (BOUND BY BYTES to that golden's sha256, with its own no-op ref); `pairs[]`
 /// pools EVERY accepted pair across all prompts; the aggregate means pool across all pairs; the
 /// PUBLISHED `raw_decode_speedup_median` is the even-n median of the per-prompt raw ratio-of-means
-/// (reusing [`bench_core::score::paired_decode_only_median`]). The die-5 verdict (finding R2/R7) is
+/// (reusing [`bench_core::stats::even_n_median`]). The die-5 verdict (finding R2/R7) is
 /// the PER-PROMPT floor (EVERY prompt accepts `>= min_pairs`) AND the run-total floor
 /// (`accepted >= min_pairs * pool_size`), computed here so it is sealed coherently with the pairs.
 /// #108 (M1) — the OBSERVED §5 series tags of a run: the `(serial, candidate)` pair of per-leg tags
@@ -6866,11 +6871,7 @@ fn build_results(
             .collect();
         let serial_mean = mean(&serial_spts);
         let mtp_mean = mean(&mtp_spts);
-        let raw_ratio_of_means = if mtp_mean > 0.0 {
-            serial_mean / mtp_mean
-        } else {
-            0.0
-        };
+        let raw_ratio_of_means = bench_core::score::speedup(serial_mean, mtp_mean);
 
         // finding R4/R7 — the prompt IDENTITY is the sha256 of THIS golden's bytes (BIND BY BYTES),
         // never a cross-prompt or `timed_prompt_pool[0]` copy. Match the golden's real sha against
@@ -6953,8 +6954,7 @@ fn build_results(
     // shared `bench_core::score` median (the same rule the A-3 overlay recomputes, R18) rather than
     // duplicating it. Median-of-one for a single-golden pool is degenerate but valid.
     let per_prompt_ratios: Vec<f64> = per_prompt.iter().map(|p| p.raw_ratio_of_means).collect();
-    let raw_decode_speedup_median =
-        bench_core::score::paired_decode_only_median(&per_prompt_ratios);
+    let raw_decode_speedup_median = bench_core::stats::even_n_median(&per_prompt_ratios);
 
     // The run-total floor still holds alongside the per-prompt floor (finding R7).
     let candidate_accepted =
@@ -6970,11 +6970,7 @@ fn build_results(
     let pooled_serial_mean = mean(&serial_spts);
     let pooled_mtp_mean = mean(&mtp_spts);
     // R16 — the POOLED raw ratio-of-means (sanity, NOT the score).
-    let mtp_decode_speedup = if pooled_mtp_mean > 0.0 {
-        pooled_serial_mean / pooled_mtp_mean
-    } else {
-        0.0
-    };
+    let mtp_decode_speedup = bench_core::score::speedup(pooled_serial_mean, pooled_mtp_mean);
     let mtp_decode_speedup_min = min_finite(&per_pair_ratios);
     // R16 (medium cycle-3) — `decode_speedup_floor_met` is a POOLED/published semantic, NOT a per-
     // pair min. The live wrapper checks the POOLED raw `mtp_decode_speedup` against the sanity floor
@@ -7004,7 +7000,7 @@ fn build_results(
         if normalized_ratios_informational.is_empty() {
             0.0
         } else {
-            bench_core::score::paired_decode_only_median(&normalized_ratios_informational)
+            bench_core::stats::even_n_median(&normalized_ratios_informational)
         };
     let effective_mean_draft_len_by_prompt: Vec<f64> = per_prompt
         .iter()
@@ -7075,7 +7071,7 @@ fn build_results(
 /// (the sealed member list), `pairs[]` = its accepted pairs, and THE PUBLISHED
 /// `raw_decode_speedup_median` = the even-n median of the per-PAIR cohort ratios (D2: the cohort
 /// is the measurement unit and the accepted pairs are the median's >= `min_pairs` samples —
-/// reusing [`bench_core::score::paired_decode_only_median`], the SAME rule as the per-prompt
+/// reusing [`bench_core::stats::even_n_median`], the SAME rule as the per-prompt
 /// path). The die-5 verdict is the per-COHORT floor: `accepted >= min_pairs`.
 ///
 /// Deliberate seal shape:
@@ -7138,18 +7134,14 @@ fn build_cohort_results(
     let per_pair_ratios: Vec<f64> = accepted.iter().map(|p| p.raw_ratio).collect();
     let pooled_serial_mean = mean(&serial_spts);
     let pooled_candidate_mean = mean(&candidate_spts);
-    let raw_ratio_of_means = if pooled_candidate_mean > 0.0 {
-        pooled_serial_mean / pooled_candidate_mean
-    } else {
-        0.0
-    };
+    let raw_ratio_of_means = bench_core::score::speedup(pooled_serial_mean, pooled_candidate_mean);
 
     // D2 — THE PUBLISHED SCORE: the even-n median over the accepted pairs' cohort ratios (the
     // same shared median rule as the per-prompt path; `pairs_per_cohort = 4` (RULED 2026-08-26,
     // superseding the 2026-08-24 ruling of 2) keeps the sample count EVEN, so the
     // two-central-order-statistics rule matters — at n = 4 it is the mean of the 2nd and 3rd
     // sorted ratios, so the fastest and slowest cohort windows do not enter the published score).
-    let raw_decode_speedup_median = bench_core::score::paired_decode_only_median(&per_pair_ratios);
+    let raw_decode_speedup_median = bench_core::stats::even_n_median(&per_pair_ratios);
 
     // The per-COHORT floor (the D2 translation of the per-prompt floor; one cohort, so the
     // run-total floor is the same predicate).
@@ -8203,7 +8195,7 @@ mod tests {
             .iter()
             .map(|p| p.raw_ratio_of_means)
             .collect();
-        let expected = bench_core::score::paired_decode_only_median(&ratios);
+        let expected = bench_core::stats::even_n_median(&ratios);
         assert_eq!(
             out.results.aggregate.raw_decode_speedup_median, expected,
             "published median == even-n median over the per-prompt raw ratios"
@@ -10739,7 +10731,7 @@ mod tests {
         );
         assert_ne!(
             lower_median(&[1.0, 2.0, 3.0, 4.0]),
-            bench_core::score::paired_decode_only_median(&[1.0, 2.0, 3.0, 4.0]),
+            bench_core::stats::even_n_median(&[1.0, 2.0, 3.0, 4.0]),
             "the per-pair lower-median is DISTINCT from the published even-n median"
         );
         // finding 6: a finite guard BEFORE aggregation (no NaN panic).
@@ -11596,7 +11588,7 @@ mod tests {
             .iter()
             .map(|p| p.raw_ratio_of_means)
             .collect();
-        let published = bench_core::score::paired_decode_only_median(&ratios);
+        let published = bench_core::stats::even_n_median(&ratios);
         assert_eq!(
             agg["raw_decode_speedup_median"].as_f64().unwrap(),
             published,

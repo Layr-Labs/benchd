@@ -341,13 +341,15 @@ pub struct ScoreMetrics {
     /// The DECODE WINDOW seconds per token of each role: the same value as
     /// `*_leg_decode_seconds_per_token` (decode is the decode window,
     /// `bench_core::score::decode_window_seconds_per_token`). THE BOARD READS THESE for its decode
-    /// tok/s readout. Absent when that role produced no timing.
+    /// tok/s readout. Absent when that role produced no timing. The candidate key is sealed on
+    /// every path that timed a leg, the local modes included; the baseline key only where a
+    /// control leg ran.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub baseline_leg_decode_window_seconds_per_token: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub candidate_leg_decode_window_seconds_per_token: Option<f64>,
     /// REPORT-ONLY — the SEED PREFILL window per seed token of each role. Never part of any decode
-    /// figure.
+    /// figure. Sealed on the same paths as the decode window keys above.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub baseline_leg_seed_prefill_window_seconds_per_token: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]

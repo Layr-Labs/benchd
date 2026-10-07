@@ -1187,6 +1187,14 @@ pub(crate) fn apply_timing_metrics(
     // was decided against can never disagree (David 2026-09-09).
     metrics.passed_decode_speedup_floor = decode_speedup >= scoring.floors.decode;
     metrics.passed_prefill_speedup_floor = prefill_speedup >= scoring.floors.prefill;
+    // The leg's window SPLIT under the keys the paired path seals, so a local or single-leg score
+    // states its decode window by name. The decode window is the same value as
+    // `decode_seconds_per_token`; the seed prefill is REPORT-ONLY and feeds no decode figure.
+    metrics.candidate_leg_decode_window_seconds_per_token =
+        (timing.decode_seconds_per_token.is_finite() && timing.decode_seconds_per_token > 0.0)
+            .then_some(timing.decode_seconds_per_token);
+    metrics.candidate_leg_seed_prefill_window_seconds_per_token =
+        seed_prefill_window_per_token(timing);
     // Every timed second: the prefill phase, the seed prefill, and the decode window. A wall-clock
     // total, not a decode figure.
     let seed = timing
@@ -1195,6 +1203,16 @@ pub(crate) fn apply_timing_metrics(
     let timed = timing.prefill_elapsed_seconds + seed + timing.decode_elapsed_seconds;
     metrics.timed_benchmark_seconds = finite_nonneg(timed);
     metrics.benchmark_wall_seconds = finite_nonneg(timed);
+}
+
+/// One leg's SEED PREFILL window per seed token, or `None` when the leg timed a teacher-forced
+/// window that has no seed prefill in its clock. REPORT-ONLY, sealed under seed-named keys only:
+/// it never feeds a decode figure.
+pub(crate) fn seed_prefill_window_per_token(timing: &TimingResult) -> Option<f64> {
+    let w = timing.phase_window?;
+    let (seconds, tokens) = (w.seed_prefill_elapsed_seconds, w.prefill_token_total);
+    (tokens > 0 && seconds.is_finite() && seconds > 0.0)
+        .then(|| bench_core::score::prefill_seconds_per_token(seconds, tokens))
 }
 
 /// A FAILED payload that RETAINS the real timing surface (ITEM 1 / David's ruling): a
@@ -1754,8 +1772,9 @@ pub(crate) fn base_metrics(
     //   identity only by `main` from the timed worker's hello. Each is omitted from the sealed JSON
     //   while unset, so a payload that never reaches those seals is byte-unchanged.
     // * The PAIRED-BASELINE seal (`baseline_*`, `candidate_leg_*`, `paired_legs`) — written by
-    //   `official::seal_paired_baseline` on the ranked paired path only; every other path seals no
-    //   key there.
+    //   `official::seal_paired_baseline` on the ranked paired path only. The one exception is the
+    //   candidate leg's window split (`candidate_leg_{decode,seed_prefill}_window_seconds_per_token`),
+    //   which `apply_timing_metrics` seals on every payload that kept a timing.
     ScoreMetrics {
         // SEALED = ENFORCED (David 2026-09-09): the baselines and the floors this run resolved —
         // from the `--contract` track fixture on a scored run — are the ones every gate on this
@@ -1988,6 +2007,7 @@ pub(crate) fn test_window() -> bench_core::constants::WindowShape {
         benchmark_decode_steps: 128,
         local_submit_benchmark_decode_steps: 1023,
         official_prefill_warmup_runs: 1,
+        official_prefill_timed_runs: 1,
     }
 }
 
@@ -2857,48 +2877,106 @@ mod tests {
         );
     }
 
-    /// DECODE MEANS THE DECODE WINDOW ON LOCAL ITERATE (David 2026-10-07). The same prefill and
-    /// decode windows with different seed prefills give a byte-identical local payload: decode
-    /// seconds per token, decode gain, floor verdicts and score. Only the wall-clock totals, which
-    /// count every timed second, move.
+    /// DECODE MEANS THE DECODE WINDOW ON THE LOCAL MODES (David 2026-10-07). On local-iterate and
+    /// local-submit, the same prefill and decode windows with different seed prefills give a
+    /// byte-identical local payload: decode seconds per token, the sealed decode window key,
+    /// decode gain, floor verdicts and score. Only the seed-named key and the wall-clock totals,
+    /// which count every timed second, move. The decode window key equals
+    /// `decode_seconds_per_token`, and the seed key is the seed prefill over its tokens.
     #[test]
     fn local_iterate_decode_gain_and_score_are_byte_identical_whatever_the_seed_prefill_takes() {
         let golden = benchmark_golden();
         let weights = DirDigest::empty();
-        let n = bench_core::constants::BENCHMARK_DECODE_STEPS as f64;
-        let score = |seed: f64| {
-            let timing = crate::testgolden::leg_timing(
-                TEST_BASELINE.prefill_seconds_per_token,
-                seed,
-                TEST_BASELINE.decode_seconds_per_token * n / 1.4,
-            );
-            let payload = local_iterate_score(
-                Mode::LocalIterate,
-                &timing,
-                ScoringInputs::local(
+        for mode in [Mode::LocalIterate, Mode::LocalSubmit] {
+            let steps = mode.decode_steps(&test_window());
+            let score = |seed: f64| {
+                let timing = crate::testgolden::leg_timing_over(
                     TEST_BASELINE.prefill_seconds_per_token,
-                    TEST_BASELINE.decode_seconds_per_token,
-                ),
-                &golden,
-                RunDigests::for_test(&weights),
-                &test_window(),
-            );
-            let mut v = serde_json::to_value(&payload).unwrap();
-            let m = v["metrics"].as_object_mut().unwrap();
-            for wall_clock in ["timed_benchmark_seconds", "benchmark_wall_seconds"] {
-                assert!(m.remove(wall_clock).is_some(), "{wall_clock}");
+                    seed,
+                    TEST_BASELINE.decode_seconds_per_token * steps as f64 / 1.4,
+                    steps,
+                );
+                let payload = local_iterate_score(
+                    mode,
+                    &timing,
+                    ScoringInputs::local(
+                        TEST_BASELINE.prefill_seconds_per_token,
+                        TEST_BASELINE.decode_seconds_per_token,
+                    ),
+                    &golden,
+                    RunDigests::for_test(&weights),
+                    &test_window(),
+                );
+                let mut v = serde_json::to_value(&payload).unwrap();
+                let m = v["metrics"].as_object_mut().unwrap();
+                assert_eq!(
+                    m["candidate_leg_decode_window_seconds_per_token"],
+                    m["decode_seconds_per_token"],
+                    "{mode:?}: the sealed decode window is the decode figure"
+                );
+                let sealed_seed = m["candidate_leg_seed_prefill_window_seconds_per_token"]
+                    .as_f64()
+                    .unwrap();
+                let seed_tokens = timing.phase_window.unwrap().prefill_token_total as f64;
+                assert!((sealed_seed - seed / seed_tokens).abs() < 1e-15, "{mode:?}");
+                for wall_clock in ["timed_benchmark_seconds", "benchmark_wall_seconds"] {
+                    assert!(m.remove(wall_clock).is_some(), "{wall_clock}");
+                }
+                crate::testgolden::without_seed_keys(v)
+            };
+            let base = score(0.2);
+            assert!((base["metrics"]["decode_speedup"].as_f64().unwrap() - 1.4).abs() < 1e-9);
+            for seed in [0.001, 3.0, 40.0] {
+                assert_eq!(
+                    score(seed),
+                    base,
+                    "{mode:?}: a local figure moved with a {seed} s seed prefill"
+                );
             }
-            v
-        };
-        let base = score(0.2);
-        assert!((base["metrics"]["decode_speedup"].as_f64().unwrap() - 1.4).abs() < 1e-9);
-        for seed in [0.001, 3.0, 40.0] {
-            assert_eq!(
-                score(seed),
-                base,
-                "a local figure moved with a {seed} s seed prefill"
-            );
         }
+    }
+
+    /// The same rule on the REAL CLOCK through the whole local-submit flow: a mock engine that
+    /// spends 300 ms in the seed prefill (`free_decode_begin`) gets a sealed seed window of at
+    /// least 300 ms, and none of it in the decode figure or the decode window key.
+    #[test]
+    fn local_submit_flow_never_charges_a_slow_seed_prefill_to_decode() {
+        let golden = submit_golden(vec![2i64; 1025]);
+        let (mut session, _) = Session::connect(
+            window_engine(&golden, vec![2i64; 1025])
+                .sleep_on("free_decode_begin", std::time::Duration::from_millis(300)),
+        )
+        .unwrap();
+        let payload = iterate_flow_windowed(
+            Some(&mut session),
+            test_flow(
+                &golden,
+                Mode::LocalSubmit,
+                false,
+                RunDigests::for_test(&DirDigest::empty()),
+                &test_window(),
+            ),
+            unused_spawner,
+            no_cool_gate,
+        );
+        assert!(payload.passed, "error={}", payload.metrics.error);
+        let m = &payload.metrics;
+        let seed_tokens = golden.benchmark.as_ref().unwrap().decode_seed_tokens.len() as f64;
+        let seed = m
+            .candidate_leg_seed_prefill_window_seconds_per_token
+            .unwrap()
+            * seed_tokens;
+        assert!(seed >= 0.3, "seed prefill window {seed} s");
+        assert_eq!(
+            m.candidate_leg_decode_window_seconds_per_token,
+            Some(m.decode_seconds_per_token)
+        );
+        assert!(
+            m.decode_seconds_per_token * 1023.0 < 0.3,
+            "decode {} s/tok carries the 300 ms seed prefill",
+            m.decode_seconds_per_token
+        );
+        assert!(m.timed_benchmark_seconds >= 0.3, "the wall total counts it");
     }
 
     /// LOCAL-ITERATE NOW POPULATES `per_prompt`. It was sealed only on the official path, so every
@@ -3024,13 +3102,15 @@ mod tests {
         let metrics_obj = value.get("metrics").unwrap().as_object().unwrap();
         // 56 SWIFT-PARITY keys + the ADDITIVE seals a timed local-iterate leg now records: the
         // board's `per_prompt` array, the run's `effective_spec_mode`/`effective_spec_depth`,
-        // and the additive `local_phases` diagnostics.
+        // the additive `local_phases` diagnostics, and the leg's window split
+        // (`candidate_leg_decode_window_seconds_per_token`,
+        // `candidate_leg_seed_prefill_window_seconds_per_token`).
         // This leg requests NO spec, so it seals `serial` / `0` and NONE of the drafting counters
         // (nothing drafted), and it runs against a mock with no head provenance, so no engine
         // identity key appears either.
         assert_eq!(
             metrics_obj.len(),
-            60,
+            62,
             "all ScoreMetrics fields must be present"
         );
         assert_eq!(

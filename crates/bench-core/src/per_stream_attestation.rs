@@ -462,9 +462,8 @@ pub struct PerStreamCompositeDiagnostic {
 /// Ratio-of-sums, serial-anchored, via [`crate::score::speedup`] (the SAME non-finite/
 /// non-positive guard the real score path uses, so this diagnostic cannot silently divide by a
 /// degenerate sum): `prefill_gain = speedup(serial.prefill_sum_ns, candidate.prefill_sum_ns)` and
-/// the decode twin. `composite_score = prefill_gain^prefill_gain_exponent *
-/// decode_gain^decode_gain_exponent` — `NaN` if either gain guard-rejected (mirrors
-/// [`crate::score::score`]'s own NaN posture). The exponent pair is taken as plain `f64`s rather
+/// the decode twin. `composite_score` is [`crate::score::composite`] of the two gains at the
+/// passed exponents — `NaN` if a weighted gain guard-rejected. The exponent pair is taken as plain `f64`s rather
 /// than a benchd-specific type: this crate does not depend on `benchd`, so the CALLER is
 /// responsible for passing the actually-certified pair (`ScoredExponents::certify`'s output,
 /// David's ruled 0.25/0.75) rather than a fixture-declared or invented one.
@@ -487,15 +486,14 @@ pub fn composite_diagnostic(
     );
     let decode_gain =
         crate::score::speedup(serial.decode_sum_ns as f64, candidate.decode_sum_ns as f64);
-    let composite_score = if prefill_gain.is_finite()
-        && prefill_gain > 0.0
-        && decode_gain.is_finite()
-        && decode_gain > 0.0
-    {
-        prefill_gain.powf(prefill_gain_exponent) * decode_gain.powf(decode_gain_exponent)
-    } else {
-        f64::NAN
-    };
+    let composite_score = crate::score::composite(
+        prefill_gain,
+        decode_gain,
+        crate::score::ScoringWeights {
+            decode: decode_gain_exponent,
+            prefill: prefill_gain_exponent,
+        },
+    );
     PerStreamCompositeDiagnostic {
         prefill_gain,
         decode_gain,

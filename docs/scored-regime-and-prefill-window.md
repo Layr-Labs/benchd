@@ -37,10 +37,10 @@ The composite is:
 composite = prefill_gain ^ prefill_gain_exponent * decode_gain ^ decode_gain_exponent
 ```
 
-> **DECLARED, NOT YET COMPUTED ON THIS PATH.** `bench_core::score::composite_score` has no call
-> site in the `measure-job` flow. Nothing there computes a composite from the sealed windows: the
-> published figure comes from `score_paired_decode_only` — the even-n median of the per-prompt raw
-> decode ratios.
+> **DECLARED, NOT YET COMPUTED ON THIS PATH.** The single-stream `measure-job` flow computes no
+> composite from the sealed windows: the published figure comes from `score_paired_decode_only` —
+> the even-n median of the per-prompt raw decode ratios. Where benchd does compute a composite, it
+> uses the one function `bench_core::score::composite`.
 >
 > The declaration says what a track scores. Computing it here is a later change, and it is gated on
 > the work-placement invariant in part 3.

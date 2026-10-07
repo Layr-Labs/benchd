@@ -147,12 +147,21 @@ pub const PLATFORM_KEY_CUDA: &str = "cuda";
 /// The MLX (Mac) track's local pre-timing cool-gate temperature (C). A Mac idles well below
 /// this, so the gate blocks only a genuinely warm GPU.
 pub const COOL_GATE_TEMP_C_MLX: f64 = 40.0;
-/// The CUDA (GB10) track's local pre-timing cool-gate temperature (C). David 2026-08-30 ("our
-/// engine, our benchmark — no adversarial hardening"): the GB10 GPU IDLES at 40–43 C (throttle
-/// T.Limit 55 C), so the MLX 40 C gate would refuse forever. The trusted per-platform gate is
-/// 50 C — above idle so it re-sites the threshold, below the throttle limit so a genuinely hot
-/// GB10 still waits/refuses.
-pub const COOL_GATE_TEMP_C_CUDA: f64 = 50.0;
+/// The CUDA (GB10) track's local pre-timing cool-gate temperature (C): 60 C, raised from 50 C
+/// (GumbiiDigital measurement for the Nemotron 3.5 Lightning track, 2026-09-26; ported to main
+/// 2026-10-07).
+///
+/// WHY. On driver 580.159.03 ANY CUDA context holds the GB10 in P0 (~10.7 W, 2.4 GHz at zero
+/// utilization), so a leg's loaded resident plateaus at 49–52 C on a quiet box. A 50 C gate
+/// therefore sat on the plateau: every measured pass was admitted at exactly 50.0 C after
+/// 70–390 s of idle, and 4 of 7 boxes were refused ("not cooling down") stuck at 51.0 C.
+///
+/// THE THROTTLE LIMIT IS NOT 55 C. `nvidia-smi -q` reports `GPU T.Limit Temp` as the MARGIN below
+/// the maximum operating temperature (53 C of headroom at 43 C, so the limit is ~96 C), and the
+/// box's `SW/HW Thermal Slowdown` counters stayed at 0 us across runs that reached 64 C; the only
+/// active limiter was the SW power cap. 60 C keeps a 30+ C margin below any thermal slowdown and
+/// still refuses a box that stays genuinely hot.
+pub const COOL_GATE_TEMP_C_CUDA: f64 = 60.0;
 
 impl Platform {
     /// Every platform, for tests and mirrors that must cover the whole table.
@@ -362,9 +371,10 @@ pub fn refuse_retired_paired_flow(track_id: &str, retired: bool) -> Result<(), S
 /// and the machinery that certifies it is not armed (see
 /// [`crate::prefill_window::certify_prefill_window`]).
 ///
-/// DECLARED, NOT YET COMPUTED: [`crate::score::composite_score`] has no production call site. The
-/// declaration states what a track scores and ARMS the prefill certification; the published figure
-/// still comes from [`crate::score::score_paired_decode_only`].
+/// The arithmetic is [`crate::score::composite`], the one composite every path uses. On the
+/// single-stream measure-job seam the declaration states what a track scores and ARMS the prefill
+/// certification; that seam's published figure comes from
+/// [`crate::score::score_paired_decode_only`].
 ///
 /// RAISING A PREFILL EXPONENT IS GATED. Certification binds the SUM of the two window halves, not
 /// where the work sits inside them, so an engine that defers seed-prefill work past
@@ -675,6 +685,16 @@ pub struct WindowShape {
     /// `prefill` opener without a `phase_diagnostics` barrier between them — a warm-up pass there
     /// is a protocol error, not a warmer number.
     pub official_prefill_warmup_runs: usize,
+    /// The fixture's `official_prefill_timed_runs`: how many MEASURED prefill passes the official
+    /// timed session runs after its warm-up passes. The phase's prefill time is their MEDIAN.
+    /// Optional in the fixture: absent means [`BENCHMARK_PREFILL_TIMED_RUNS`] (1), which is every
+    /// track but the Nemotron one, and with one run the median is that run.
+    ///
+    /// WHY (GumbiiDigital measurement, 2026-09-27; ported to main 2026-10-07): on the Nemotron 3.5 Lightning track, with a 4096-token
+    /// seed, one warm-up pass and a 60 C gate, ONE timed prefill per calibration pass still varied
+    /// 1.0-2.7% pass to pass on half the GB10 boxes, against the fixed 1% calibration maximum. The
+    /// median of several passes damps the per-sample noise and drops a single slow pass.
+    pub official_prefill_timed_runs: usize,
 }
 
 #[cfg(test)]
@@ -731,17 +751,18 @@ mod tests {
     }
 
     #[test]
-    fn cool_gate_temp_is_per_platform_mac_40_gb10_50() {
+    fn cool_gate_temp_is_per_platform_mac_40_gb10_60() {
         // R21 lift (David 2026-08-30): the gate temperature is a trusted per-platform value, not a
-        // frozen 40 C constant. Mac/MLX idles cool → 40 C; GB10/CUDA idles at 40–43 C, so its gate
-        // is re-sited to 50 C (below the 55 C throttle limit — it re-sites, it does not defang).
+        // frozen 40 C constant. Mac/MLX idles cool → 40 C. GB10/CUDA: a loaded resident holds the
+        // die at 49–52 C in P0, so the gate is re-sited to 60 C (see the constant).
         assert_eq!(Platform::Mlx.cool_gate_temp_c(), 40.0);
-        assert_eq!(Platform::Cuda.cool_gate_temp_c(), 50.0);
+        assert_eq!(Platform::Cuda.cool_gate_temp_c(), 60.0);
         assert!(
             Platform::Cuda.cool_gate_temp_c() > Platform::Mlx.cool_gate_temp_c(),
             "the GB10 gate is raised above the Mac gate, keyed by platform"
         );
-        // Still below the GB10 throttle limit (55 C): a genuinely hot GB10 stays above the gate.
-        assert!(Platform::Cuda.cool_gate_temp_c() < 55.0);
+        // At least 30 C below the GB10 maximum operating temperature (~96 C: `GPU T.Limit Temp` is a
+        // margin, 53 C at 43 C), so the gate never admits a box near thermal slowdown.
+        assert!(Platform::Cuda.cool_gate_temp_c() <= 96.0 - 30.0);
     }
 }

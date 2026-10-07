@@ -74,8 +74,8 @@ It carries into Model-2 unchanged. Only the calibration *bands* are re-measured 
 | Ruling | Value | Code |
 |---|---|---|
 | Serial-anchored scoring (serial control = 1.0, no normalization) | `serial = 1.0` | `crates/benchd/src/measure_job.rs:90` `SCORE_ANCHOR_SERIAL_ONE`; serial leg runs the timed verb at depth 0, `:47` `SERIAL_CONTROL_DEPTH = 0` |
-| Per-prompt RAW serial-relative decode ratio | `serial_decode_spt / candidate_decode_spt` | `crates/bench-core/src/score.rs:339` `paired_decode_raw_ratio` (reuses `speedup`, `:14`) |
-| Median rule — even-n mean of the two central order statistics | `even_n_mean_of_two_central_order_statistics` | `crates/bench-core/src/score.rs:348` `paired_decode_only_median`; sealed name `crates/benchd/src/measure_job.rs:100` `MEDIAN_RULE_EVEN_N`, aggregation `:94` `SCORING_AGGREGATION_MEDIAN_OF_PER_PROMPT` |
+| Per-prompt RAW serial-relative decode ratio | `serial_decode_spt / candidate_decode_spt` | `bench_core::score::speedup` (`crates/bench-core/src/score.rs`) |
+| Median rule — even-n mean of the two central order statistics | `even_n_mean_of_two_central_order_statistics` | `bench_core::stats::even_n_median` (`crates/bench-core/src/stats.rs`); sealed name `crates/benchd/src/measure_job.rs:100` `MEDIAN_RULE_EVEN_N`, aggregation `:94` `SCORING_AGGREGATION_MEDIAN_OF_PER_PROMPT` |
 | Submission floor on the raw median | `0.90` | `crates/bench-core/src/constants.rs:79` `QWEN_MTP_DECODE_SPEEDUP_FLOOR` |
 | Ceiling on the raw median | `5.0` | `crates/bench-core/src/constants.rs:83` `QWEN_MTP_DECODE_SPEEDUP_CEILING` |
 | Per-pair plausibility bound (rejects before aggregation) | `8.0` | `crates/bench-core/src/constants.rs:88` `QWEN_MTP_PER_PAIR_RATIO_BOUND` |
@@ -212,7 +212,7 @@ The bands come from serial-anchored legs measured on the box under benchd's cloc
    into `BASELINE_CALIBRATION` for §3a. Serial-vs-serial isolates the box's serial denominator
    from any drafter behavior.
 2. **Serial-anchored stock legs** — run the stock depth-2 candidate against the serial
-   control, aggregate to the even-n raw median (`paired_decode_only_median`). That median is
+   control, aggregate to the even-n raw median (`bench_core::stats::even_n_median`). That median is
    the Model-2 `expected` for §3b's envelope; its spread over gated sessions sets the
    Model-2 `band_pct`.
 3. **Authoring** — the band is authored ONLY off a fully-accepted, parity-true run:

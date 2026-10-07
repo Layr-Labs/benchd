@@ -4155,6 +4155,24 @@ fn tokens_per_second(seconds_per_token: f64) -> f64 {
     }
 }
 
+/// The HUMAN-FACING timing line of a run that timed a leg: prefill and the DECODE WINDOW, in tok/s.
+/// Decode is read from the sealed decode-window key, so this line and the sealed JSON cannot
+/// disagree, and the seed prefill is not in it. A paired run adds its control leg's decode window.
+/// `None` when no leg was timed.
+fn timing_summary(mode_name: &str, m: &score::ScoreMetrics) -> Option<String> {
+    let decode = m.candidate_leg_decode_window_seconds_per_token?;
+    let control = m
+        .baseline_leg_decode_window_seconds_per_token
+        .map(|c| format!(", control decode window {:.1} tok/s", tokens_per_second(c)))
+        .unwrap_or_default();
+    Some(format!(
+        "benchd iterate: {mode_name} candidate leg: prefill {:.1} tok/s, decode window {:.1} \
+         tok/s{control} (the decode run over its N tokens; the seed prefill is not in it)",
+        tokens_per_second(m.prefill_seconds_per_token),
+        tokens_per_second(decode),
+    ))
+}
+
 /// Whether BOTH runner inputs of the paired path are present — from the flags, else from the
 /// runner environment. It is the switch a LOCAL mode takes to run the full paired path instead of
 /// a candidate-only unscored run; the ranked path requires them either way and refuses by name.
@@ -5050,13 +5068,11 @@ fn execute_iterate(args: &IterateArgs) -> Result<bool, String> {
         eprintln!(
             "benchd iterate: {} UNSCORED on track {track_id} — it scores against a serial-control \
              leg on the organizer's reference tree, and none is named here (set \
-             {} and {} to run the paired path locally). Candidate leg: prefill {:.1} tok/s, \
-             decode {:.1} tok/s; correctness {}. No score was written.",
+             {} and {} to run the paired path locally). Candidate leg correctness {}. No \
+             score was written.",
             args.mode.mode_name(),
             baseline::BASELINE_WORKSPACE_ENV,
             baseline::BASELINE_CALIBRATION_ENV,
-            tokens_per_second(m.prefill_seconds_per_token),
-            tokens_per_second(m.decode_seconds_per_token),
             if m.passed_correctness {
                 "passed"
             } else {
@@ -5244,6 +5260,9 @@ fn execute_iterate(args: &IterateArgs) -> Result<bool, String> {
         },
     )?;
 
+    if let Some(line) = timing_summary(args.mode.mode_name(), &payload.metrics) {
+        eprintln!("{line}");
+    }
     eprintln!(
         "benchd iterate: wrote {} (passed={}, score={})",
         args.score_path.display(),
@@ -5394,7 +5413,7 @@ fn official_cool_gate(
 /// a bare local run on a Mac. The SCORED measure-job path never uses this: it passes the platform
 /// it already resolved from the contract≡env track id. Only the local dev helpers
 /// (`--local-cool-gate-only`, `--mode local-iterate`) fall back to this env resolution, where a GB10
-/// operator sets the track id env to key the 50 C GB10 gate. The gate temperature is per-platform
+/// operator sets the track id env to key the 60 C GB10 gate. The gate temperature is per-platform
 /// (`Platform::cool_gate_temp_c`), never a contract/candidate value.
 fn cool_gate_platform_from_env() -> bench_core::constants::Platform {
     std::env::var("MLXFAST_QWEN_MTP_TRACK_ID")
@@ -7528,6 +7547,68 @@ mod tests {
             Some("/ref/cal.json")
         )));
         assert!(!paired_inputs_present(&args_with(None, None)));
+    }
+
+    /// THE PRINTED DECODE IS THE DECODE WINDOW (David 2026-10-07). On local-iterate and
+    /// local-submit, scored against the local pair or unscored, the stderr timing line is
+    /// byte-identical whatever the seed prefill takes, and its decode figure is 1 / the sealed
+    /// decode window key.
+    #[test]
+    fn the_printed_local_decode_is_the_decode_window_whatever_the_seed_prefill_takes() {
+        let golden = crate::testgolden::TestGolden::new().fixture();
+        let weights = DirDigest::empty();
+        let base = crate::testgolden::TEST_BASELINE;
+        for mode in [Mode::LocalIterate, Mode::LocalSubmit] {
+            let steps = mode.decode_steps(&test_window());
+            for (prefill, decode) in [
+                (
+                    base.prefill_seconds_per_token,
+                    base.decode_seconds_per_token,
+                ),
+                (0.0, 0.0),
+            ] {
+                let line = |seed: f64| {
+                    let timing = crate::testgolden::leg_timing_over(
+                        0.0004,
+                        seed,
+                        0.005 * steps as f64,
+                        steps,
+                    );
+                    let mut payload = iterate::local_iterate_score(
+                        mode,
+                        &timing,
+                        ScoringInputs::local(prefill, decode),
+                        &golden,
+                        iterate::RunDigests::for_test(&weights),
+                        &test_window(),
+                    );
+                    if decode == 0.0 {
+                        iterate::seal_local_unscored(&mut payload);
+                    }
+                    assert_eq!(
+                        payload
+                            .metrics
+                            .candidate_leg_decode_window_seconds_per_token,
+                        Some(payload.metrics.decode_seconds_per_token)
+                    );
+                    timing_summary(mode.mode_name(), &payload.metrics).unwrap()
+                };
+                let first = line(0.2);
+                assert!(
+                    first.contains("decode window 200.0 tok/s"),
+                    "{mode:?}: {first}"
+                );
+                assert!(first.contains("prefill 2500.0 tok/s"), "{first}");
+                for seed in [0.001, 3.0, 40.0] {
+                    assert_eq!(line(seed), first, "{mode:?}: moved with a {seed} s seed");
+                }
+            }
+        }
+        // No timed leg, no line.
+        assert_eq!(
+            timing_summary("local-submit", &crate::score::ScoreMetrics::default()),
+            None
+        );
     }
 
     /// THE UNSCORED SEAL. A local run of a live-control-leg track carries the real timing surface

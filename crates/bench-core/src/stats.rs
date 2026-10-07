@@ -1,10 +1,13 @@
-//! Small, paired-free statistical primitives.
+//! The ONE implementation of every aggregate benchd takes over measured figures.
 //!
-//! Extracted from the retired qwen-mtp-paired-decode-only scoring so a generic, reusable
-//! aggregation utility does not travel with (or die with) the paired seam. `even_n_median` makes
-//! NO paired / candidate-vs-baseline assumption — it is a plain order-statistic median over a slice
-//! of `f64`. A future multi-golden "median-of-per-prompt-gains" mode for the single-leg official
-//! path is the intended next consumer.
+//! * [`mean`] — the arithmetic mean: the `mean` pair rule, the calibration means, the measure-job
+//!   per-prompt and pooled means.
+//! * [`lower_median_index`] / [`lower_median`] — the `lower_median` pair rule and the measure-job
+//!   per-pair diagnostic: the order statistic at `(n - 1) / 2`, ties in input order.
+//! * [`even_n_median`] — the median of the timed prefill passes and the decode-only track's
+//!   published median of the per-prompt ratios.
+//!
+//! None of them makes a paired / candidate-vs-baseline assumption.
 
 /// The EVEN-N median of a slice: for an odd count the middle order statistic, for an even count the
 /// mean of the two central order statistics. Returns `NaN` for an empty slice (the caller guards
@@ -18,14 +21,37 @@ pub fn even_n_median(samples: &[f64]) -> f64 {
         return f64::NAN;
     }
     let mut sorted = samples.to_vec();
-    // Total order over f64 for the order statistics; NaN sorts last. `partial_cmp` is safe here as
-    // we sort a materialised copy.
-    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Greater));
+    // Total order over f64 for the order statistics; a positive NaN sorts last.
+    sorted.sort_by(|a, b| a.total_cmp(b));
     if n % 2 == 1 {
         sorted[n / 2]
     } else {
         (sorted[n / 2 - 1] + sorted[n / 2]) / 2.0
     }
+}
+
+/// The ARITHMETIC MEAN of a slice: the sum in input order over the count. Returns `NaN` for an
+/// empty slice (the caller guards non-empty).
+pub fn mean(samples: &[f64]) -> f64 {
+    samples.iter().sum::<f64>() / samples.len() as f64
+}
+
+/// The INDEX of the LOWER MEDIAN of a slice: the order statistic at `(n - 1) / 2` of the values in
+/// [`f64::total_cmp`] order, which on an even count is the lower of the two central values, never
+/// their mean. The sort is stable, so equal values keep input order and the earlier one is chosen.
+/// `None` for an empty slice.
+pub fn lower_median_index(samples: &[f64]) -> Option<usize> {
+    if samples.is_empty() {
+        return None;
+    }
+    let mut order: Vec<usize> = (0..samples.len()).collect();
+    order.sort_by(|&a, &b| samples[a].total_cmp(&samples[b]));
+    Some(order[(samples.len() - 1) / 2])
+}
+
+/// The LOWER MEDIAN of a slice ([`lower_median_index`]). Returns `NaN` for an empty slice.
+pub fn lower_median(samples: &[f64]) -> f64 {
+    lower_median_index(samples).map_or(f64::NAN, |i| samples[i])
 }
 
 #[cfg(test)]
@@ -42,6 +68,21 @@ mod tests {
         assert_eq!(even_n_median(&[1.234]), 1.234);
         // Unsorted input is ordered first.
         assert_eq!(even_n_median(&[4.0, 1.0, 3.0, 2.0]), 2.5);
+    }
+
+    #[test]
+    fn lower_median_is_the_lower_central_value_and_keeps_input_order_on_ties() {
+        assert_eq!(lower_median(&[1.3, 1.1, 1.2]), 1.2);
+        assert_eq!(lower_median(&[1.4, 1.1, 1.3, 1.2]), 1.2);
+        assert_eq!(lower_median_index(&[1.2, 1.2]), Some(0));
+        assert_eq!(lower_median_index(&[]), None);
+        assert!(lower_median(&[]).is_nan());
+    }
+
+    #[test]
+    fn mean_is_the_sum_over_the_count() {
+        assert_eq!(mean(&[1.0, 2.0, 4.5]), 2.5);
+        assert!(mean(&[]).is_nan());
     }
 
     #[test]

@@ -83,8 +83,11 @@ is the control leg's decode window per token divided by the candidate leg's. One
 function computes it (`bench_core::score::decode_window_seconds_per_token`), and
 every path uses it: the paired official path under every pair rule, the
 single-leg official path, `measure-job`, `calibrate-baseline` and local
-`iterate`. The seed prefill is sealed report-only under its own key,
-`*_seed_prefill_window_seconds_per_token`. A calibration file older than version 3
+`iterate`. Every path that times a leg seals that leg's decode window by name,
+`candidate_leg_decode_window_seconds_per_token` (the paired path adds
+`baseline_leg_decode_window_seconds_per_token`), and the local modes print it on
+stderr as `decode window ... tok/s`. The seed prefill is sealed report-only under
+its own key, `*_seed_prefill_window_seconds_per_token`. A calibration file older than version 3
 recorded the whole window as decode, and benchd refuses it by name
 (`BASELINE-CALIBRATION-WHOLE-WINDOW-DECODE`): recalibrate the box.
 

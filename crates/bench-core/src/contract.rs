@@ -266,6 +266,12 @@ pub struct Contract {
     /// resident engine is already warm and its adapter refuses a second opener.
     #[serde(default)]
     pub official_prefill_warmup_runs: Option<u32>,
+    /// The MEASURED prefill passes the official timed session runs after its warm-up passes; the
+    /// phase's prefill time is their median ([`WindowShape::official_prefill_timed_runs`]).
+    /// OPTIONAL, unlike the four window values: absent means one timed pass, the behaviour every
+    /// fixture that predates the field already describes. `0` is refused.
+    #[serde(default)]
+    pub official_prefill_timed_runs: Option<u32>,
     /// The track checkpoint's VOCABULARY BOUND ([`TrackModelIdentity::vocab_size`]): the range
     /// `0..vocab_size` every token id in a golden or a tape must fall in, and the bound the
     /// conformance path judges worker top-logit distributions against.
@@ -339,6 +345,7 @@ impl Contract {
         benchmark_decode_steps: None,
         local_submit_benchmark_decode_steps: None,
         official_prefill_warmup_runs: None,
+        official_prefill_timed_runs: None,
         vocab_size: None,
         num_hidden_layers: None,
         seed_tokens: None,
@@ -768,6 +775,11 @@ fn declared_window_shape(contract: &Contract) -> Option<WindowShape> {
         benchmark_decode_steps: contract.benchmark_decode_steps? as usize,
         local_submit_benchmark_decode_steps: contract.local_submit_benchmark_decode_steps? as usize,
         official_prefill_warmup_runs: contract.official_prefill_warmup_runs? as usize,
+        official_prefill_timed_runs: contract
+            .official_prefill_timed_runs
+            .map_or(crate::constants::BENCHMARK_PREFILL_TIMED_RUNS, |n| {
+                n as usize
+            }),
     })
 }
 
@@ -776,6 +788,12 @@ fn declared_window_shape(contract: &Contract) -> Option<WindowShape> {
 ///
 /// The WARM-UP count is the exception that may be zero, and legitimately is on CUDA.
 fn certify_window_shape(contract: &Contract, track_id: &str) -> Result<(), String> {
+    if contract.official_prefill_timed_runs == Some(0) {
+        return Err(format!(
+            "the --contract track fixture for {track_id:?} declares official_prefill_timed_runs: \
+             0; a prefill of zero timed runs measures nothing"
+        ));
+    }
     let counts = [
         ("correctness_steps", contract.correctness_steps),
         ("benchmark_decode_steps", contract.benchmark_decode_steps),
@@ -1900,8 +1918,9 @@ mod round_trip_oracle_tests {
         bands: (f64, f64, f64, f64, bool, bool),
         /// `(decode, prefill)`.
         weights: (f64, f64),
-        /// `(correctness, benchmark_decode, local_submit_decode, official_prefill_warmup)`.
-        window: Option<(usize, usize, usize, usize)>,
+        /// `(correctness, benchmark_decode, local_submit_decode, official_prefill_warmup,
+        /// official_prefill_timed)`.
+        window: Option<(usize, usize, usize, usize, usize)>,
         /// `(golden_model_type, vocab_size, num_hidden_layers, seed_tokens)`.
         model: (&'static str, usize, i64, usize),
     }
@@ -1948,7 +1967,7 @@ mod round_trip_oracle_tests {
             baseline: None,
             bands: (0.05, 0.05, 0.02, 0.05, false, false),
             weights: (0.75, 0.25),
-            window: Some((64, 128, 1023, 1)),
+            window: Some((64, 128, 1023, 1, 1)),
             model: ("qwen4_exp_text", 248_320, 48, 1_024),
         },
         Expected {
@@ -1959,7 +1978,7 @@ mod round_trip_oracle_tests {
             baseline: None,
             bands: (0.05, 0.05, 0.02, 0.05, false, false),
             weights: (0.75, 0.25),
-            window: Some((64, 128, 1023, 0)),
+            window: Some((64, 128, 1023, 0, 1)),
             model: ("qwen4_exp_text", 248_320, 48, 1_024),
         },
     ];
@@ -2092,7 +2111,7 @@ mod round_trip_oracle_tests {
 
             // 6. THE MEASUREMENT WINDOW.
             match want.window {
-                Some((correctness, decode_steps, submit_steps, warmup)) => {
+                Some((correctness, decode_steps, submit_steps, warmup, timed)) => {
                     let got = window_shape(&full, track_id)
                         .unwrap_or_else(|e| panic!("{track_id}: window_shape: {e}"));
                     assert_eq!(
@@ -2101,8 +2120,9 @@ mod round_trip_oracle_tests {
                             got.value.benchmark_decode_steps,
                             got.value.local_submit_benchmark_decode_steps,
                             got.value.official_prefill_warmup_runs,
+                            got.value.official_prefill_timed_runs,
                         ),
-                        (correctness, decode_steps, submit_steps, warmup),
+                        (correctness, decode_steps, submit_steps, warmup, timed),
                         "{track_id}: window"
                     );
                     assert_eq!(got.source, ContractSource::Contract);
@@ -2556,6 +2576,7 @@ mod window_shape_tests {
                 benchmark_decode_steps: 256,
                 local_submit_benchmark_decode_steps: 2047,
                 official_prefill_warmup_runs: 3,
+                official_prefill_timed_runs: 1,
             }
         );
         // The SAME fixture resolves the SAME window under a track naming the other platform: the
@@ -2571,6 +2592,37 @@ mod window_shape_tests {
         let err = window_shape(&Contract::NONE_DECLARED, "t").unwrap_err();
         assert!(err.contains(constants::WINDOW_SHAPE_UNDECLARED), "{err}");
         assert!(err.contains("\"t\""), "{err}");
+    }
+
+    /// THE TIMED PREFILL COUNT is optional: absent resolves to one pass (every fixture that predates
+    /// the field), a declared count resolves as declared, and zero is refused at the parse.
+    #[test]
+    fn the_timed_prefill_count_defaults_to_one_and_refuses_zero() {
+        let window = br#"{"track_id":"t","correctness_steps":64,"benchmark_decode_steps":128,
+                  "local_submit_benchmark_decode_steps":1023,"official_prefill_warmup_runs":1"#;
+        let with = |tail: &str| {
+            let mut body = window.to_vec();
+            body.extend_from_slice(tail.as_bytes());
+            body
+        };
+        let absent = Contract::parse(&with("}")).unwrap();
+        assert_eq!(
+            window_shape(&absent, "t")
+                .unwrap()
+                .value
+                .official_prefill_timed_runs,
+            constants::BENCHMARK_PREFILL_TIMED_RUNS
+        );
+        let five = Contract::parse(&with(r#","official_prefill_timed_runs":5}"#)).unwrap();
+        assert_eq!(
+            window_shape(&five, "t")
+                .unwrap()
+                .value
+                .official_prefill_timed_runs,
+            5
+        );
+        let err = Contract::parse(&with(r#","official_prefill_timed_runs":0}"#)).unwrap_err();
+        assert!(err.contains("zero timed runs measures nothing"), "{err}");
     }
 
     /// THE WINDOW IS ONE SHAPE, refused AT THE PARSE when it is half-declared, and a step count of

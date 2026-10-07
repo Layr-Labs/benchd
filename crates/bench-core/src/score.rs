@@ -29,7 +29,16 @@ pub fn decode_window_seconds_per_token(
     decode_run_elapsed_seconds / decode_tokens as f64
 }
 
-/// `BenchmarkScore.speedup`: baseline/candidate, or 0 if either is non-finite or <= 0.
+/// THE DEFINITION OF PREFILL: prefill seconds per token is the prefill phase's time (the median of
+/// its timed passes) divided by the prompt's token count. Every prefill seconds-per-token figure
+/// benchd computes comes from this one function.
+pub fn prefill_seconds_per_token(prefill_elapsed_seconds: f64, prompt_tokens: usize) -> f64 {
+    prefill_elapsed_seconds / prompt_tokens as f64
+}
+
+/// THE GAIN (`BenchmarkScore.speedup`): control seconds per token / candidate seconds per token, or
+/// 0 if either is non-finite or <= 0. A faster candidate has a gain above 1. Every decode gain,
+/// prefill gain and per-pair ratio benchd computes comes from this one function.
 pub fn speedup(baseline_spt: f64, candidate_spt: f64) -> f64 {
     if !baseline_spt.is_finite()
         || !candidate_spt.is_finite()
@@ -41,10 +50,11 @@ pub fn speedup(baseline_spt: f64, candidate_spt: f64) -> f64 {
     baseline_spt / candidate_spt
 }
 
-/// `BenchmarkScore.score`: weighted geometric mean of the decode/prefill speedups.
+/// `BenchmarkScore.score`: the [`composite`] of the decode and prefill gains, each gain the
+/// [`speedup`] of the baseline over the candidate seconds per token.
 ///
-/// Returns `f64::NAN` if either speedup is <= 0, or the weights are non-finite /
-/// negative / sum to <= 0 (mirrors the Swift `guard ... else { return .nan }`).
+/// Returns `f64::NAN` if a weighted gain is <= 0, or the weights are non-finite / negative / sum
+/// to <= 0 (mirrors the Swift `guard ... else { return .nan }`).
 pub fn score(
     decode_spt: f64,
     prefill_spt: f64,
@@ -53,27 +63,56 @@ pub fn score(
     decode_weight: f64,
     prefill_weight: f64,
 ) -> f64 {
-    let decode_speedup = speedup(baseline_decode_spt, decode_spt);
-    let prefill_speedup = speedup(baseline_prefill_spt, prefill_spt);
-    let total_weight = decode_weight + prefill_weight;
-    // Reject NaN and non-positive inputs. `x.is_nan() || x <= 0.0` is the
-    // clippy-clean equivalent of the NaN-catching `!(x > 0.0)` guard (accepts
-    // +inf, rejects <= 0 and NaN — identical semantics).
-    if decode_speedup.is_nan()
-        || decode_speedup <= 0.0
-        || prefill_speedup.is_nan()
-        || prefill_speedup <= 0.0
-        || !decode_weight.is_finite()
-        || !prefill_weight.is_finite()
-        || decode_weight < 0.0
-        || prefill_weight < 0.0
-        || total_weight.is_nan()
-        || total_weight <= 0.0
+    composite(
+        speedup(baseline_prefill_spt, prefill_spt),
+        speedup(baseline_decode_spt, decode_spt),
+        ScoringWeights {
+            decode: decode_weight,
+            prefill: prefill_weight,
+        },
+    )
+}
+
+/// THE COMPOSITE: `prefill_gain ^ (w_p / (w_p + w_d)) * decode_gain ^ (w_d / (w_p + w_d))`, the
+/// weighted geometric mean of the two gains. Every composite benchd computes, seals, gates or
+/// re-derives comes from this one function: the paired official path (each pair, under both pair
+/// rules), the single-leg official path, local iterate and local submit, the measure-job cohort
+/// composite, the overlay's coherence check and the per-stream diagnostic. Every declared pair
+/// sums to 1, so the exponents are the declared weights themselves.
+///
+/// * A weight of exactly `0.0` drops its axis: the factor is `1.0` and the gain is not read, so a
+///   track that does not measure an axis can leave that gain `NaN`.
+/// * An exponent of exactly `1.0` returns the gain itself, with no `powf` round trip.
+/// * A weighted gain that is `NaN` or <= 0, or weights that are non-finite, negative or sum to
+///   <= 0, give `f64::NAN`. `+inf` is accepted.
+pub fn composite(prefill_gain: f64, decode_gain: f64, weights: ScoringWeights) -> f64 {
+    let total = weights.decode + weights.prefill;
+    if !weights.decode.is_finite()
+        || !weights.prefill.is_finite()
+        || weights.decode < 0.0
+        || weights.prefill < 0.0
+        || total.is_nan()
+        || total <= 0.0
     {
         return f64::NAN;
     }
-    decode_speedup.powf(decode_weight / total_weight)
-        * prefill_speedup.powf(prefill_weight / total_weight)
+    let factor = |gain: f64, weight: f64| -> f64 {
+        if weight == 0.0 {
+            return 1.0;
+        }
+        // Reject NaN and non-positive gains. `x.is_nan() || x <= 0.0` is the clippy-clean
+        // equivalent of the NaN-catching `!(x > 0.0)` guard (accepts +inf).
+        if gain.is_nan() || gain <= 0.0 {
+            return f64::NAN;
+        }
+        let exponent = weight / total;
+        if exponent == 1.0 {
+            gain
+        } else {
+            gain.powf(exponent)
+        }
+    };
+    factor(decode_gain, weights.decode) * factor(prefill_gain, weights.prefill)
 }
 
 /// THE TWO SCORING WEIGHTS one run combines its gain axes with: the exponents of the weighted
@@ -430,37 +469,6 @@ pub fn run_timeout_budget(
     Ok(std::time::Duration::from_secs_f64(secs))
 }
 
-/// The RAW serial-relative decode ratio for ONE pair: `serial_decode_spt / candidate_decode_spt`
-/// (serial is the numerator / normaliser; a faster candidate ⇒ ratio > 1). Reuses [`speedup`],
-/// so it is 0 when either seconds-per-token value is non-finite or ≤ 0 (an implausible/blank
-/// pair the caller rejects). One "pair" today = one serial leg vs one candidate leg over the
-/// same window.
-pub fn paired_decode_raw_ratio(serial_decode_spt: f64, candidate_decode_spt: f64) -> f64 {
-    speedup(serial_decode_spt, candidate_decode_spt)
-}
-
-/// The EVEN-N median of the per-prompt raw ratios (track fixture
-/// `scoring_semantics.median_rule = even_n_mean_of_two_central_order_statistics`): for an even
-/// count the mean of the two central order statistics, for an odd count the middle element.
-/// (This is NOT the lower-median rule the per-pair diagnostic / CLI p50 use.) A single-prompt
-/// run yields that one ratio. Returns `NaN` for an empty slice (the caller guards non-empty).
-pub fn paired_decode_only_median(per_prompt_raw_ratios: &[f64]) -> f64 {
-    let n = per_prompt_raw_ratios.len();
-    if n == 0 {
-        return f64::NAN;
-    }
-    let mut sorted = per_prompt_raw_ratios.to_vec();
-    // Total order over f64 for the order statistics; NaN sorts last (and is caught by the
-    // finite check in the gate). `partial_cmp` is safe here as we sort a materialised copy.
-    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Greater));
-    if n % 2 == 1 {
-        sorted[n / 2]
-    } else {
-        // Mean of the two central order statistics.
-        (sorted[n / 2 - 1] + sorted[n / 2]) / 2.0
-    }
-}
-
 /// Which bound a paired decode-only run failed (the score is null and `error` names it).
 #[derive(Debug, Clone, PartialEq)]
 pub enum PairedDecodeFailure {
@@ -520,7 +528,9 @@ pub fn score_paired_decode_only(
     per_pair_ratios: &[f64],
     per_prompt_raw_ratios: &[f64],
 ) -> PairedDecodeOnlyScore {
-    let raw_median = paired_decode_only_median(per_prompt_raw_ratios);
+    // The EVEN-N median of the per-prompt raw ratios (track fixture
+    // `scoring_semantics.median_rule = even_n_mean_of_two_central_order_statistics`).
+    let raw_median = crate::stats::even_n_median(per_prompt_raw_ratios);
     let fail = |f: PairedDecodeFailure| PairedDecodeOnlyScore {
         raw_median,
         score: None,
@@ -562,59 +572,6 @@ pub fn score_paired_decode_only(
     }
 }
 
-// ---------------------------------------------------------------------------
-// The composite over a track's DECLARED scored regime
-// ---------------------------------------------------------------------------
-
-/// One axis's factor in the composite: `gain ^ exponent`, with the two exponents that have an
-/// exact answer folded rather than routed through `powf`.
-///
-/// * `exponent == 0.0` ⇒ `1.0`. The axis carries no weight, so it DROPS OUT — the gain is never
-///   read at all, including when it is `NaN` or infinite, which is the state a track that does not
-///   measure that axis is in.
-/// * `exponent == 1.0` ⇒ the gain ITSELF, bit-for-bit, with no libm round trip.
-///
-/// Both folds are the identities `powf` already promises, spelled out here so the decode-only
-/// regime's composite is provably the decode gain rather than provably-close to it.
-fn gain_factor(gain: f64, exponent: f64) -> f64 {
-    if exponent == 0.0 {
-        1.0
-    } else if exponent == 1.0 {
-        gain
-    } else {
-        gain.powf(exponent)
-    }
-}
-
-/// The composite a track's DECLARED regime ([`crate::constants::ScoredRegime`]) computes over the
-/// two gain axes: `prefill_gain ^ a * decode_gain ^ b`.
-///
-/// DECLARED, NOT YET COMPUTED — this function has NO PRODUCTION CALL SITE. Nothing in a run
-/// computes a composite today, and no `prefill_gain` / `decode_gain` is derived from the sealed
-/// windows. The published figure is still [`score_paired_decode_only`]'s even-n median of the
-/// per-prompt raw decode ratios. This is the one form in which a track's declared exponents WOULD
-/// be applied, defined here so the declaration and the arithmetic cannot drift apart before then;
-/// wiring it up is a later, separately-reviewed change, gated on the work-placement invariant in
-/// `docs/scored-regime-and-prefill-window.md` §3.
-///
-/// It is ADDITIVE either way: it does not touch the generic `ds^0.75 · ps^0.25` [`score`] the
-/// official and local runs use, nor the paired decode-only gate.
-///
-/// FIXTURE-INERT for a decode-only regime (`a = 0.0`, `b = 1.0`): the prefill factor is `1.0` and
-/// the decode factor is the decode gain, so the composite is `1.0 * decode_gain` — `decode_gain`
-/// bit-for-bit for every finite value, every infinity, and a QUIET NaN. Not for a SIGNALLING NaN,
-/// which the multiply quiets (the payload's quiet bit flips); no path here produces one, since a
-/// gain is a division of two measured durations. See
-/// `constants::tests::the_declared_regime_reproduces_todays_score`.
-pub fn composite_score(
-    regime: &crate::constants::ScoredRegime,
-    prefill_gain: f64,
-    decode_gain: f64,
-) -> f64 {
-    gain_factor(prefill_gain, regime.prefill_gain_exponent)
-        * gain_factor(decode_gain, regime.decode_gain_exponent)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -639,6 +596,39 @@ mod tests {
                 .expect_err(&format!("{what} must not silently disarm the deadline"));
             assert!(err.contains("RunTimeout budget"), "{what}: {err}");
         }
+    }
+
+    /// THE ONE COMPOSITE. `score` is `composite` of the two gains; the ruled 0.25 / 0.75 pair is
+    /// the raw exponent form bit for bit; a zero-weight axis drops out without reading its gain;
+    /// an exponent of 1 is the gain itself; a weighted gain <= 0 or NaN is NaN.
+    #[test]
+    fn composite_is_the_one_weighted_geometric_mean_every_score_reads() {
+        let w = ScoringWeights::DEFAULT;
+        let (p, d) = (1.37_f64, 1.46_f64);
+        assert_eq!(
+            composite(p, d, w).to_bits(),
+            (d.powf(0.75) * p.powf(0.25)).to_bits()
+        );
+        assert_eq!(
+            score(0.5, 0.25, 0.5 * d, 0.25 * p, 0.75, 0.25).to_bits(),
+            composite(speedup(0.25 * p, 0.25), speedup(0.5 * d, 0.5), w).to_bits()
+        );
+        let decode_only = ScoringWeights {
+            decode: 1.0,
+            prefill: 0.0,
+        };
+        assert_eq!(composite(f64::NAN, d, decode_only).to_bits(), d.to_bits());
+        assert!(composite(p, 0.0, w).is_nan());
+        assert!(composite(f64::NAN, d, w).is_nan());
+        assert!(composite(
+            p,
+            d,
+            ScoringWeights {
+                decode: 0.0,
+                prefill: 0.0
+            }
+        )
+        .is_nan());
     }
 
     #[test]

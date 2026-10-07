@@ -45,10 +45,8 @@
 //! re-anchor integrity `score_sha256` over the merged bytes (`:177-181`).
 
 use bench_core::constants::{QWEN_MTP_DECODE_SPEEDUP_CEILING, QWEN_MTP_DECODE_SPEEDUP_FLOOR};
-use bench_core::score::{
-    paired_decode_only_median, paired_decode_raw_ratio, score_paired_decode_only,
-    PairedDecodeFailure,
-};
+use bench_core::score::{score_paired_decode_only, speedup, PairedDecodeFailure};
+use bench_core::stats::even_n_median;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -1270,6 +1268,14 @@ fn validate_cohort_pool(
 /// [`crate::measure_job::DECODE_GAIN_EXPONENT`] rather than taken from the artifact: they are ruled
 /// constants, not per-run data, and a run that could name its own exponents could name the pair
 /// that maximises its score.
+/// The RULED composite exponents as [`bench_core::score::composite`] weights.
+fn exponents_weights() -> bench_core::score::ScoringWeights {
+    bench_core::score::ScoringWeights {
+        decode: crate::measure_job::DECODE_GAIN_EXPONENT,
+        prefill: crate::measure_job::PREFILL_GAIN_EXPONENT,
+    }
+}
+
 fn validate_cohort_composite(c: &PerCohortView) -> Result<(), String> {
     let Some(composite) = c.composite else {
         return Err(format!(
@@ -1321,12 +1327,11 @@ fn validate_cohort_composite(c: &PerCohortView) -> Result<(), String> {
 
     // COHERENCE — recompute the composite from its own sealed gains (finding R18's posture, applied
     // to the cohort's published number).
-    let recomputed = composite
-        .prefill_gain
-        .powf(crate::measure_job::PREFILL_GAIN_EXPONENT)
-        * composite
-            .decode_gain
-            .powf(crate::measure_job::DECODE_GAIN_EXPONENT);
+    let recomputed = bench_core::score::composite(
+        composite.prefill_gain,
+        composite.decode_gain,
+        exponents_weights(),
+    );
     if !recomputed.is_finite() || recomputed <= 0.0 {
         return Err(format!(
             "overlay composite coherence: the composite recomputed from the sealed gains is not a \
@@ -1515,13 +1520,13 @@ fn merge_overlay_against_harness(
                 .per_prompt
                 .iter()
                 .map(|p| {
-                    paired_decode_raw_ratio(
+                    speedup(
                         p.serial_seconds_per_token_mean,
                         p.mtp_seconds_per_token_mean,
                     )
                 })
                 .collect();
-            paired_decode_only_median(&per_prompt_ratios)
+            even_n_median(&per_prompt_ratios)
         }
         // COHORT: `per_prompt` is empty by construction, and the producer's sealed median is the
         // even-n median over the accepted PAIRS' cohort ratios. Recomputing from `pairs[].raw_ratio`
@@ -1529,7 +1534,7 @@ fn merge_overlay_against_harness(
         // check is relocated to the right samples, not dropped.
         ResultsShape::Cohort { .. } => {
             let per_pair: Vec<f64> = results.pairs.iter().map(|p| p.raw_ratio).collect();
-            paired_decode_only_median(&per_pair)
+            even_n_median(&per_pair)
         }
     };
     let sealed_median = results.aggregate.raw_decode_speedup_median;
@@ -1567,7 +1572,7 @@ fn merge_overlay_against_harness(
             .per_prompt
             .iter()
             .map(|p| {
-                paired_decode_raw_ratio(
+                speedup(
                     p.serial_seconds_per_token_mean,
                     p.mtp_seconds_per_token_mean,
                 )
@@ -2019,7 +2024,7 @@ mod tests {
             .map(|(i, &r)| per_prompt(i, r, 1))
             .collect();
         let pairs: Vec<PairView> = ratios.iter().map(|&r| tf_pair(r)).collect();
-        let median = paired_decode_only_median_helper(ratios);
+        let median = even_n_median(ratios);
         let mut sorted = ratios.to_vec();
         sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
         ResultsView {
@@ -2045,19 +2050,6 @@ mod tests {
             // Single-stream fixtures seal no cohort records — the shape cross-check requires that.
             per_cohort: Vec::new(),
             scored_batch_size: None,
-        }
-    }
-
-    /// Even-n median helper (mirrors `bench_core::score::paired_decode_only_median`) for building
-    /// coherent sealed medians in fixtures.
-    fn paired_decode_only_median_helper(ratios: &[f64]) -> f64 {
-        let mut sorted = ratios.to_vec();
-        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        let n = sorted.len();
-        if n % 2 == 1 {
-            sorted[n / 2]
-        } else {
-            (sorted[n / 2 - 1] + sorted[n / 2]) / 2.0
         }
     }
 
@@ -3166,7 +3158,7 @@ mod tests {
             })
             .collect();
         let acc = pair_ratios.len();
-        let median = paired_decode_only_median_helper(pair_ratios);
+        let median = even_n_median(pair_ratios);
         let mut sorted = pair_ratios.to_vec();
         sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
         ResultsView {

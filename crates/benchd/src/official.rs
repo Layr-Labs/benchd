@@ -44,8 +44,8 @@ use bench_runner::{
 
 use crate::iterate::{
     apply_timing_metrics, base_metrics, failed_metrics, failed_score, finite_nonneg,
-    first_conformance_failure, FailedAudit, FailureReport, Mode, RunDigests, ScoringInputs,
-    SessionEngine,
+    first_conformance_failure, seed_prefill_window_per_token, FailedAudit, FailureReport, Mode,
+    RunDigests, ScoringInputs, SessionEngine,
 };
 use crate::score::{ScoreMetrics, ScorePayload};
 
@@ -387,6 +387,7 @@ pub fn official_timed_params(
     crate::iterate::benchmark_window_params(benchmark, Mode::Official.decode_steps(window))
         .with_spec(spec)
         .with_prefill_warmup_runs(window.official_prefill_warmup_runs)
+        .with_prefill_timed_runs(window.official_prefill_timed_runs)
 }
 
 /// The MEASUREMENT-INTEGRITY WARMUP leg's parameters (coordinator ruling 2026-08-31): ONE
@@ -1402,15 +1403,6 @@ fn paired_leg_record(
     }
 }
 
-/// One leg's SEED PREFILL window per seed token, or `None` when the leg timed a teacher-forced
-/// window that has no seed prefill in its clock. REPORT-ONLY, sealed under seed-named keys only:
-/// it never feeds a decode figure.
-fn seed_prefill_window_per_token(timing: &TimingResult) -> Option<f64> {
-    let w = timing.phase_window?;
-    let (seconds, tokens) = (w.seed_prefill_elapsed_seconds, w.prefill_token_total);
-    (tokens > 0 && seconds.is_finite() && seconds > 0.0).then(|| seconds / tokens as f64)
-}
-
 /// Seal the SCORED pair's seed prefill windows onto the flat metrics
 /// (`ScoreMetrics::*_leg_seed_prefill_window_seconds_per_token`). These are the same row's figures,
 /// never a mean over pairs. Absent when that pair timed a teacher-forced window.
@@ -1432,11 +1424,9 @@ fn seal_seed_prefill_windows(metrics: &mut ScoreMetrics, record: &PairedLegRecor
 /// lifted to the whole pair so that every enforced figure the run seals comes from one measured
 /// pair.
 fn scored_pair_index(records: &[PairedLegRecord], weights: ScoringWeights) -> usize {
-    let mut order: Vec<usize> = (0..records.len()).collect();
-    order.sort_by(|&a, &b| {
-        pair_composite(&records[a], weights).total_cmp(&pair_composite(&records[b], weights))
-    });
-    order[(records.len() - 1) / 2]
+    let composites: Vec<f64> = records.iter().map(|r| pair_composite(r, weights)).collect();
+    bench_core::stats::lower_median_index(&composites)
+        .expect("a paired run measures at least one pair")
 }
 
 /// One pair's composite: the track's weighted score of its candidate leg over its OWN control leg.
@@ -1488,14 +1478,15 @@ fn seal_pair_means(
     records: &[PairedLegRecord],
     weights: ScoringWeights,
 ) {
-    let n = records.len() as f64;
-    let mean = |f: &dyn Fn(&PairedLegRecord) -> f64| records.iter().map(f).sum::<f64>() / n;
+    let mean = |f: &dyn Fn(&PairedLegRecord) -> f64| {
+        bench_core::stats::mean(&records.iter().map(f).collect::<Vec<f64>>())
+    };
     let mean_of_splits = |f: &dyn Fn(&PairedLegRecord) -> Option<f64>| {
         records
             .iter()
             .map(f)
-            .sum::<Option<f64>>()
-            .map(|sum| sum / n)
+            .collect::<Option<Vec<f64>>>()
+            .map(|v| bench_core::stats::mean(&v))
     };
     let speedup = bench_core::score::speedup;
     payload.score = Some(mean(&|r| pair_composite(r, weights)));
@@ -3510,6 +3501,16 @@ mod tests {
         let cuda = official_timed_params(golden.benchmark.as_ref().unwrap(), None, &cuda_window);
         assert_eq!(cuda.prefill_warmup_runs, 0);
         assert_eq!(cuda.prefill_timed_runs, 1);
+        // Nemotron: one warm-up pass, then the MEDIAN of five timed passes.
+        let nemotron_window = WindowShape {
+            official_prefill_warmup_runs: 1,
+            official_prefill_timed_runs: 5,
+            ..crate::iterate::test_window()
+        };
+        let nemotron =
+            official_timed_params(golden.benchmark.as_ref().unwrap(), None, &nemotron_window);
+        assert_eq!(nemotron.prefill_warmup_runs, 1);
+        assert_eq!(nemotron.prefill_timed_runs, 5);
         // The local modes are untouched: their default is still the reference's zero.
         let local = TimingParams::new(vec![1], 1, vec![1], 1, vec![1, 2], 1);
         assert_eq!(
@@ -6964,5 +6965,283 @@ mod tests {
         .unwrap_err();
         assert!(err.contains(SERIAL_CONTROL_LEG_FAILED), "{err}");
         assert!(err.contains("benchmark oracle"), "{err}");
+    }
+
+    // ---- CROSS-PATH INVARIANTS (David 2026-10-07: "make sure benchd calculates scores and uses
+    // decode consistently"). One set of synthetic legs, each with a seed prefill far longer than
+    // its decode window, goes through every path that reports decode, gain or composite. ----
+
+    /// Three pairs of legs: control decode windows near 151.7 tok/s, candidate near 221.5 tok/s,
+    /// different prefill gains per pair, and seed prefills of 5-9 s against decode windows under
+    /// 1 s.
+    fn cross_path_legs() -> Vec<(TimingResult, TimingResult)> {
+        let n = BENCHMARK_DECODE_STEPS as f64;
+        [
+            (151.7, 221.5, 0.000_30, 5.0, 9.0),
+            (151.6, 230.0, 0.000_31, 7.0, 6.0),
+            (151.8, 215.0, 0.000_29, 9.0, 5.0),
+        ]
+        .iter()
+        .map(
+            |&(control_tps, candidate_tps, candidate_prefill, control_seed, candidate_seed)| {
+                (
+                    crate::testgolden::leg_timing(0.000_35, control_seed, n / control_tps),
+                    crate::testgolden::leg_timing(
+                        candidate_prefill,
+                        candidate_seed,
+                        n / candidate_tps,
+                    ),
+                )
+            },
+        )
+        .collect()
+    }
+
+    /// ONE DECODE FIGURE, GAIN AND COMPOSITE ON EVERY PATH. For the same control and candidate
+    /// legs, local iterate, local submit, the single-leg official builder and the paired record
+    /// report bit-identical decode seconds per token (the decode window over N, never the seed),
+    /// decode gain, prefill gain and composite. The paired lower-median score is the single-leg
+    /// score of the scored pair, the mean score is the mean of the per-pair composites, and the
+    /// calibration's decode mean is the paired mean rule's control decode figure.
+    #[test]
+    fn every_path_reports_one_decode_gain_and_composite_for_the_same_legs() {
+        let w = ScoringWeights::DEFAULT;
+        let golden = official_golden(None);
+        let weights = DirDigest::empty();
+        let window = crate::iterate::test_window();
+        let n = BENCHMARK_DECODE_STEPS as f64;
+        let open_bands = AcceptanceBands {
+            prefill_up_tolerance: 1e9,
+            decode_up_tolerance: 1e9,
+            ..PAIRED_TEST_BANDS
+        };
+        let zero_floors = SpeedupFloors {
+            decode: 0.0,
+            prefill: 0.0,
+        };
+        let legs = cross_path_legs();
+        let mut records = Vec::new();
+        let mut single_leg_scores = Vec::new();
+        for (i, (control, candidate)) in legs.iter().enumerate() {
+            let window_spt = candidate.phase_window.unwrap().decode_elapsed_seconds / n;
+            assert!(
+                candidate.phase_window.unwrap().seed_prefill_elapsed_seconds > window_spt * n,
+                "precondition: the seed prefill is longer than the decode window"
+            );
+            let scoring = ScoringInputs {
+                baseline_prefill_spt: control.prefill_seconds_per_token,
+                baseline_decode_spt: control.decode_seconds_per_token,
+                floors: zero_floors,
+                weights: w,
+            };
+            let record = paired_leg_record(i + 1, &golden.sha256, control, candidate);
+            let official = finish_official(
+                &golden,
+                scoring,
+                open_bands,
+                RunDigests::for_test(&weights),
+                "deadbeef",
+                candidate,
+                || Session::connect(conformant_engine()).map(|(s, _)| s),
+            );
+            assert!(official.passed, "{}", official.metrics.error);
+            let decode_gain = bench_core::score::speedup(
+                record.control_decode_seconds_per_token,
+                record.candidate_decode_seconds_per_token,
+            );
+            let prefill_gain = bench_core::score::speedup(
+                record.control_prefill_seconds_per_token,
+                record.candidate_prefill_seconds_per_token,
+            );
+            let composite = bench_core::score::composite(prefill_gain, decode_gain, w);
+            assert_eq!(pair_composite(&record, w).to_bits(), composite.to_bits());
+            assert_eq!(
+                record.candidate_decode_seconds_per_token.to_bits(),
+                window_spt.to_bits()
+            );
+            assert_eq!(
+                record.candidate_decode_window_seconds_per_token,
+                Some(record.candidate_decode_seconds_per_token)
+            );
+            for mode in [Mode::LocalIterate, Mode::LocalSubmit] {
+                let local = crate::iterate::local_iterate_score(
+                    mode,
+                    candidate,
+                    scoring,
+                    &golden,
+                    RunDigests::for_test(&weights),
+                    &window,
+                );
+                for (path, p) in [("local", &local), ("single-leg official", &official)] {
+                    let m = &p.metrics;
+                    let site = format!("pair {}, {mode:?}, {path}", i + 1);
+                    assert_eq!(
+                        m.decode_seconds_per_token.to_bits(),
+                        window_spt.to_bits(),
+                        "{site}"
+                    );
+                    assert_eq!(
+                        m.candidate_leg_decode_window_seconds_per_token,
+                        Some(window_spt),
+                        "{site}"
+                    );
+                    assert_eq!(m.decode_speedup.to_bits(), decode_gain.to_bits(), "{site}");
+                    assert_eq!(
+                        m.prefill_speedup.to_bits(),
+                        prefill_gain.to_bits(),
+                        "{site}"
+                    );
+                    assert_eq!(
+                        p.score.map(f64::to_bits),
+                        Some(composite.to_bits()),
+                        "{site}"
+                    );
+                }
+            }
+            single_leg_scores.push(official.score.unwrap());
+            records.push(record);
+        }
+
+        // lower_median: the scored pair's single-leg score.
+        let composites: Vec<f64> = records.iter().map(|r| pair_composite(r, w)).collect();
+        let scored = scored_pair_index(&records, w);
+        assert_eq!(
+            scored,
+            bench_core::stats::lower_median_index(&composites).unwrap()
+        );
+        assert_eq!(
+            single_leg_scores[scored].to_bits(),
+            composites[scored].to_bits()
+        );
+
+        // mean: the mean of the per-pair composites and gains.
+        let mut payload = ScorePayload {
+            score: Some(0.0),
+            passed: true,
+            metrics: ScoreMetrics::default(),
+        };
+        seal_pair_means(&mut payload, &records, w);
+        assert_eq!(
+            payload.score.unwrap().to_bits(),
+            bench_core::stats::mean(&composites).to_bits()
+        );
+        let decode_gains: Vec<f64> = records
+            .iter()
+            .map(|r| {
+                bench_core::score::speedup(
+                    r.control_decode_seconds_per_token,
+                    r.candidate_decode_seconds_per_token,
+                )
+            })
+            .collect();
+        assert_eq!(
+            payload.metrics.decode_speedup.to_bits(),
+            bench_core::stats::mean(&decode_gains).to_bits()
+        );
+
+        // calibration: its decode mean over the same control legs is the mean rule's control
+        // decode figure, and the decode window, never the seed.
+        let controls: Vec<TimingResult> = legs.iter().map(|(c, _)| c.clone()).collect();
+        let (prefill_legs, decode_legs) = crate::baseline::control_leg_seconds(&controls);
+        let calibration = crate::baseline::calibration_from_passes(
+            &crate::baseline::CalibrationIdentity {
+                track_id: "track",
+                box_name: "box",
+                reference_commit: "0123456789abcdef0123456789abcdef01234567",
+                benchd_source_commit: "0123456789abcdef0123456789abcdef01234567",
+                captured_at: "2026-10-07T00:00:00Z",
+            },
+            &[crate::baseline::PromptPasses {
+                prompt: "prompt",
+                prefill_legs: &prefill_legs,
+                decode_legs: &decode_legs,
+            }],
+            Vec::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            calibration.prompts[0]
+                .decode_seconds_per_token_mean
+                .to_bits(),
+            payload.metrics.baseline_decode_seconds_per_token.to_bits()
+        );
+    }
+
+    /// THE SEALED SCORE IS THE COMPOSITE OF THE SEALED PAIRS, end to end on the real clock, under
+    /// both pair rules. Both legs spend 60 ms in the seed prefill; the score read back from the
+    /// sealed JSON equals the composite recomputed from the sealed `paired_legs` fields
+    /// (lower-median pair, or the mean of the pairs), and no sealed decode figure carries the seed.
+    #[test]
+    fn the_sealed_paired_score_is_the_composite_recomputed_from_the_sealed_pairs() {
+        let w = ScoringWeights::DEFAULT;
+        let seed = std::time::Duration::from_millis(60);
+        let slow_seed = move || conformant_engine().sleep_on("free_decode_begin", seed);
+        for combine in [PairCombine::LowerMedian, PairCombine::Mean] {
+            let golden = official_golden(None);
+            let calibration = wide_calibration();
+            let payload = official_core_paired(
+                &[PairedGoldens {
+                    candidate: &golden,
+                    control: &golden,
+                    prompt: "botany",
+                }],
+                &calibration,
+                paired_seal_for_test(&calibration),
+                RunDigests::for_test(&DirDigest::empty()),
+                "deadbeef",
+                PairedLegs {
+                    open_baseline_leg: |_| Ok(()),
+                    open_candidate_leg: |_| Ok(()),
+                    spawn_baseline: || Session::connect(slow_seed()).map(|(s, _)| s),
+                    spawn_timed: || Session::connect(slow_seed()).map(|(s, _)| s),
+                },
+                open_paired_window(3, combine),
+            );
+            assert!(payload.passed, "{combine:?}: {}", payload.metrics.error);
+            let sealed: serde_json::Value =
+                serde_json::from_str(&payload.to_sealed_json().unwrap()).unwrap();
+            let f = |v: &serde_json::Value, k: &str| v[k].as_f64().unwrap();
+            let pairs = sealed["metrics"]["paired_legs"].as_array().unwrap();
+            assert_eq!(pairs.len(), 3);
+            let composites: Vec<f64> = pairs
+                .iter()
+                .map(|r| {
+                    for role in ["control", "candidate"] {
+                        let decode = f(r, &format!("{role}_decode_seconds_per_token"));
+                        assert_eq!(
+                            f(r, &format!("{role}_decode_window_seconds_per_token")),
+                            decode
+                        );
+                        let seed_spt =
+                            f(r, &format!("{role}_seed_prefill_window_seconds_per_token"));
+                        assert!(seed_spt * BENCHMARK_DECODE_SEED_TOKENS as f64 >= 0.06);
+                        assert!(
+                            decode * (BENCHMARK_DECODE_STEPS as f64) < 0.06,
+                            "{combine:?}: {role} decode {decode} s/tok carries the seed prefill"
+                        );
+                    }
+                    bench_core::score::composite(
+                        bench_core::score::speedup(
+                            f(r, "control_prefill_seconds_per_token"),
+                            f(r, "candidate_prefill_seconds_per_token"),
+                        ),
+                        bench_core::score::speedup(
+                            f(r, "control_decode_seconds_per_token"),
+                            f(r, "candidate_decode_seconds_per_token"),
+                        ),
+                        w,
+                    )
+                })
+                .collect();
+            let expected = match combine {
+                PairCombine::LowerMedian => bench_core::stats::lower_median(&composites),
+                PairCombine::Mean => bench_core::stats::mean(&composites),
+            };
+            assert_eq!(
+                sealed["score"].as_f64().unwrap().to_bits(),
+                expected.to_bits(),
+                "{combine:?}"
+            );
+        }
     }
 }
