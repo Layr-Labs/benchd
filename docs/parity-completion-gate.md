@@ -1081,7 +1081,7 @@ and `overlay-timing` are real subcommands that carried no matrix row and no disp
 | OOS-13 | rustfmt drift on `main` (~6.2k lines) | **none** | razor | Orthogonal to all three prongs; a repo-wide reformat would destroy the line-number citations this document and the matrix depend on. |
 | OOS-14 | Prefill residual (M-5, 27.2 ms protocol floor) | **none** | razor | DECOMPOSED **physical** — the benchd↔engine protocol/spawn floor an in-process monolith never pays. It **cancels in scoring** under per-series benchd-measured baselines, so P3 ✗ (no scoring verdict moves). Grade A on the band with a standing band alarm. |
 | OOS-15 | Anything organizer-owned: the ranked `score.json` seal, the GPQA judge + score-patch + integrity re-anchor, the track fixture's per-prompt numeric values | **none** *(for benchd)* | razor | Ownership boundary — benchd does not author these. Organizer material is **report-only: never modified, never re-uploaded**, even where it looks defective (FT-4). **NARROWED per the Q1a ruling — see below.** |
-| OOS-16 | The 494-vs-303 divergence | **IN-CORPUS** | **ruled** | **RULED A-SCOPED (Q7)** — one adjudication step inside the primary-leg window, with the pre-agreed rule in §5.2. No longer out-of-scope; it leaves this table and becomes a scoped leg. |
+| OOS-16 | The golden-vs-emitted token divergence | **IN-CORPUS** | **ruled** | **RULED A-SCOPED (Q7)** — one adjudication step inside the primary-leg window, with the pre-agreed rule in §5.2. No longer out-of-scope; it leaves this table and becomes a scoped leg. |
 | OOS-17 | `benchd prefill-decompose` (`main.rs@35c100a:313`) | **none** | razor | **Disposition added pre-freeze (A-10).** A one-shot *diagnostic* subcommand: it measured prefill round-trip elapsed at n = 128/256/512/1024 to fit the M-5 intercept. It has no reference counterpart, authors no sealed artifact, and its output feeds no decision, score, floor or calibration verdict — it produced the OOS-14 argument and is not re-run. P1 ✗ (not submission-reachable) · P2 ✗ (nothing ingested) · P3 ✗ (no verdict moves). |
 | OOS-18 | `benchd overlay-timing` (`main.rs@35c100a:322`) | **deferred** | **deferral** | **Disposition added pre-freeze (A-10).** benchd's LOCAL equivalent of ranked **seam 3**, which on the ranked path is the organizer's trusted shell — benchd never authors the ranked `score.json`. So it is not differ-coverable (no second implementation on the ranked path) and not out-of-scope either: its semantics must stay faithful to seam 3 so a local estimate matches what the organizer would seal. **Deferred to D-2**, which mirrors the live overlay (Y's inline merge at `@2108`, validate `@2141-2153`) and is where the fidelity check belongs. Its `--integrity` re-anchor path is already noted in §2.3 as the reason a re-anchored sidecar loses the reference's field ORDER while keeping every field and value. |
 
@@ -1226,15 +1226,15 @@ immediately, (a) when the R2 hidden behavior-gate reference is pulled.
 *Historical note:* prior drafts listed this as an ordinary out-of-scope line ("signed hole"). It
 was a signed hole *for coverage*; it is not a signed hole *for security*.
 
-### 5.2 The 494-vs-303 classification — RULED: **OPTION A, SCOPED**
+### 5.2 The golden-vs-emitted token classification — RULED: **OPTION A, SCOPED**
 
-**494 and 303 are TOKENS, not counts.** Any reading as "494 items vs 303 items" is wrong.
+**The two values are TOKEN IDS, not counts.** Any reading of them as item counts is wrong.
 
 **The facts.** In window 4's E2A leg
 (#109 comment 5353937166), benchd's
-local-iterate run reported `first_failing_step = 3`, `expected_token = 494`, `actual_token = 303`,
-`case_count = 1`, `checked_steps = 4`. `494` is what the window-4 golden `beefed.json`
-(`32045f7e…`, 16,940 B) declares at `expected_tokens[2]`; `303` is what the engine emitted on the
+local-iterate run reported `first_failing_step = 3`, an `expected_token` (the golden token) different from the `actual_token` (the emitted token),
+`case_count = 1`, `checked_steps = 4`. The golden token is what the window-4 golden `beefed.json`
+(`32045f7e…`, 16,940 B) declares at `expected_tokens[2]`; the emitted token is what the engine emitted on the
 M5 box. The analysis rules out an alignment artifact: `first_failing_step = 3` ⇒
 `expected_index = 2` ⇒ **decode step 1**, and a one-index shift would have failed at index 0
 (`expected_tokens[0]` is checked against the prefill argmax). Indices 0 and 1 **matched**, then
@@ -1242,7 +1242,7 @@ index 2 diverged — a **genuine teacher-forced divergence** at the third token 
 a real regression).
 
 **Why unadjudicated.** REF never ran a token on this golden: it refused at load on **arity** (128
-supplied, ≥129 required). No cross-check of the `494` exists.
+supplied, ≥129 required). No cross-check of the golden token exists.
 
 **Razor reading.** If this is a real engine divergence it is **P3** (same inputs → different
 emitted token, i.e. the benchmark does not run the same way) and arguably **P1** (the engine
@@ -1261,7 +1261,7 @@ provenance chain a ranked run trusts.
 > position using the track's own generation path (`mtp-verify --generate`, pinned head,
 > transformed weights) and compare both implementations' emitted chain against that reference
 > chain.
-> - *PASSES:* the window-4 `303` was an artifact of a golden REF refuses plus a generation path
+> - *PASSES:* the window-4 emitted token was an artifact of a golden REF refuses plus a generation path
 >   the track does not use; nothing owed.
 > - *FAILS:* benchd's engine and REF disagree on a decode token under the **track's own
 >   provenance** — a P3 (and likely P1) divergence at the engine seam that would block completion
@@ -1275,21 +1275,21 @@ provenance chain a ranked run trusts.
 > **Option B — OUT-OF-SCOPE.** Classify as a **stale-golden artifact** superseded by #124's arity
 > fix: the observation came from a golden both loaders now correctly refuse, generated off a path
 > the track does not use, so the measurement never had standing.
-> - *Implication:* the `494` is never adjudicated. If it was a real engine regression the battery
+> - *Implication:* the golden token is never adjudicated. If it was a real engine regression the battery
 >   will not catch it — the surround runs its own fixtures and would not reproduce that token
 >   position, and the primary leg's tapes are a different workload.
 > - *Cost:* zero.
 > - *Risk:* a possible P3/P1 divergence stays unexamined behind a procedural dismissal. The §8
 >   re-verify at 129 arity passed 3/3 with **zero deterministic mismatches**, which is *suggestive*
 >   for B — but it ran the re-provisioned golden, whose `expected_tokens[2]` was regenerated by the
->   reference, so it did not test the disputed `494` at all.
+>   reference, so it did not test the disputed golden token at all.
 >
 > **Checker recommendation — OPTION A, SCOPED.** One adjudication step inside the
 > **already-scheduled primary-leg window**: re-derive the disputed position via the track's own
 > `mtp-verify --generate`, then read the regenerated token at that position.
-> - regenerated **303** ⇒ close as a **stale-golden artifact**; the window-4 `494` came from a
+> - regenerated token **= the emitted token** ⇒ close as a **stale-golden artifact**; the window-4 golden token came from a
 >   golden both loaders now refuse, generated off a path the track does not use. Done, no escalation.
-> - regenerated **494** ⇒ **escalate as an engine-seam divergence** — benchd's engine and the
+> - regenerated token **= the golden token** ⇒ **escalate as an engine-seam divergence** — benchd's engine and the
 >   reference disagree on a decode token under the track's own provenance (P3, arguably P1).
 >
 > This is Option A bounded to a single GPU step with a pre-agreed decision rule, so it carries
@@ -1302,8 +1302,8 @@ provenance chain a ranked run trusts.
 >
 > > One adjudication step inside the already-scheduled primary-leg window, re-deriving the
 > > disputed position via the track's own `mtp-verify --generate`.
-> > **Regenerated `303` ⇒ close as a stale-golden artifact.**
-> > **Regenerated `494` ⇒ escalate as an engine-seam divergence and hand off.**
+> > **Regenerated token = the emitted token ⇒ close as a stale-golden artifact.**
+> > **Regenerated token = the golden token ⇒ escalate as an engine-seam divergence and hand off.**
 >
 > The escalation branch is a **hand-off, not more work inside this gate** — that boundary is part
 > of the ruling and is what keeps A-scoped from expanding into an open-ended investigation.
@@ -1402,7 +1402,7 @@ implausible s-per-tok / row-accounting) rather than a parity class.
 | **Q4** | #131 no-artifact class | **R-10a with option (2)** — real byte-compare; seal diverges on the 3 declared weights fields; **no** 15 GB pre-hash | §4.7 |
 | **Q5** | Family V pins | **From the window REPORT** — rule as written | §4.9 |
 | **Q6** | #135 sidecar premise | **TWO ARTIFACTS** — `results.json` organizer-shape + full 8-key local sidecar | §2.4 D-1 |
-| **Q7** | 494-vs-303 | **A-SCOPED**, checker's decision rule verbatim | §5.2 |
+| **Q7** | Golden-vs-emitted token | **A-SCOPED**, checker's decision rule verbatim | §5.2 |
 | **Q8** | FT-1 (tapes vs local modes) | **FACT ACCEPTED** — does not block a leg | §3.3 |
 
 ### The two follow-on deliverables this signature creates
@@ -1435,5 +1435,5 @@ Named explicitly, so nothing rides on silence:
 - **R-10 needs the #131 fix** before its case can run.
 - **#134 was merged** (PR #136, `1465393`), so the GPU block is lifted — but no window has run
   under this gate yet. Every "must show" in §2.4 and §3.4 remains `UNVERIFIED` until one does.
-- **The 494-vs-303 outcome is unknown.** A-SCOPED settles *how* it gets adjudicated, not what the
-  answer is; the `494` branch escalates out of this gate.
+- **The golden-vs-emitted token outcome is unknown.** A-SCOPED settles *how* it gets adjudicated, not what the
+  answer is; the golden-token branch escalates out of this gate.
