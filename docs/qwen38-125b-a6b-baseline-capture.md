@@ -32,9 +32,10 @@ on its own. The score is the live ratio of those aggregates:
 (ref_prefill_spt / cand_prefill_spt)^0.25 * (ref_decode_spt / cand_decode_spt)^0.75
 ```
 
-The speedup floors and the acceptance bands do not change. The band shape is
-prefill +5 % up, decode +2 % up. The down bands are DISABLED on both axes: a
-control leg faster than its calibration is a well box and passes. What changed
+The speedup floors are the only gate on a slow candidate. The band shape is
+prefill +5 % up, decode +2 % up. It is the health band of the control leg
+(section 2), and it does not gate the candidate. The down bands are DISABLED on
+both axes: a control leg faster than its calibration is a well box and passes. What changed
 is the reference the shape is applied to. It is a live measurement, not a
 stored pair.
 

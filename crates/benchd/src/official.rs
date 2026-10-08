@@ -932,9 +932,9 @@ pub struct PairedWindow<G> {
 /// its OWN control leg. The fixture's `official_pair_combine` then decides the score:
 ///
 /// * `lower_median` (the default): the run scores ONE pair, the lower median of the composites
-///   ([`scored_pair_index`]). The floors and the acceptance bands gate that pair.
+///   ([`scored_pair_index`]). The speedup floors gate that pair.
 /// * `mean`: the score is the arithmetic mean of the composites. Every pair is scored, so the
-///   floors and the acceptance bands gate every pair, each against its own control leg, and the
+///   floors gate every pair, each against its own control leg, and the
 ///   first pair that fails refuses the run ([`first_failing_pair`]). The run-level timing figures
 ///   are the means of the per-pair figures ([`seal_pair_means`]).
 ///
@@ -1443,7 +1443,8 @@ fn pair_composite(record: &PairedLegRecord, weights: ScoringWeights) -> f64 {
 
 /// THE MEAN RULE'S GATE (`official_pair_combine: "mean"`): every pair is scored, so every pair
 /// must pass the same gate the lower-median rule applies to its one pair — a finite composite,
-/// the speedup floors and the acceptance bands, each against the pair's own control leg. Returns
+/// the speedup floors and the band's enabled lower bounds, each against the pair's own control
+/// leg ([`evaluate_timed_run`]). Returns
 /// the index of the first pair that fails, in measurement order, and its reason.
 fn first_failing_pair(
     records: &[PairedLegRecord],
@@ -1775,9 +1776,10 @@ where
 {
     let (baseline_prefill_spt, baseline_decode_spt) = scoring.baselines();
     // 2. Official GATING, evaluated BEFORE correctness (Swift Score.swift:50-126,
-    //    QwenRuntimeBenchmark.swift:513-558): non-finite score → floors (0.95) → acceptance
-    //    bands (prefill ±5%, decode +2%/−5%). The FIRST failure reason (in that priority)
-    //    fails the run; real timing is retained.
+    //    QwenRuntimeBenchmark.swift:513-558): non-finite score → the fixture's speedup floors
+    //    (the only gate on a slow candidate) → the band's enabled lower bounds (a suspiciously
+    //    fast candidate). The FIRST failure reason (in that priority) fails the run; real timing
+    //    is retained.
     let eval = evaluate_timed_run(
         timing.decode_seconds_per_token,
         timing.prefill_seconds_per_token,
@@ -5531,8 +5533,8 @@ mod tests {
             first_failing_pair(&fine, PAIRED_TEST_BANDS, SpeedupFloors::DEFAULT, w),
             None
         );
-        // Pair 2 decodes at 0.90 of its control leg: under the 0.95 floor. Pair 3 is over the
-        // decode up band too, but pair 2 comes first.
+        // Pair 2 decodes at 0.90 of its control leg: under the 0.95 floor. Pair 3 is under it
+        // too, but pair 2 comes first.
         let slow = [
             pair_with_composite(1, 1.30),
             pair_with_composite(2, 0.90),
@@ -5543,7 +5545,8 @@ mod tests {
         assert_eq!(pair, 1);
         assert!(reason.starts_with("pair 2 of 3: "), "{reason}");
         assert!(reason.contains("decode_speedup=0.900000"), "{reason}");
-        // The prefill axis is gated per pair too: pair 1's prefill is 10 % over its control leg.
+        // The prefill axis is gated per pair too: pair 1's prefill is 10 % over its control leg,
+        // a gain of 0.909, under the 0.95 prefill floor.
         let mut prefill_slow = fine.clone();
         prefill_slow[0].candidate_prefill_seconds_per_token = 1.10;
         let (pair, reason) =
@@ -7235,6 +7238,228 @@ mod tests {
                 .to_bits(),
             payload.metrics.baseline_decode_seconds_per_token.to_bits()
         );
+    }
+
+    /// The CUDA Nemotron band shape: up 0.05 prefill and 0.02 decode (the control leg's health
+    /// band), both lower bounds off.
+    const NEMOTRON_BANDS: AcceptanceBands = PAIRED_TEST_BANDS;
+
+    /// The floors David set for the CUDA Nemotron track (engine PR #16): 0.95 decode, 0.80
+    /// prefill.
+    const NEMOTRON_FLOORS: SpeedupFloors = SpeedupFloors {
+        decode: 0.95,
+        prefill: 0.80,
+    };
+
+    /// One pair's legs at the given decode and prefill gains over a control leg near 75 tok/s
+    /// decode and 0.000276407 s/tok prefill (the fd79c401 control), each with a long seed prefill.
+    fn legs_at_gains(decode_gain: f64, prefill_gain: f64) -> (TimingResult, TimingResult) {
+        let n = BENCHMARK_DECODE_STEPS as f64;
+        let control_prefill = 0.000276407;
+        let control_window = n / 75.0;
+        (
+            crate::testgolden::leg_timing(control_prefill, 6.0, control_window),
+            crate::testgolden::leg_timing(
+                control_prefill / prefill_gain,
+                8.0,
+                control_window / decode_gain,
+            ),
+        )
+    }
+
+    /// REGRESSION fd79c401 (run 37713077396), and THE SAME DECISION ON EVERY PATH. The candidate's
+    /// one slowness gate is its speedup floor. For the same legs, the single-leg official path,
+    /// the paired lower-median path (the gate on its scored pair), the paired mean path (the gate
+    /// on every pair), the local floor flags and the measure-job overlay gate (under its own
+    /// decode-only regime: decode weight 1, the 0.90 decode floor, no prefill axis) all pass or
+    /// all refuse, and a refusal names the floor. The band's up tolerances are not read: the same
+    /// decisions hold with them at 1e9.
+    #[test]
+    fn regression_fd79c401_every_path_makes_the_same_floor_decision_for_the_same_legs() {
+        let golden = official_golden(None);
+        let weights = DirDigest::empty();
+        let window = crate::iterate::test_window();
+        let w = ScoringWeights::DEFAULT;
+        // (decode gain, prefill gain, passes, the floor message when refused)
+        let cases: [(f64, f64, bool, Option<&str>); 6] = [
+            (1.6016, 0.85, true, None),
+            // The measured fd79c401 pair 1: 0.000276407 / 0.000318502.
+            (1.6016, 0.000276407 / 0.000318502, true, None),
+            (1.6016, 0.80, true, None),
+            (
+                1.6016,
+                0.79,
+                false,
+                Some("prefill_speedup=0.790000 floor=0.800000"),
+            ),
+            (
+                0.94,
+                1.0,
+                false,
+                Some("decode_speedup=0.940000 floor=0.950000"),
+            ),
+            (1.0, 1.0, true, None),
+        ];
+        let wide_up = AcceptanceBands {
+            prefill_up_tolerance: 1e9,
+            decode_up_tolerance: 1e9,
+            ..NEMOTRON_BANDS
+        };
+        for bands in [NEMOTRON_BANDS, wide_up] {
+            for &(decode_gain, prefill_gain, passes, floor_message) in &cases {
+                let site = format!("decode {decode_gain}, prefill {prefill_gain}, bands {bands:?}");
+                let (control, candidate) = legs_at_gains(decode_gain, prefill_gain);
+                let scoring = ScoringInputs {
+                    baseline_prefill_spt: control.prefill_seconds_per_token,
+                    baseline_decode_spt: control.decode_seconds_per_token,
+                    floors: NEMOTRON_FLOORS,
+                    weights: w,
+                };
+                let check = |path: &str, passed: bool, error: &str| {
+                    assert_eq!(passed, passes, "{site}, {path}: {error}");
+                    if let Some(message) = floor_message {
+                        assert!(
+                            error.contains("performance floor failed:") && error.contains(message),
+                            "{site}, {path}: {error}"
+                        );
+                    }
+                    assert!(
+                        !error.contains("acceptance band"),
+                        "{site}, {path}: {error}"
+                    );
+                };
+
+                // Single-leg official, and the paired lower-median gate on its scored pair: the
+                // same `finish_official` over the pair's own control leg.
+                let official = finish_official(
+                    &golden,
+                    scoring,
+                    bands,
+                    RunDigests::for_test(&weights),
+                    "deadbeef",
+                    &candidate,
+                    || Session::connect(conformant_engine()).map(|(s, _)| s),
+                );
+                check(
+                    "single-leg / lower-median",
+                    official.passed,
+                    &official.metrics.error,
+                );
+
+                // Paired mean: every pair is gated; three identical pairs.
+                let records: Vec<PairedLegRecord> = (1..=3)
+                    .map(|pair| paired_leg_record(pair, &golden.sha256, &control, &candidate))
+                    .collect();
+                let mean_gate = first_failing_pair(&records, bands, NEMOTRON_FLOORS, w);
+                let mean_error = mean_gate.as_ref().map_or("", |(_, r)| r.as_str());
+                check("paired mean", mean_gate.is_none(), mean_error);
+
+                // Local iterate and local submit seal the same floor decision as flags.
+                for mode in [Mode::LocalIterate, Mode::LocalSubmit] {
+                    let local = crate::iterate::local_iterate_score(
+                        mode,
+                        &candidate,
+                        scoring,
+                        &golden,
+                        RunDigests::for_test(&weights),
+                        &window,
+                    );
+                    let m = &local.metrics;
+                    assert_eq!(
+                        m.passed_decode_speedup_floor && m.passed_prefill_speedup_floor,
+                        passes,
+                        "{site}, {mode:?}"
+                    );
+                }
+
+                // Measure-job: the overlay gate on the pair's decode ratio, and the official
+                // gate under the measure-job regime, make one decision.
+                let ratio = bench_core::score::speedup(
+                    control.decode_seconds_per_token,
+                    candidate.decode_seconds_per_token,
+                );
+                let overlay = bench_core::score::score_paired_decode_only(&[ratio], &[ratio]);
+                let regime = bench_core::score::evaluate_timed_run(
+                    candidate.decode_seconds_per_token,
+                    candidate.prefill_seconds_per_token,
+                    control.decode_seconds_per_token,
+                    control.prefill_seconds_per_token,
+                    bands,
+                    SpeedupFloors {
+                        decode: bench_core::constants::QWEN_MTP_DECODE_SPEEDUP_FLOOR,
+                        prefill: 0.0,
+                    },
+                    ScoringWeights {
+                        decode: 1.0,
+                        prefill: 0.0,
+                    },
+                );
+                assert_eq!(
+                    overlay.passed,
+                    regime.first_failure_reason().is_none(),
+                    "{site}, measure-job"
+                );
+                assert_eq!(
+                    overlay.passed,
+                    crate::measure_job::decode_speedup_floor_verdict(
+                        crate::measure_job::LegRegime::FreeRunV1_1,
+                        ratio,
+                        ratio
+                    )
+                    .1,
+                    "{site}, measure-job seal"
+                );
+                assert_eq!(
+                    overlay.passed,
+                    decode_gain >= bench_core::constants::QWEN_MTP_DECODE_SPEEDUP_FLOOR,
+                    "{site}, measure-job"
+                );
+            }
+        }
+    }
+
+    /// THE HEALTH BAND STILL REFUSES A SLOW CONTROL LEG (fd79c401 changed only the candidate). A
+    /// control leg slower than its calibrated mean times `1 + up` refuses the paired run by name
+    /// under both pair rules, with the Nemotron fixture's band and floors, exactly as before.
+    #[test]
+    fn regression_fd79c401_the_health_band_still_refuses_a_slow_control_leg() {
+        let golden = official_golden(None);
+        for combine in [PairCombine::LowerMedian, PairCombine::Mean] {
+            let calibration = narrow_calibration();
+            let mut window = paired_window_for_test(|_phase: &str| Ok(()));
+            window.bands = NEMOTRON_BANDS;
+            window.floors = NEMOTRON_FLOORS;
+            window.combine = combine;
+            window.pairs = 3;
+            let payload = official_core_paired(
+                &[PairedGoldens {
+                    candidate: &golden,
+                    control: &golden,
+                    prompt: "botany",
+                }],
+                &calibration,
+                paired_seal_for_test(&calibration),
+                RunDigests::for_test(&DirDigest::empty()),
+                "deadbeef",
+                PairedLegs {
+                    open_baseline_leg: |_| Ok(()),
+                    open_candidate_leg: |_| Ok(()),
+                    spawn_baseline: || Session::connect(conformant_engine()).map(|(s, _)| s),
+                    spawn_timed: || Session::connect(conformant_engine()).map(|(s, _)| s),
+                },
+                window,
+            );
+            assert!(payload.score.is_none(), "{combine:?}");
+            assert!(!payload.passed, "{combine:?}");
+            assert!(
+                payload
+                    .metrics
+                    .error
+                    .contains(crate::baseline::SERIAL_CONTROL_LEG_OUTSIDE_BAND),
+                "{combine:?}: {}",
+                payload.metrics.error
+            );
+        }
     }
 
     /// THE SEALED SCORE IS THE COMPOSITE OF THE SEALED PAIRS, end to end on the real clock, under

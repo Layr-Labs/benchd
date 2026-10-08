@@ -144,7 +144,7 @@ prompt:
 The two engines are strictly sequential and each leg loads the model once. Each
 pair has its own composite. The fixture's `official_pair_combine` picks the
 score: the lower-median pair (the default) or the mean of the per-pair
-composites (`mean`). The floors and the bands gate each scored pair. Every
+composites (`mean`). The speedup floors gate each scored pair. Every
 control leg is band-checked on its own. A fixture
 that declares no `official_pairs` refuses the ranked run; benchd never guesses
 the count.

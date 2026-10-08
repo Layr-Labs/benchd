@@ -93,8 +93,11 @@ pub const QWEN_MTP_PER_PAIR_RATIO_BOUND: f64 = 8.0;
 /// They are FIXED LITERALS carried inside [`OfficialBaseline`] and pending together with the pair
 /// (they are NOT re-derived from a capture CV at seal time — the scored path reads exactly these).
 ///
-/// Band SHAPE for the single-leg MTP-on-the-timed-leg regime (David ruling): prefill ±5% symmetric;
-/// decode +2% UP; decode DOWN-band DISABLED. The values land at calibration.
+/// ONE MEANING PER FIELD (David 2026-10-07). The UP tolerances are the ceiling of the CONTROL
+/// leg's health band (`benchd::baseline::HealthBand`) and nothing else: no candidate gate reads
+/// them, because the speedup floors are the candidate's only slowness gate. The DOWN tolerances,
+/// when enabled, are the candidate's lower ("suspiciously fast") bound
+/// ([`crate::score::check_fast_side`]).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct AcceptanceBands {
     pub prefill_up_tolerance: f64,
@@ -106,14 +109,14 @@ pub struct AcceptanceBands {
     /// where the ruling is: decode DOWN-band DISABLED. MTP spec-decode decode is legitimately much
     /// faster than the serial baseline, so Laguna's "-5% improvement too large" lower guard would
     /// WRONGLY fail a healthy MTP run — the 0.95 decode speedup FLOOR is the only lower guard the
-    /// decode axis needs. When `false`, [`crate::score::evaluate_timed_run`]/`check` skip the
-    /// decode lower-bound test and keep the decode UP bound. `decode_down_tolerance` is then inert.
+    /// decode axis needs. When `false`, [`crate::score::evaluate_timed_run`] skips the decode
+    /// lower-bound test. `decode_down_tolerance` is then inert on the candidate.
     pub decode_down_enabled: bool,
     /// Whether the prefill band enforces its LOWER bound. `false` on the paired design: the
     /// serial-control leg is measured live in the same run and carries its own health band
     /// (`benchd::baseline::check_band`), so a candidate prefill far below the control's is a
     /// faster engine, not a lottery, and the -tolerance% "improvement too large" guard would refuse
-    /// exactly the submissions the track exists to reward. The prefill UP bound stays.
+    /// exactly the submissions the track exists to reward.
     pub prefill_down_enabled: bool,
 }
 

@@ -91,11 +91,11 @@ The fixture's `official_pair_combine` sets how the pairs make one score.
 
 - `lower_median` (the default, when the field is absent): the run scores the
   pair whose composite is the lower median over the pairs: the middle pair on
-  an odd count, the lower of the two central pairs on an even count. The floors
-  and the bands gate that pair. Every enforced figure in `score.json` is that
+  an odd count, the lower of the two central pairs on an even count. The speedup
+  floors gate that pair. Every enforced figure in `score.json` is that
   one pair's.
 - `mean`: the score is the arithmetic mean of the per-pair composites. The
-  floors and the bands gate every pair, each against its own control leg, and
+  speedup floors gate every pair, each against its own control leg, and
   the first pair that fails stops the run. The two gains and the candidate and
   control seconds per token in `score.json` are each the mean of the same
   per-pair figure. The score is not the composite of the mean gains, and a mean

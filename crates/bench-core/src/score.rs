@@ -204,22 +204,26 @@ impl SpeedupFloors {
     };
 }
 
-/// `BenchmarkScore.passesSpeedupFloors`: false if anything is non-finite, else both
-/// speedups must clear their floor.
+/// THE CANDIDATE'S SLOWNESS GATE (David 2026-10-07): a candidate gain is slow enough to refuse
+/// only when it is below its floor. The floor is the one slowness gate on the candidate. No
+/// candidate-vs-reference band has a slow side. Every pass/fail decision on candidate speed comes
+/// from this one predicate: [`passes_speedup_floors`] (the paired path under both pair rules and
+/// the single-leg path, through [`evaluate_timed_run`]), the local `passed_*_speedup_floor` flags,
+/// the measure-job floor verdict and [`score_paired_decode_only`] (the overlay).
+///
+/// False if the gain or the floor is not finite. A gain exactly at the floor clears it.
+pub fn clears_floor(gain: f64, floor: f64) -> bool {
+    gain.is_finite() && floor.is_finite() && gain >= floor
+}
+
+/// `BenchmarkScore.passesSpeedupFloors`: both gains [`clears_floor`] on their own axis.
 pub fn passes_speedup_floors(
     decode_speedup: f64,
     prefill_speedup: f64,
     decode_floor: f64,
     prefill_floor: f64,
 ) -> bool {
-    if !decode_speedup.is_finite()
-        || !prefill_speedup.is_finite()
-        || !decode_floor.is_finite()
-        || !prefill_floor.is_finite()
-    {
-        return false;
-    }
-    decode_speedup >= decode_floor && prefill_speedup >= prefill_floor
+    clears_floor(decode_speedup, decode_floor) && clears_floor(prefill_speedup, prefill_floor)
 }
 
 /// `BenchmarkScore.speedupFloorFailureMessage`: exact POSIX/en_US format, 6 decimals.
@@ -260,16 +264,22 @@ impl AcceptanceBandResult {
     }
 }
 
-/// `AcceptanceBand.check`: per-run band gate against a paired baseline. Two-sided when
-/// `enforce_lower_bound` is `true`; when `false` the LOWER ("improvement too large") test is SKIPPED
-/// and only the upper bound is enforced. The lower bound is disabled for the MTP timed leg's decode
-/// axis (see [`crate::constants::AcceptanceBands::decode_down_enabled`]): MTP decode legitimately
-/// runs much faster than the serial baseline, so the -tolerance% lower guard would wrongly fail a
-/// healthy run — the 0.95 decode speedup floor is the only lower guard the decode axis needs.
-pub fn check(
+/// THE CANDIDATE'S FAST-SIDE CHECK (the lower side of the Swift `AcceptanceBand.check`). A
+/// candidate seconds-per-token figure below `reference * (1 - down_tolerance)` is "improvement too
+/// large" or a suspiciously lucky reading, and fails. The check runs only when
+/// `enforce_lower_bound` is `true` (the fixture's `*_band_down_enabled`); when it is `false` any
+/// finite positive value passes.
+///
+/// There is NO slow side (David 2026-10-07). A slow candidate is refused by its speedup floor
+/// ([`clears_floor`]) and by nothing else. The fixture's `*_band_up_tolerance` is the ceiling of
+/// the CONTROL leg's health band (`benchd::baseline::HealthBand::of_contract`) and is not read
+/// here. Before this, the band's slow side read the same field, so a candidate prefill had two
+/// slowness gates and a floor below `1 / (1 + up)` could never take effect (submission fd79c401).
+///
+/// A value or reference that is not finite and positive fails on either setting.
+pub fn check_fast_side(
     value: f64,
     reference: f64,
-    up_tolerance: f64,
     down_tolerance: f64,
     enforce_lower_bound: bool,
     label: &str,
@@ -279,15 +289,7 @@ pub fn check(
             "{label} ({value}) and reference ({reference}) must be finite and positive"
         ));
     }
-    let hi = reference * (1.0 + up_tolerance);
     let lo = reference * (1.0 - down_tolerance);
-    if value > hi {
-        return AcceptanceBandResult::failed(format!(
-            "{label} {value} exceeds +{}% of reference {reference} (> {hi}): \
-slowdown/regression beyond tolerance",
-            up_tolerance * 100.0
-        ));
-    }
     if enforce_lower_bound && value < lo {
         return AcceptanceBandResult::failed(format!(
             "{label} {value} below -{}% of reference {reference} (< {lo}): \
@@ -348,10 +350,13 @@ impl TimedRunScoreEvaluation {
     }
 }
 
-/// `BenchmarkScore.evaluateTimedRun`. Prefill band uses the prefill up/down tolerances;
-/// decode band uses the decode up/down tolerances (all from `constants`). `floors` is the run's
-/// resolved [`SpeedupFloors`] — the track fixture's pair on a scored run — and the evaluation
-/// carries it back, so the caller seals the floors this gate enforced.
+/// `BenchmarkScore.evaluateTimedRun`: THE ONE GATE on a candidate's speed, used by the paired
+/// official path under both pair rules and by the single-leg official path. The candidate is
+/// refused when it is slow by its speedup floors ([`passes_speedup_floors`]), and when it is
+/// suspiciously fast by the enabled lower bounds of `bands` ([`check_fast_side`]). The up
+/// tolerances of `bands` are not read. `floors` is the run's resolved [`SpeedupFloors`] (the track
+/// fixture's pair on a scored run) and the evaluation carries it back, so the caller seals the
+/// floors this gate enforced.
 pub fn evaluate_timed_run(
     decode_spt: f64,
     prefill_spt: f64,
@@ -370,23 +375,20 @@ pub fn evaluate_timed_run(
     );
     let decode_speedup = speedup(baseline_decode_spt, decode_spt);
     let prefill_speedup = speedup(baseline_prefill_spt, prefill_spt);
-    // Each LOWER bound is conditional. The MTP timed leg disables decode's
-    // (`decode_down_enabled == false`); the paired design disables prefill's too
-    // (`prefill_down_enabled == false`), because the control leg is measured live and carries its
-    // own health band, so a candidate far faster than the control is the point, not a lottery.
-    // The UP bounds and the speedup floors remain the guards.
-    let prefill_band = check(
+    // THE FAST SIDE ONLY. Each lower bound runs when the fixture enables it
+    // (`*_band_down_enabled`). Both Nemotron tracks and the paired design disable both, because
+    // the control leg is measured live and carries its own health band. The SLOW side is the
+    // speedup floors and nothing else.
+    let prefill_band = check_fast_side(
         prefill_spt,
         baseline_prefill_spt,
-        bands.prefill_up_tolerance,
         bands.prefill_down_tolerance,
         bands.prefill_down_enabled,
         "prefill",
     );
-    let decode_band = check(
+    let decode_band = check_fast_side(
         decode_spt,
         baseline_decode_spt,
-        bands.decode_up_tolerance,
         bands.decode_down_tolerance,
         bands.decode_down_enabled,
         "decode",
@@ -552,7 +554,7 @@ pub fn score_paired_decode_only(
     if !raw_median.is_finite() {
         return fail(PairedDecodeFailure::NonFiniteMedian { median: raw_median });
     }
-    if raw_median < QWEN_MTP_DECODE_SPEEDUP_FLOOR {
+    if !clears_floor(raw_median, QWEN_MTP_DECODE_SPEEDUP_FLOOR) {
         return fail(PairedDecodeFailure::Floor {
             median: raw_median,
             floor: QWEN_MTP_DECODE_SPEEDUP_FLOOR,
@@ -704,50 +706,49 @@ prefill_speedup=0.800000 floor=0.950000"
     }
 
     #[test]
-    fn band_edges_inclusive_pass() {
+    fn fast_side_edge_inclusive_pass() {
         let reference = 100.0;
-        // hi = 105 (up 5%), lo = 95 (down 5%). Exactly on the edges passes.
-        assert!(check(105.0, reference, 0.05, 0.05, true, "x").passed);
-        assert!(check(95.0, reference, 0.05, 0.05, true, "x").passed);
-        assert!(check(100.0, reference, 0.05, 0.05, true, "x").passed);
+        // lo = 95 (down 5%). Exactly on the edge passes.
+        assert!(check_fast_side(95.0, reference, 0.05, true, "x").passed);
+        assert!(check_fast_side(100.0, reference, 0.05, true, "x").passed);
     }
 
     #[test]
-    fn band_beyond_edges_fail() {
-        let reference = 100.0;
-        let above = check(105.0001, reference, 0.05, 0.05, true, "x");
-        assert!(!above.passed);
-        assert!(above.reason.contains("slowdown/regression"));
-        let below = check(94.9999, reference, 0.05, 0.05, true, "x");
+    fn fast_side_beyond_edge_fails() {
+        let below = check_fast_side(94.9999, 100.0, 0.05, true, "x");
         assert!(!below.passed);
         assert!(below.reason.contains("improvement too large"));
     }
 
-    /// Change 3 — the MTP timed leg disables the decode DOWN band: a value far BELOW the lower edge
-    /// (an "improvement too large") PASSES when `enforce_lower_bound = false`, while the UP bound
-    /// still fails a genuine slowdown. The two-sided call rejects the same low value.
+    /// THE CANDIDATE HAS NO SLOW SIDE (David 2026-10-07). A value far ABOVE the reference passes
+    /// the band on either lower-bound setting: the speedup floor is the only slowness gate.
     #[test]
-    fn band_lower_bound_disabled_skips_improvement_too_large_but_keeps_upper() {
+    fn fast_side_check_never_refuses_a_slow_value() {
+        for enforce in [true, false] {
+            let slow = check_fast_side(1000.0, 100.0, 0.05, enforce, "prefill");
+            assert!(slow.passed, "{}", slow.reason);
+        }
+    }
+
+    /// The MTP timed leg disables the decode DOWN band: a value far BELOW the lower edge (an
+    /// "improvement too large") PASSES when `enforce_lower_bound = false`, and the same value is
+    /// refused with the bound on.
+    #[test]
+    fn fast_side_disabled_accepts_a_large_improvement() {
         let reference = 100.0;
-        // Far below the -5% edge, lower bound OFF → passes (the 0.95 floor is the real guard).
-        let fast = check(50.0, reference, 0.02, 0.05, false, "decode");
+        let fast = check_fast_side(50.0, reference, 0.05, false, "decode");
         assert!(
             fast.passed,
             "lower bound disabled must accept a large improvement"
         );
-        // The SAME value with the lower bound ON is refused as "improvement too large".
-        let fast_two_sided = check(50.0, reference, 0.02, 0.05, true, "decode");
+        let fast_two_sided = check_fast_side(50.0, reference, 0.05, true, "decode");
         assert!(!fast_two_sided.passed);
         assert!(fast_two_sided.reason.contains("improvement too large"));
-        // A genuine slowdown still fails the UP bound even with the lower bound disabled.
-        let slow = check(102.1, reference, 0.02, 0.05, false, "decode");
-        assert!(!slow.passed);
-        assert!(slow.reason.contains("slowdown/regression"));
     }
 
     #[test]
     fn band_nonfinite_value_fails() {
-        let r = check(f64::NAN, 100.0, 0.05, 0.05, true, "prefill");
+        let r = check_fast_side(f64::NAN, 100.0, 0.05, true, "prefill");
         assert!(!r.passed);
         assert!(r.reason.contains("must be finite and positive"));
     }
@@ -766,8 +767,8 @@ prefill_speedup=0.800000 floor=0.950000"
 
     /// PAIRED DESIGN: a candidate prefill 13% faster than the live serial control passes the
     /// prefill band when the lower bound is disabled (`prefill_down_enabled == false`), and is
-    /// refused as "improvement too large" by the same evaluation with the bound on. The UP bound
-    /// and the floors are unchanged either way.
+    /// refused as "improvement too large" by the same evaluation with the bound on. The floors
+    /// are unchanged either way.
     #[test]
     fn evaluate_timed_run_prefill_lower_bound_disabled_accepts_large_prefill_gain() {
         let control_decode = 0.0661;
@@ -807,7 +808,8 @@ prefill_speedup=0.800000 floor=0.950000"
             .prefill_band
             .reason
             .contains("improvement too large"));
-        // A prefill slowdown past the UP bound is still refused with the lower bound off.
+        // A prefill 4% slower than the control passes the band: the floor is the only slowness
+        // gate, and 1 / 1.04 clears 0.95.
         let slow = evaluate_timed_run(
             control_decode * 0.85,
             control_prefill * 1.04,
@@ -817,8 +819,70 @@ prefill_speedup=0.800000 floor=0.950000"
             SpeedupFloors::DEFAULT,
             ScoringWeights::DEFAULT,
         );
-        assert!(!slow.prefill_band.passed);
-        assert!(slow.prefill_band.reason.contains("slowdown/regression"));
+        assert!(slow.prefill_band.passed, "{}", slow.prefill_band.reason);
+        assert_eq!(slow.first_failure_reason(), None);
+    }
+
+    /// REGRESSION fd79c401 (run 37713077396): David set the CUDA prefill floor to 0.80, and the
+    /// run was still refused by the band's slow side, "prefill 0.000318502 exceeds +5% of
+    /// reference 0.000276407". The floor is the candidate's one slowness gate: with the up
+    /// tolerance at 0.05, a prefill gain of 0.85 (or the measured 0.868) passes a 0.80 floor, and
+    /// 0.79 is refused BY THE FLOOR, with the floor message. Both tolerances set to any value
+    /// change nothing on the slow side.
+    #[test]
+    fn regression_fd79c401_prefill_floor_is_the_only_slowness_gate() {
+        let nemotron = AcceptanceBands {
+            prefill_up_tolerance: 0.05,
+            prefill_down_tolerance: 0.05,
+            decode_up_tolerance: 0.02,
+            decode_down_tolerance: 0.05,
+            decode_down_enabled: false,
+            prefill_down_enabled: false,
+        };
+        let floors = SpeedupFloors {
+            decode: 0.95,
+            prefill: 0.80,
+        };
+        let control_decode = 1.0 / 75.0;
+        let candidate_decode = 1.0 / 122.0;
+        let control_prefill = 0.000276407;
+        let eval = |candidate_prefill: f64, bands: AcceptanceBands| {
+            evaluate_timed_run(
+                candidate_decode,
+                candidate_prefill,
+                control_decode,
+                control_prefill,
+                bands,
+                floors,
+                ScoringWeights::DEFAULT,
+            )
+        };
+        let wide_up = AcceptanceBands {
+            prefill_up_tolerance: 1e9,
+            decode_up_tolerance: 1e9,
+            ..nemotron
+        };
+        for bands in [nemotron, wide_up] {
+            // The measured fd79c401 pair 1.
+            let measured = eval(0.000318502, bands);
+            assert_eq!(measured.first_failure_reason(), None);
+            // Gain 0.85.
+            let at_085 = eval(control_prefill / 0.85, bands);
+            assert!((at_085.prefill_speedup - 0.85).abs() < 1e-12);
+            assert!(at_085.passes_floors);
+            assert!(at_085.passes_acceptance_bands());
+            assert_eq!(at_085.first_failure_reason(), None);
+            // Gain 0.79: the floor refuses it, by the floor message.
+            let at_079 = eval(control_prefill / 0.79, bands);
+            assert!(!at_079.passes_floors);
+            assert!(at_079.passes_acceptance_bands());
+            let reason = at_079.first_failure_reason().unwrap();
+            assert!(reason.starts_with("performance floor failed:"), "{reason}");
+            assert!(
+                reason.contains("prefill_speedup=0.790000 floor=0.800000"),
+                "{reason}"
+            );
+        }
     }
 
     #[test]
@@ -842,7 +906,7 @@ prefill_speedup=0.800000 floor=0.950000"
 
     #[test]
     fn evaluate_timed_run_floor_failure_reported() {
-        // Candidate far slower on decode: speedup below floor, and above band.
+        // Candidate far slower on decode: speedup below floor.
         let e = evaluate_timed_run(
             1.0,
             0.010605031949609375,

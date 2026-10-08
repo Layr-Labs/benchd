@@ -268,10 +268,10 @@ fields, the paired-run fields and the two speedup floors are each declared on th
 | scored regime | `decode_gain_exponent` | The exponent of the decode gain in the composite. |
 | official baseline | `official_baseline_prefill_seconds_per_token` | The prefill half of a stored pair. |
 | official baseline | `official_baseline_decode_seconds_per_token` | The decode half of the same pair. |
-| speedup floors | `decode_speedup_floor` | The decode speedup the scored run must clear. |
-| speedup floors | `prefill_speedup_floor` | The prefill speedup the scored run must clear. |
-| acceptance bands | `prefill_band_up_tolerance`, `prefill_band_down_tolerance`, `prefill_band_down_enabled` | The prefill band and whether its lower bound is enforced. |
-| acceptance bands | `decode_band_up_tolerance`, `decode_band_down_tolerance`, `decode_band_down_enabled` | The decode band and whether its lower bound is enforced. |
+| speedup floors | `decode_speedup_floor` | The decode speedup the scored run must clear. It is the only gate on a slow candidate decode. |
+| speedup floors | `prefill_speedup_floor` | The prefill speedup the scored run must clear. It is the only gate on a slow candidate prefill. |
+| acceptance bands | `prefill_band_up_tolerance`, `decode_band_up_tolerance` | The ceiling of the control leg's health band, `1 + up` times the calibrated mean. They do not gate the candidate. |
+| acceptance bands | `prefill_band_down_tolerance`, `prefill_band_down_enabled`, `decode_band_down_tolerance`, `decode_band_down_enabled` | The candidate's lower bound: when enabled, a candidate below `1 - down` of its reference fails as too fast. |
 | scoring weights | `score_decode_weight`, `score_prefill_weight` | The weights of the published composite. |
 | window shape | `correctness_steps` | The checked decode steps the correctness gate evaluates. |
 | window shape | `benchmark_decode_steps` | The timed decode depth of the official and local-iterate modes. |

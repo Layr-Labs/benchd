@@ -1107,6 +1107,40 @@ mod tests {
         assert!(err.contains(SERIAL_CONTROL_LEG_OUTSIDE_BAND), "{err}");
     }
 
+    /// THE HEALTH BAND IS UNCHANGED BY fd79c401 (the candidate lost its slow band; the control
+    /// leg did not). Under the CUDA Nemotron fixture, a control prefill at the 1.05 ceiling passes,
+    /// one just over it refuses with the same message as before, and the decode axis keeps its own
+    /// 1.02 ceiling.
+    #[test]
+    fn regression_fd79c401_the_health_band_still_refuses_a_slow_control_leg() {
+        let cal = file_with_default_band_fields(0.013117913);
+        let entry = &cal.prompts[0];
+        let (p, d) = (
+            entry.prefill_seconds_per_token_mean,
+            entry.decode_seconds_per_token_mean,
+        );
+        let band = HealthBand::of_contract(&fixture_with_decode_up(0.02));
+        assert_eq!(band.prefill_high, 1.05);
+        assert!(cal.check_band("prompt-a", p * 1.05, d, band).is_ok());
+        let slow = p * 1.0501;
+        let err = cal.check_band("prompt-a", slow, d, band).unwrap_err();
+        assert_eq!(
+            err,
+            format!(
+                "{SERIAL_CONTROL_LEG_OUTSIDE_BAND}: serial-control leg outside this box's band: \
+                 the prefill leg measured {slow} seconds per token, and box {:?} is calibrated at \
+                 {p} on prompt \"prompt-a\" with a ceiling of {} (1.05 of the mean, the track \
+                 fixture's band); the box is slower than when it was calibrated; refusing to \
+                 seal a score",
+                cal.box_name,
+                band_ceiling(p, 1.05)
+            )
+        );
+        let err = cal.check_band("prompt-a", p, d * 1.0201, band).unwrap_err();
+        assert!(err.contains(SERIAL_CONTROL_LEG_OUTSIDE_BAND), "{err}");
+        assert!(err.contains("the decode leg"), "{err}");
+    }
+
     /// A fixture that declares no band shape gets the default band, and the default band is the
     /// band the band fields of every earlier file carry.
     #[test]

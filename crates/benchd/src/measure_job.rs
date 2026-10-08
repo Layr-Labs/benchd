@@ -680,7 +680,7 @@ pub fn decode_speedup_floor_verdict(
     match regime {
         LegRegime::TeacherForcedV1 => (
             DECODE_SPEEDUP_FLOOR,
-            pooled_ratio_of_means >= DECODE_SPEEDUP_FLOOR,
+            bench_core::score::clears_floor(pooled_ratio_of_means, DECODE_SPEEDUP_FLOOR),
         ),
         // Batch-8 brief D1 (RULED) — the existing floor/ceiling/median machinery is reused
         // UNCHANGED for the cohort series: the scored quantity keeps the ratio shape (serial
@@ -688,7 +688,7 @@ pub fn decode_speedup_floor_verdict(
         // median exactly as on the single-stream free-run series. ZERO new scoring constants.
         LegRegime::FreeRunV1_1 | LegRegime::BatchedFreeRunV1_2(_) => (
             FREE_RUN_DECODE_SPEEDUP_FLOOR,
-            published_median >= FREE_RUN_DECODE_SPEEDUP_FLOOR,
+            bench_core::score::clears_floor(published_median, FREE_RUN_DECODE_SPEEDUP_FLOOR),
         ),
     }
 }

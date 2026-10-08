@@ -206,18 +206,20 @@ pub struct Contract {
     #[serde(default)]
     pub official_baseline_decode_seconds_per_token: Option<f64>,
     /// The track's PREFILL acceptance band, upper tolerance
-    /// ([`AcceptanceBands::prefill_up_tolerance`]).
+    /// ([`AcceptanceBands::prefill_up_tolerance`]). ONE MEANING: the ceiling of the control leg's
+    /// prefill health band, `1 + up` times the calibrated mean. It does not gate the candidate; the
+    /// prefill speedup floor does.
     ///
     /// The SIX band values are ONE shape and arrive together; absent, the run is refused BY NAME as
-    /// [`crate::constants::ACCEPTANCE_BANDS_UNDECLARED`]. The band is what gates the timed run, so
-    /// benchd never invents one.
+    /// [`crate::constants::ACCEPTANCE_BANDS_UNDECLARED`]. benchd never invents one.
     #[serde(default)]
     pub prefill_band_up_tolerance: Option<f64>,
     /// The track's PREFILL acceptance band, lower tolerance. INERT while
     /// [`Contract::prefill_band_down_enabled`] is `false`.
     #[serde(default)]
     pub prefill_band_down_tolerance: Option<f64>,
-    /// The track's DECODE acceptance band, upper tolerance.
+    /// The track's DECODE acceptance band, upper tolerance. ONE MEANING: the ceiling of the control
+    /// leg's decode health band. It does not gate the candidate; the decode speedup floor does.
     #[serde(default)]
     pub decode_band_up_tolerance: Option<f64>,
     /// The track's DECODE acceptance band, lower tolerance. INERT while

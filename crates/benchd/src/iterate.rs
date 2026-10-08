@@ -22,7 +22,7 @@ use bench_core::conformance::{
 };
 use bench_core::constants::WindowShape;
 use bench_core::golden::{BenchmarkGolden, GoldenFixture, Token};
-use bench_core::score::{score_weighted, speedup, ScoringWeights, SpeedupFloors};
+use bench_core::score::{clears_floor, score_weighted, speedup, ScoringWeights, SpeedupFloors};
 use bench_core::BenchError;
 use bench_protocol::SpecConfig;
 use bench_runner::{
@@ -1185,8 +1185,8 @@ pub(crate) fn apply_timing_metrics(
     // THE FLOORS THIS RUN WAS GIVEN, never a constant: `base_metrics` sealed the same
     // `scoring.floors` into `metrics.{decode,prefill}_speedup_floor`, so the flag and the floor it
     // was decided against can never disagree (David 2026-09-09).
-    metrics.passed_decode_speedup_floor = decode_speedup >= scoring.floors.decode;
-    metrics.passed_prefill_speedup_floor = prefill_speedup >= scoring.floors.prefill;
+    metrics.passed_decode_speedup_floor = clears_floor(decode_speedup, scoring.floors.decode);
+    metrics.passed_prefill_speedup_floor = clears_floor(prefill_speedup, scoring.floors.prefill);
     // The leg's window SPLIT under the keys the paired path seals, so a local or single-leg score
     // states its decode window by name. The decode window is the same value as
     // `decode_seconds_per_token`; the seed prefill is REPORT-ONLY and feeds no decode figure.
@@ -3197,7 +3197,7 @@ mod tests {
         assert!(!payload.metrics.passed_decode_speedup_floor);
         assert!(payload.metrics.passed_prefill_speedup_floor);
 
-        // The decode acceptance band fails (value far above +2% of reference).
+        // The official gate refuses the same leg by the decode floor. The band has no slow side.
         let eval = evaluate_timed_run(
             slow_decode,
             baseline_prefill,
@@ -3207,8 +3207,8 @@ mod tests {
             SpeedupFloors::DEFAULT,
             ScoringWeights::DEFAULT,
         );
-        assert!(!eval.decode_band.passed);
-        assert!(eval.prefill_band.passed);
+        assert!(!eval.passes_floors);
+        assert!(eval.passes_acceptance_bands());
 
         // local-iterate still publishes a finite positive score (bands/floors are
         // reported, not gated, on the local path).

@@ -45,7 +45,7 @@
 //! re-anchor integrity `score_sha256` over the merged bytes (`:177-181`).
 
 use bench_core::constants::{QWEN_MTP_DECODE_SPEEDUP_CEILING, QWEN_MTP_DECODE_SPEEDUP_FLOOR};
-use bench_core::score::{score_paired_decode_only, speedup, PairedDecodeFailure};
+use bench_core::score::{clears_floor, score_paired_decode_only, speedup, PairedDecodeFailure};
 use bench_core::stats::even_n_median;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -1360,7 +1360,7 @@ fn validate_cohort_composite(c: &PerCohortView) -> Result<(), String> {
             composite.composite_speedup_floor
         ));
     }
-    let floor_met = composite.composite_score >= QWEN_MTP_DECODE_SPEEDUP_FLOOR;
+    let floor_met = clears_floor(composite.composite_score, QWEN_MTP_DECODE_SPEEDUP_FLOOR);
     if composite.composite_speedup_floor_met != floor_met {
         return Err(format!(
             "results.json per_cohort[0].composite.composite_speedup_floor_met ({}) disagrees with \
@@ -1603,8 +1603,7 @@ fn merge_overlay_against_harness(
     // finding 11 — coherent floor fields for the DECODE-ONLY paired track. Recompute the decode
     // floor against the 0.90 paired floor; NEUTRALIZE the generic prefill floor (this track never
     // scores or floors prefill) so `passed_prefill_speedup_floor` can never contradict `passed`.
-    metrics.passed_decode_speedup_floor =
-        median.is_finite() && median >= QWEN_MTP_DECODE_SPEEDUP_FLOOR;
+    metrics.passed_decode_speedup_floor = clears_floor(median, QWEN_MTP_DECODE_SPEEDUP_FLOOR);
     metrics.prefill_speedup_floor = 0.0; // not-applicable on the paired decode-only track
     metrics.passed_prefill_speedup_floor = true; // vacuously satisfied (prefill is a diagnostic only)
 

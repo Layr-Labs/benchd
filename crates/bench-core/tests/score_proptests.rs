@@ -14,7 +14,9 @@ use bench_core::constants::{
     SCORE_DECODE_SPEEDUP_FLOOR, SCORE_DECODE_WEIGHT, SCORE_PREFILL_SPEEDUP_FLOOR,
     SCORE_PREFILL_WEIGHT,
 };
-use bench_core::score::{check, passes_speedup_floors, score, score_default_weights, speedup};
+use bench_core::score::{
+    check_fast_side, passes_speedup_floors, score, score_default_weights, speedup,
+};
 use proptest::prelude::*;
 
 /// Positive, finite, well-conditioned seconds-per-token / speedup magnitudes.
@@ -216,65 +218,56 @@ proptest! {
         }
     }
 
-    // ---- acceptance band (AcceptanceBand.swift:35-67) ----
+    // ---- the candidate's fast-side check (the lower side of AcceptanceBand.swift:35-67) ----
+    // The slow side is gone (David 2026-10-07): the speedup floor is the candidate's one slowness
+    // gate, so the check refuses only a value below `B*(1-down)` while the lower bound is enabled.
 
-    /// A measurement passes iff it lands inside `[B*(1-down), B*(1+up)]`, inclusive.
-    /// Recomputes the bounds with the same float ops the production code uses, so the
-    /// equivalence is exact. (AcceptanceBand.swift:49-66.)
+    /// A finite positive measurement passes iff it is at or above `B*(1-down)`, inclusive, and any
+    /// value passes when the lower bound is disabled. Recomputes the bound with the same float ops
+    /// the production code uses, so the equivalence is exact.
     #[test]
-    fn band_passes_iff_within_inclusive(
+    fn fast_side_passes_iff_at_or_above_the_lower_edge(
         reference in pos(),
         value in pos(),
-        up in 0.0f64..0.5f64,
         down in 0.0f64..0.9f64,
+        enforce in proptest::bool::ANY,
     ) {
-        let hi = reference * (1.0 + up);
         let lo = reference * (1.0 - down);
-        let expected = value <= hi && value >= lo;
-        prop_assert_eq!(check(value, reference, up, down, true, "x").passed, expected);
+        let expected = !enforce || value >= lo;
+        prop_assert_eq!(check_fast_side(value, reference, down, enforce, "x").passed, expected);
     }
 
-    /// #45 band symmetry: with equal up/down tolerances (the prefill ±5% health gate),
-    /// a symmetric offset accepts or rejects identically on both sides of B. Here,
-    /// strictly inside the band, both the slow and the fast side pass.
-    /// (AcceptanceBand.swift:49-65; AcceptanceBandTests.swift:42-65.)
+    /// No slow value fails: any multiple of the reference above 1 passes, on either setting.
     #[test]
-    fn band_symmetric_within(reference in pos(), tol in 1e-4f64..0.5f64, frac in 0.0f64..0.95f64) {
-        let delta = frac * tol; // strictly inside the tolerance
-        let slow = check(reference * (1.0 + delta), reference, tol, tol, true, "x");
-        let fast = check(reference * (1.0 - delta), reference, tol, tol, true, "x");
-        prop_assert!(slow.passed);
-        prop_assert!(fast.passed);
-        prop_assert_eq!(slow.passed, fast.passed);
+    fn fast_side_never_refuses_a_slow_value(
+        reference in pos(),
+        factor in 1.0f64..1e6f64,
+        down in 0.0f64..0.9f64,
+        enforce in proptest::bool::ANY,
+    ) {
+        prop_assert!(check_fast_side(reference * factor, reference, down, enforce, "x").passed);
     }
 
-    /// #45 band symmetry, other side: strictly outside an equal-tolerance band, both
-    /// the slow and the fast side fail — the slow side as a slowdown, the fast side as
-    /// too-large a gain. (AcceptanceBand.swift:51-65; AcceptanceBandTests.swift:50-65.)
+    /// Strictly below the lower edge, the enabled check fails as too large a gain.
     #[test]
-    fn band_symmetric_outside(reference in pos(), tol in 1e-4f64..0.5f64, frac in 1.05f64..3.0f64) {
-        let delta = frac * tol; // strictly outside the tolerance
-        let slow = check(reference * (1.0 + delta), reference, tol, tol, true, "x");
-        let fast = check(reference * (1.0 - delta.min(0.99)), reference, tol, tol, true, "x");
-        prop_assert!(!slow.passed);
-        prop_assert!(slow.reason.contains("slowdown"));
-        // The fast side fails only while it stays a valid positive value (delta < 1).
+    fn fast_side_outside_fails(reference in pos(), tol in 1e-4f64..0.5f64, frac in 1.05f64..3.0f64) {
+        let delta = frac * tol;
         if delta < 1.0 {
+            let fast = check_fast_side(reference * (1.0 - delta), reference, tol, true, "x");
             prop_assert!(!fast.passed);
             prop_assert!(fast.reason.contains("chunk"));
         }
     }
 
-    /// The production prefill band really is symmetric (up == down); the decode band
-    /// really is asymmetric (up != down). Anchored on the shared constants so the test
-    /// tracks any retune. (Constants.swift:103-106.)
     /// Non-finite / non-positive value or reference is always rejected.
     /// (AcceptanceBand.swift:43-48; AcceptanceBandTests.swift:100-105.)
     #[test]
-    fn band_rejects_nonfinite_or_nonpositive(ok in pos(), up in 0.0f64..0.5f64, down in 0.0f64..0.5f64) {
+    fn fast_side_rejects_nonfinite_or_nonpositive(ok in pos(), down in 0.0f64..0.5f64) {
         for bad in [0.0f64, -1.0, f64::NAN, f64::INFINITY] {
-            prop_assert!(!check(bad, ok, up, down, true, "x").passed);
-            prop_assert!(!check(ok, bad, up, down, true, "x").passed);
+            for enforce in [true, false] {
+                prop_assert!(!check_fast_side(bad, ok, down, enforce, "x").passed);
+                prop_assert!(!check_fast_side(ok, bad, down, enforce, "x").passed);
+            }
         }
     }
 }
