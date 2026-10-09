@@ -201,7 +201,7 @@ so the readiness receipt is a passing run that scores near 1.00.
 - [ ] iogpu wired limit pinned by the boot daemon (`sysctl iogpu.wired_limit_mb`)
 - [ ] `./setup.sh` completes: toolchain, Metal kernels, checkpoint verified, `weights/` transformed
 - [ ] local `benchmark.sh --local-iterate` passes correctness on the public golden
-- [ ] reference tree built at `baseline_reference_commit` and calibrated on this box with CV at or under 1 %; `MLXFAST_BASELINE_WORKSPACE` and `MLXFAST_BASELINE_CALIBRATION` in the runner `.env`
+- [ ] reference tree built at `baseline_reference_commit` and calibrated on this box with CV at or under 2 %; `MLXFAST_BASELINE_WORKSPACE` and `MLXFAST_BASELINE_CALIBRATION` in the runner `.env`
 - [ ] one `workflow_dispatch` of `benchmark.yml` passes end to end
 - [ ] sealed serial score near 1.00 on the paired run
 

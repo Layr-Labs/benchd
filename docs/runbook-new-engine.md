@@ -26,7 +26,7 @@ fixture or constant holds one either. benchd refuses a golden that carries
 Two names carry the per-box state. `MLXFAST_BASELINE_WORKSPACE` is the built reference tree;
 `MLXFAST_BASELINE_CALIBRATION` is this box's `baseline-calibration.json`. `tools/calibrate-box.sh`
 writes that file. It runs `benchd calibrate-baseline` for 4 passes on the reference tree for each
-prompt, and it refuses to write when the coefficient of variation is above 1 % on either axis. The
+prompt, and it refuses to write when the coefficient of variation is above 2 % on either axis. The
 file holds one band for each prompt. A band is a health band for the serial-control leg, never a
 denominator: a stale file cannot move a score, only stop a
 run. benchd itself is built and published from bench `main` to the dist channel. The engine names
@@ -162,5 +162,5 @@ row. A depth-N declaration is one edited file: `mtp-head.manifest.json`.
 - [ ] runner merged to fork `main`; `bench-worker manifest --digest` matches the hello
 - [ ] engine repo pushed; `tools/fetch-benchd.sh` resolves benchd from the channel
 - [ ] runner online with the label; timed pool and per-depth tapes staged and pinned
-- [ ] reference tree built at `baseline_reference_commit`, calibration written with CV at or under 1 %, both names exported, `tools/ranked-box-preflight.sh` passing
+- [ ] reference tree built at `baseline_reference_commit`, calibration written with CV at or under 2 %, both names exported, `tools/ranked-box-preflight.sh` passing
 - [ ] validation run scores near 1.00; the row is open; one depth-N submission accepted

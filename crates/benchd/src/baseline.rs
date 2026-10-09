@@ -1483,7 +1483,7 @@ mod tests {
         // A file whose recorded CV is above the fixed maximum is refused at READ time too, not
         // only when it is written: the file is the only evidence a reader has.
         let mut doc = valid_document();
-        doc["prompts"][0]["decode_cv"] = json!(0.02);
+        doc["prompts"][0]["decode_cv"] = json!(0.021);
         let err = parse(&doc).unwrap_err();
         assert!(err.contains(CALIBRATION_CV_EXCEEDED), "{err}");
     }
@@ -1728,6 +1728,73 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// The calibration CV maximum is 2 % per axis (David 2026-10-09: "set the cv to 2%, 1% seems
+    /// too strict"), on the write path and on the read path: a box whose legs vary by 1.5 %
+    /// calibrates, and one whose legs vary by 2.1 % refuses by name.
+    #[test]
+    fn the_calibration_cv_maximum_is_two_percent_on_write_and_read() {
+        assert_eq!(CALIBRATION_MAX_CV_PERCENT, 2.0);
+        // Legs m(1-k), m(1-k), m(1+k), m(1+k) have a sample CV of 2k/sqrt(3).
+        fn legs(mean: f64, cv_percent: f64) -> Vec<f64> {
+            let k = cv_percent / 100.0 * 3f64.sqrt() / 2.0;
+            vec![
+                mean * (1.0 - k),
+                mean * (1.0 - k),
+                mean * (1.0 + k),
+                mean * (1.0 + k),
+            ]
+        }
+        let reference = "a".repeat(40);
+        let benchd = "b".repeat(40);
+        let identity = CalibrationIdentity {
+            track_id: "qwen3.8-125b-a6b-mlx-v1",
+            box_name: "test-box",
+            reference_commit: &reference,
+            benchd_source_commit: &benchd,
+            captured_at: "2026-10-09T00:00:00Z",
+        };
+        let quiet_prefill = legs(0.001, 0.0);
+        let quiet_decode = legs(0.030, 0.0);
+        for cv in [1.5, 2.1] {
+            let noisy_prefill = legs(0.001, cv);
+            let noisy_decode = legs(0.030, cv);
+            let measured = crate::capture::sample_cv_percent(&noisy_decode).unwrap();
+            assert!((measured - cv).abs() < 1e-9, "{measured} != {cv}");
+            for (axis, prefill_legs, decode_legs) in [
+                ("prefill", &noisy_prefill, &quiet_decode),
+                ("decode", &quiet_prefill, &noisy_decode),
+            ] {
+                let got = calibration_from_passes(
+                    &identity,
+                    &[PromptPasses {
+                        prompt: "p1",
+                        prefill_legs,
+                        decode_legs,
+                    }],
+                    HealthBand::DEFAULT,
+                    Vec::new(),
+                );
+                if cv < CALIBRATION_MAX_CV_PERCENT {
+                    assert!(got.is_ok(), "{axis} at {cv}%: {:?}", got.err());
+                } else {
+                    let err = got.unwrap_err();
+                    assert!(err.contains(CALIBRATION_CV_EXCEEDED), "{err}");
+                    assert!(err.contains(axis), "{err}");
+                }
+            }
+        }
+
+        for field in ["prefill_cv", "decode_cv"] {
+            let mut doc = valid_document();
+            doc["prompts"][0][field] = json!(0.015);
+            assert!(parse(&doc).is_ok(), "{field} 1.5% must parse");
+            doc["prompts"][0][field] = json!(0.021);
+            let err = parse(&doc).unwrap_err();
+            assert!(err.contains(CALIBRATION_CV_EXCEEDED), "{err}");
+            assert!(err.contains(field), "{err}");
+        }
+    }
+
     #[test]
     fn calibration_authoring_computes_the_means_and_refuses_a_noisy_box() {
         let reference = "a".repeat(40);
@@ -1762,7 +1829,7 @@ mod tests {
         assert_eq!(entry.prefill_band_low, DEFAULT_PREFILL_BAND_LOW);
         assert_eq!(entry.decode_band_high, DEFAULT_DECODE_BAND_HIGH);
 
-        // A decode axis that varies by ~4.7% is well past the fixed 1% maximum.
+        // A decode axis that varies by ~4.7% is well past the fixed 2% maximum.
         let err = calibration_from_passes(
             &identity,
             &[passes(

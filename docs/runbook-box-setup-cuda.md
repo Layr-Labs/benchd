@@ -506,7 +506,7 @@ To refresh the benchmarker pair, use `BENCHD_REFRESH=1` (section 7).
 | `git clone` of the bundle: `fatal: early EOF` or `index-pack died` | the bundle was truncated in transit; `scp` over a relayed link can return 0 on a partial file | compare sha256 on both ends; copy again with `rsync --partial` or in chunks |
 | `git ls-remote` of the engine repository fails on the box | the box has no GitHub credential | expected; the operator checkout comes from a bundle; the ranked job uses the Actions token |
 | `fetch-benchd.sh`: "manifest sha256 is not 64 lowercase hex characters" | a hand-made `benchd.manifest.json` with a `binaries` entry split over lines | one entry per line, the channel's layout |
-| `benchd calibrate-baseline` refuses with `CALIBRATION-CV-EXCEEDED` | the four passes differed by more than 1% on one axis | a result, not a fault; find out why the box is noisy, then calibrate again |
+| `benchd calibrate-baseline` refuses with `CALIBRATION-CV-EXCEEDED` | the four passes differed by more than 2% on one axis | a result, not a fault; find out why the box is noisy, then calibrate again |
 | runner offline; log says a session already exists | a second listener | never start a second container; `docker logs spark-box` shows the one listener |
 | preflight refuses an unpinned `*.json` in the pool directory | a non-pool golden placed beside the pool | move it out of `<root>/goldens/<track>` |
 | a window stalls, GPU idle, two worker processes | a second connection waiting on the one-connection resident | one attached worker per window (benchd does this when `DS4_RESIDENT_SOCKET` is set) |

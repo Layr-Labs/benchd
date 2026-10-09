@@ -119,7 +119,7 @@ CALIBRATION-CV-EXCEEDED
 ```
 
 A box that refuses is not quiet enough for a mean to describe it. Find out why
-before you calibrate again. Do not widen the gate. The maximum is fixed at 1 %
+before you calibrate again. Do not widen the gate. The maximum is fixed at 2 %
 per axis and no flag can relax it.
 
 ## 5. The file
@@ -319,7 +319,7 @@ inherited socket is used as before.
 | `SERIAL-CONTROL-LEG-OUTSIDE-BAND` | the control leg is slower than this box's band ceiling |
 | `GOLDEN-CARRIES-STORED-BASELINE` | the golden still declares a baseline pair |
 | `STORED-BASELINE-OVERRIDE-REFUSED` | `MLXFAST_PAIRED_BASELINE_*` or `--baseline-*` reached the ranked path |
-| `CALIBRATION-CV-EXCEEDED` | the calibration passes vary by more than 1 % |
+| `CALIBRATION-CV-EXCEEDED` | the calibration passes vary by more than 2 % |
 | `LEG-SERVE-SCRIPT-MISSING` | a leg's tree holds no `tools/serve-up.sh` |
 | `LEG-SERVE-BOOT-FAILED` | a leg's resident did not boot |
 | `LEG-SERVE-INHERITED-SOCKET` | a resident socket was inherited instead of booted per leg |
