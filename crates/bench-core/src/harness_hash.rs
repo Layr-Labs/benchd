@@ -21,7 +21,8 @@
 //! * the MLX (Apple-silicon) engine's Swift
 //!   `Sources/MLXFastTrustedHarness/QwenRuntimePreflight.swift` — `QwenRuntime.harnessHashRoots`,
 //!   `QwenRuntime.harnessHashRootFiles(baseDirectory:)` and `QwenRuntime.harnessHash()`;
-//! * the CUDA engine's equivalent, over that engine's own roster surface (`harness/`, `vllm/`).
+//! * the CUDA engine's equivalent, over that engine's own roster surface (`harness/`, `vllm/`,
+//!   and for the Bonsai track `llama.cpp/`).
 //!
 //! Both compute the SAME algorithm over the roots that EXIST in their respective trees. This port is
 //! byte-compatible with each: the same bytes go into SHA256, in the same order, so a benchd-computed
@@ -62,8 +63,8 @@
 //!    unconditionally, with no regular-file check, and the content read follows the link.
 //! 8. **A MISSING root is LOGGED and SKIPPED, never a refusal.** The roster spans BOTH engine
 //!    surfaces (MLX and CUDA), and neither engine has every root: the MLX tree has no `harness/` or
-//!    `vllm/`, the CUDA tree has no `Package.swift`/`Sources`/`Tests`. Per David's ruling the hash
-//!    is computed over what EXISTS — a root absent from disk contributes zero files (exactly as if
+//!    `vllm/` or `llama.cpp/`, the CUDA tree has no `Package.swift`/`Sources`/`Tests`. Per David's
+//!    ruling the hash is computed over what EXISTS — a root absent from disk contributes zero files (exactly as if
 //!    it were an empty directory) and is noted on stderr so an operator can see what was covered.
 //!    The SAME roster therefore serves both engines, and each hashes over its own surface.
 
@@ -77,12 +78,12 @@ use crate::hash::hex_lower;
 /// The FIXED root set the harness hash covers, spanning BOTH engine surfaces.
 ///
 /// The first nine roots are the MLX engine's `QwenRuntime.harnessHashRoots`, transcribed in ORDER;
-/// `harness` and `vllm` are the CUDA engine's own harness surface, appended. The order does NOT
+/// `harness`, `vllm`, and `llama.cpp` are CUDA engine harness surfaces, appended. The order does NOT
 /// affect the digest (the collected paths are sorted globally before hashing), but it is pinned so
 /// a root add/remove/reorder is a deliberate, reviewed act. A root that is absent on a given engine
 /// is logged and skipped ([`harness_hash_root_files`]), so the same roster covers both engines and
 /// each hashes over exactly the roots it actually has.
-pub const HARNESS_HASH_ROOTS: [&str; 11] = [
+pub const HARNESS_HASH_ROOTS: [&str; 12] = [
     "Package.swift",
     "Sources",
     "Tests",
@@ -94,6 +95,7 @@ pub const HARNESS_HASH_ROOTS: [&str; 11] = [
     "TASK.md",
     "harness",
     "vllm",
+    "llama.cpp",
 ];
 
 /// Collect the regular files under [`HARNESS_HASH_ROOTS`], resolved against `workspace_root`, as
@@ -108,8 +110,15 @@ pub const HARNESS_HASH_ROOTS: [&str; 11] = [
 /// go into the digest verbatim. Callers wanting the reference's production semantics must pass a
 /// fully-resolved absolute root; [`harness_hash_of_current_dir`] does exactly that.
 pub fn harness_hash_root_files(workspace_root: &Path) -> Vec<String> {
+    root_files_over(workspace_root, &HARNESS_HASH_ROOTS)
+}
+
+/// [`harness_hash_root_files`] over an explicit roster. Production always passes
+/// [`HARNESS_HASH_ROOTS`]; the tests pass an earlier roster to prove a roster addition does not
+/// move the digest of a tree that lacks the added root.
+fn root_files_over(workspace_root: &Path, roots: &[&str]) -> Vec<String> {
     let mut files: Vec<String> = Vec::new();
-    for root in HARNESS_HASH_ROOTS {
+    for &root in roots {
         let path = workspace_root.join(root);
         // `FileManager.fileExists(atPath:isDirectory:)` — FOLLOWS symlinks, so a symlinked root
         // satisfies the probe. An absent root (or a broken symlink) is LOGGED and SKIPPED: the
@@ -318,7 +327,7 @@ mod tests {
     /// The SYNTHETIC fixture tree the vector covers, as `(path-relative-to-VECTOR_BASE, bytes)`.
     ///
     /// This is an MLX-SHAPED tree: it has the nine MLX roots and NONE of the CUDA roots (`harness/`,
-    /// `vllm/`). It is the exact set the reference COLLECTED from the on-disk tree — note what is
+    /// `vllm/`, `llama.cpp/`). It is the exact set the reference COLLECTED from the on-disk tree — note what is
     /// absent: `Sources/.hidden.swift` and `Sources/.hiddendir/C.swift` existed on disk and are not
     /// here (`.skipsHiddenFiles`), and `Sources/empty/` contributed nothing. Deliberately listed in
     /// NON-sorted order so a port that forgets the global sort cannot pass.
@@ -400,10 +409,10 @@ mod tests {
         );
     }
 
-    /// The eleven roots, in the pinned order: the nine MLX roots (with `benchmark.sh` at index 4,
-    /// the property the engine's own `HarnessHashRootSetTests.swift` pins) followed by the two CUDA
-    /// roots. A root added, removed or reordered here changes what benchd hashes and must be a
-    /// deliberate, reviewed act.
+    /// The twelve roots, in the pinned order: the nine MLX roots (with `benchmark.sh` at index 4,
+    /// the property the engine's own `HarnessHashRootSetTests.swift` pins) followed by the CUDA
+    /// engine roots. A root added, removed or reordered here changes what benchd hashes and must be
+    /// a deliberate, reviewed act.
     #[test]
     fn the_root_set_is_the_two_engine_roster_in_order() {
         assert_eq!(
@@ -420,12 +429,14 @@ mod tests {
                 "TASK.md",
                 "harness",
                 "vllm",
+                "llama.cpp",
             ]
         );
         assert_eq!(HARNESS_HASH_ROOTS[4], "benchmark.sh");
         assert_eq!(HARNESS_HASH_ROOTS[9], "harness");
         assert_eq!(HARNESS_HASH_ROOTS[10], "vllm");
-        assert_eq!(HARNESS_HASH_ROOTS.len(), 11);
+        assert_eq!(HARNESS_HASH_ROOTS[11], "llama.cpp");
+        assert_eq!(HARNESS_HASH_ROOTS.len(), 12);
     }
 
     // -----------------------------------------------------------------------
@@ -595,7 +606,7 @@ mod tests {
             // paths, so a comparison is only meaningful when both legs share a root.
             let full = harness_hash(&root);
             let target = root.join(root_name);
-            // `harness`/`vllm` are absent from the MLX-shaped fixture already; the nine MLX roots
+            // The CUDA roots are absent from the MLX-shaped fixture already; the nine MLX roots
             // are removed here. Either way the hash must be produced, not refused.
             if target.is_dir() {
                 fs::remove_dir_all(&target).expect("remove root dir");
@@ -609,7 +620,7 @@ mod tests {
             );
             // A root that was PRESENT and carried files must move the digest when dropped; an
             // already-absent CUDA root leaves the digest unchanged.
-            if ["harness", "vllm"].contains(&root_name) {
+            if ["harness", "vllm", "llama.cpp"].contains(&root_name) {
                 assert_eq!(
                     got, full,
                     "dropping an already-absent CUDA root cannot change the digest: {root_name}"
@@ -648,18 +659,26 @@ mod tests {
              and the missing-root skip must not move it"
         );
 
-        // On-disk: an MLX tree, then the same tree with EMPTY harness/ and vllm/ present. Both must
-        // equal each other and be well-formed (present-but-empty roots contribute no files).
+        // On-disk: an MLX tree, then the same tree with EMPTY CUDA roots present. Both must equal
+        // each other and be well-formed (present-but-empty roots contribute no files).
         let root = tmp_root("mlx-stable");
         build_synthetic_tree(&root);
         let mlx = harness_hash(&root);
         assert!(is_well_formed_harness_hash(&mlx));
         fs::create_dir_all(root.join("harness")).expect("mkdir harness");
         fs::create_dir_all(root.join("vllm")).expect("mkdir vllm");
+        fs::create_dir_all(root.join("llama.cpp")).expect("mkdir llama.cpp");
         assert_eq!(
             mlx,
             harness_hash(&root),
-            "empty harness/ and vllm/ roots contribute no files and must not move the digest"
+            "empty harness/, vllm/, and llama.cpp/ roots contribute no files and must not move the digest"
+        );
+
+        write(&root.join("llama.cpp/CMakeLists.txt"), "cmake\n");
+        assert_ne!(
+            mlx,
+            harness_hash(&root),
+            "a populated llama.cpp/ root must move the digest"
         );
         let _ = fs::remove_dir_all(&root);
     }
@@ -708,6 +727,112 @@ mod tests {
             before,
             harness_hash(&root),
             "a new file under harness/ must move a CUDA tree's digest"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The roster as it stood BEFORE `llama.cpp` joined it, transcribed as data so the comparison
+    /// below is against the old roster itself, not a slice of the new one.
+    const ROSTER_BEFORE_LLAMA_CPP: [&str; 11] = [
+        "Package.swift",
+        "Sources",
+        "Tests",
+        "benchmark.json",
+        "benchmark.sh",
+        "setup.sh",
+        "tools",
+        "README.md",
+        "TASK.md",
+        "harness",
+        "vllm",
+    ];
+
+    /// The digest of `root` over an explicit roster, by the production sort and fold.
+    fn harness_hash_over_roster(root: &Path, roots: &[&str]) -> String {
+        let mut files = root_files_over(root, roots);
+        files.sort();
+        harness_hash_read_ahead(&files)
+    }
+
+    /// DIGEST STABILITY under the `llama.cpp` addition: a tree WITHOUT `llama.cpp/` hashes to the
+    /// same digest under the old eleven-root roster and the current roster. Checked for an
+    /// MLX-shaped tree and for a vLLM-shaped CUDA tree (`harness/` + `vllm/`, no Swift roots, the
+    /// Nemotron CUDA surface), so neither digest moves.
+    #[test]
+    fn a_tree_without_llama_cpp_hashes_as_under_the_old_roster() {
+        let mlx = tmp_root("no-llama-mlx");
+        build_synthetic_tree(&mlx);
+        assert_eq!(
+            harness_hash(&mlx),
+            harness_hash_over_roster(&mlx, &ROSTER_BEFORE_LLAMA_CPP),
+            "an MLX tree's digest must not move when llama.cpp joins the roster"
+        );
+        let _ = fs::remove_dir_all(&mlx);
+
+        let cuda = tmp_root("no-llama-cuda");
+        for rel in [
+            "benchmark.json",
+            "benchmark.sh",
+            "setup.sh",
+            "tools/t.sh",
+            "README.md",
+            "TASK.md",
+            "harness/protocol-adapter/src/vllm_backend.rs",
+            "vllm/csrc/kernel.cu",
+        ] {
+            write(&cuda.join(rel), rel);
+        }
+        assert_eq!(
+            harness_hash(&cuda),
+            harness_hash_over_roster(&cuda, &ROSTER_BEFORE_LLAMA_CPP),
+            "a vLLM CUDA tree's digest must not move when llama.cpp joins the roster"
+        );
+        let _ = fs::remove_dir_all(&cuda);
+    }
+
+    /// A llama.cpp-shaped CUDA tree (`harness/` + `llama.cpp/`, no `vllm/`, no Swift roots) hashes
+    /// over `llama.cpp/`: its files are collected, the digest differs from the old roster's, and a
+    /// new or changed file under `llama.cpp/` moves the digest.
+    #[test]
+    fn a_llama_cpp_file_moves_the_digest() {
+        let root = tmp_root("llama-cpp");
+        for rel in [
+            "benchmark.json",
+            "benchmark.sh",
+            "setup.sh",
+            "tools/t.sh",
+            "README.md",
+            "TASK.md",
+            "harness/protocol-adapter/src/backend.rs",
+            "llama.cpp/CMakeLists.txt",
+            "llama.cpp/src/llama.cpp",
+        ] {
+            write(&root.join(rel), rel);
+        }
+        let rels = sorted_relative(&root, &harness_hash_root_files(&root));
+        assert!(
+            rels.iter().any(|f| f == "llama.cpp/src/llama.cpp"),
+            "a CUDA tree's llama.cpp/ must be collected: {rels:?}"
+        );
+        let with = harness_hash(&root);
+        assert_ne!(
+            with,
+            harness_hash_over_roster(&root, &ROSTER_BEFORE_LLAMA_CPP),
+            "llama.cpp/ files must count under the current roster"
+        );
+
+        write(&root.join("llama.cpp/ggml/src/added.cu"), "added\n");
+        let added = harness_hash(&root);
+        assert_ne!(
+            with, added,
+            "a new file under llama.cpp/ must move the digest"
+        );
+
+        write(&root.join("llama.cpp/CMakeLists.txt"), "changed\n");
+        assert_ne!(
+            added,
+            harness_hash(&root),
+            "a changed file under llama.cpp/ must move the digest"
         );
         let _ = fs::remove_dir_all(&root);
     }
